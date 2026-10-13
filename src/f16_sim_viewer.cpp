@@ -1378,10 +1378,13 @@ int main(int argc, char* argv[]) {
         // Dogfight: the bandit, tracers and the combat HUD.
         renderer.clear_traffic();
         renderer.clear_tracers();
+        // F-35B weapons-bay doors: open while a radar missile clears the jet.
+        renderer.set_ownship_weapon_bay(graphics::weapon_bay_doors(active_world().missiles, sim::Engagement::OWN));
         if (dogfight_active) {
             const sim::World& w = dogfight->world;
             const sim::Aircraft& bandit = dogfight->bandit();
-            renderer.add_traffic(render_state_of(bandit), bandit.landing_gear.deployed, bandit.type, &bandit.stovl);
+            renderer.add_traffic(render_state_of(bandit), bandit.landing_gear.deployed, bandit.type, &bandit.stovl,
+                                 graphics::weapon_bay_doors(w.missiles, sim::Engagement::BANDIT));
             // One round in five is a tracer, as in a real belt.
             for (int r = 0; r < sim::World::kMaxRounds; r += 5) {
                 const sim::Projectile& p = w.rounds[static_cast<size_t>(r)];
@@ -1585,7 +1588,8 @@ int main(int argc, char* argv[]) {
         was_ejected = own_ejected;
         renderer.set_ownship_visible(!own_ejected);
         if (own_ejected) {
-            renderer.add_traffic(render_state_of(*own), own->landing_gear.deployed, own->type, &own->stovl);
+            renderer.add_traffic(render_state_of(*own), own->landing_gear.deployed, own->type, &own->stovl,
+                                 graphics::weapon_bay_doors(active_world().missiles, sim::Engagement::OWN));
             // F1 has no cockpit to go back to.
             renderer.camera_rig().set_mode(graphics::CameraMode::CHASE);
         }

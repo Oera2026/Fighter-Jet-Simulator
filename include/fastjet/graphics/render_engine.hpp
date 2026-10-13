@@ -78,6 +78,8 @@ private:
     /// False once the pilot has ejected: the camera follows him, and the
     /// jet he left is drawn as traffic.
     bool ownship_visible_ = true;
+    /// The ownship's weapons-bay doors this frame (F-35B), set by the sim.
+    WeaponBayDoors ownship_bay_{};
 
     /// Other aircraft in the sky this frame (dogfight bandits), drawn in both views.
     struct Traffic {
@@ -85,6 +87,7 @@ private:
         bool gear_down{false};
         aircraft::AircraftType type{aircraft::AircraftType::F16_FIGHTING_FALCON};
         propulsion::StovlStatus stovl{};  ///< Lift-system pose (F-35B doors and nozzle)
+        WeaponBayDoors bay{};             ///< Weapons-bay doors (F-35B)
     };
     static constexpr int kMaxTraffic = 8;
     std::array<Traffic, kMaxTraffic> traffic_{};
@@ -405,7 +408,7 @@ private:
         // procedural jets' own cockpit shell stands in for their interior).
         if (ownship_visible_) {
             const bool f16 = cockpit_type_ == aircraft::AircraftType::F16_FIGHTING_FALCON;
-            airframe(cockpit_type_, stovl).render_shadow(shadow_map_, state, gear_down, align, f16 || chase);
+            airframe(cockpit_type_, stovl, ownship_bay_).render_shadow(shadow_map_, state, gear_down, align, f16 || chase);
         }
         if (!chase && !asset_cockpit_) {
             // The cockpit shades itself too: glare shield onto the panel,
@@ -495,10 +498,11 @@ private:
     }
 
     /// @brief The airframe model for @p type, its moving parts posed from
-    /// @p stovl (the F-35B's lift system; nothing moves on the others).
-    ModelGLB& airframe(aircraft::AircraftType type, const propulsion::StovlStatus& stovl) {
+    /// @p stovl and @p bay (the F-35B's lift system and weapons bays;
+    /// nothing moves on the others).
+    ModelGLB& airframe(aircraft::AircraftType type, const propulsion::StovlStatus& stovl, const WeaponBayDoors& bay) {
         ModelGLB& m = airframe(type);
-        if (type == aircraft::AircraftType::F35B_LIGHTNING_II) m.set_joints(f35b_stovl_pose(stovl).joints);
+        if (type == aircraft::AircraftType::F35B_LIGHTNING_II) m.set_joints(f35b_stovl_pose(stovl, bay).joints);
         return m;
     }
 
@@ -763,7 +767,7 @@ public:
             // Other jets: seen from either view, drawn eye-relative like the ownship.
             for (int i = 0; i < traffic_count_; ++i) {
                 const Traffic& t = traffic_[static_cast<size_t>(i)];
-                airframe(t.type, t.stovl).render_world(proj_world * view_rot, t.state, t.gear_down, ctx);
+                airframe(t.type, t.stovl, t.bay).render_world(proj_world * view_rot, t.state, t.gear_down, ctx);
             }
             if (!tracer_world_.empty() && hdr) {
                 tracers_.clear();
@@ -786,7 +790,8 @@ public:
             escapes_.render(proj_world * view_rot, ctx);
 
             if (chase && ownship_visible_) {
-                airframe(cockpit_type_, telemetry.stovl).render_world(proj_world * view_rot, state, telemetry.gear_deployed, ctx);
+                airframe(cockpit_type_, telemetry.stovl, ownship_bay_)
+                    .render_world(proj_world * view_rot, state, telemetry.gear_deployed, ctx);
                 if (quality_.exhaust && hdr) {
                     float afterburner = 0.0f;
                     float glow = 0.0f;
@@ -897,7 +902,8 @@ public:
             if (cockpit_type_ == aircraft::AircraftType::F16_FIGHTING_FALCON) {
                 f16_model_.render_cockpit(proj_cockpit, view_cockpit, state, ctx, eye_b, asset_cockpit_);
             } else {
-                airframe(cockpit_type_, telemetry.stovl).render_cockpit(proj_cockpit, view_cockpit, state, ctx, eye_b, false);
+                airframe(cockpit_type_, telemetry.stovl, ownship_bay_)
+                    .render_cockpit(proj_cockpit, view_cockpit, state, ctx, eye_b, false);
             }
 
             // Live MFD pages: self-lit, so they bypass the scene lighting.
@@ -1011,13 +1017,20 @@ public:
     void clear_traffic() noexcept { traffic_count_ = 0; }
     /// @param stovl The jet's lift-system snapshot (sim::Aircraft::stovl), so
     ///        an F-35B shows its doors and nozzle; null: everything stowed.
+    /// @param bay   Its weapons-bay doors (weapon_bay_doors()); default shut.
     void add_traffic(const fdm::FlightState& state, bool gear_down,
                      aircraft::AircraftType type = aircraft::AircraftType::F16_FIGHTING_FALCON,
-                     const propulsion::StovlStatus* stovl = nullptr) noexcept {
+                     const propulsion::StovlStatus* stovl = nullptr, const WeaponBayDoors& bay = {}) noexcept {
         if (traffic_count_ < kMaxTraffic) {
-            traffic_[static_cast<size_t>(traffic_count_++)] = {state, gear_down, type, stovl ? *stovl : propulsion::StovlStatus{}};
+            traffic_[static_cast<size_t>(traffic_count_++)] = {state, gear_down, type,
+                                                               stovl ? *stovl : propulsion::StovlStatus{}, bay};
         }
     }
+
+    /// @brief The ownship's weapons-bay doors this frame (weapon_bay_doors()
+    /// of its radar-missile launches): an F-35B opens them, the others have
+    /// none to show.
+    void set_ownship_weapon_bay(const WeaponBayDoors& bay) noexcept { ownship_bay_ = bay; }
 
     /// @brief Ejected pilots to draw this frame (replaces the previous list).
     EscapeRenderer& escapes() noexcept { return escapes_; }

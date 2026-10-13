@@ -727,6 +727,17 @@ inline constexpr float kVaneZ = 0.22f;        // Louvre pivots
 inline constexpr float kWingZ = 0.08f, kWingRootY = 1.20f, kWingTipY = 5.35f;
 inline constexpr float kWingLe0 = 2.70f, kWingTe0 = -3.73f, kWingTanLe = 0.677f, kWingTanTe = 0.231f;
 inline constexpr float kWingTRoot = 0.27f, kWingTTip = 0.08f;
+// Weapons bays: two, either side of the keel, from just aft of the LiftFan's
+// exit to just ahead of the main gear: 3.6 m, the B's (the LiftFan shortens
+// them). Each has a narrow inboard and a wide outboard door, hinged at the
+// bay's edges and meeting at the seam; they swing down a little past vertical.
+inline constexpr float kBayFwd = kFanExitAft - 0.15f, kBayAft = kBayFwd - 3.60f;
+inline constexpr float kBayTooth = 0.10f;     // saw-tooth RAM edges' depth, fore and aft of the doors
+inline constexpr float kBayIn = 0.14f, kBaySeam = 0.48f, kBayOut = 0.94f; // |y| of the edges and the seam
+inline constexpr float kBayOpen = 1.66f;      // 95 deg
+/// Bay-door cycle for a radar-missile launch, from its release [s]: the
+/// doors snap open, hold while the missile clears, then shut.
+inline constexpr float kBayOpenS = 0.25f, kBayHoldS = 1.50f, kBayShutS = 0.60f;
 }  // namespace f35b_layout
 
 [[nodiscard]] inline AirframeInfo f35b_info() {
@@ -764,6 +775,10 @@ enum F35bJoint : int {
     kBsmA,         ///< 3BSM front segment: rolls about the duct axis
     kBsmB,         ///< Middle segment, on the first canted bearing
     kBsmC,         ///< Rear segment and nozzle, on the second
+    kBayInL,       ///< Weapons-bay doors, hinged at the bay's edges: left bay inboard and outboard,
+    kBayOutL,      ///< then the right bay's
+    kBayInR,
+    kBayOutR,
     kF35bJointCount
 };
 static_assert(kF35bJointCount <= JointPose::kMax);
@@ -936,6 +951,9 @@ struct F35bRig {
     V3 c1, c2, c3, exit;   ///< 3BSM bearing centres and nozzle exit
     V3 n2, n3;             ///< Canted bearing normals (pointing aft)
     V3 fan_exit, roll_exit[2];
+    /// Weapons-bay door hinge lines, fore and aft ends, in joint order
+    /// (kBayInL ..): straight lines along the belly's curve.
+    std::array<V3, 4> bay_hinge_fwd{}, bay_hinge_aft{};
     static constexpr int kTable = 37;
     std::array<float, kTable> deflection{}; ///< Nozzle deflection [rad] at segment turn i * 5 deg
 };
@@ -964,6 +982,14 @@ struct F35bRig {
             r.bsm_door_hinge[i] = {xb, side * kBsmDoorHalfW, skin_z(body, xb, kBsmDoorHalfW, false) + 0.010f};
             const math::Vector3& rp = kCfg.roll_post_pos_b;
             r.roll_exit[i] = {static_cast<float>(rp.x), side * static_cast<float>(rp.y), static_cast<float>(rp.z)};
+            // Bay doors: the inboard one hinged at the keel side, the outboard
+            // one at the bay's outer edge.
+            for (int d = 0; d < 2; ++d) {
+                const float y = side * (d == 0 ? kBayIn : kBayOut);
+                const size_t k = static_cast<size_t>(2 * i + d);
+                r.bay_hinge_fwd[k] = {kBayFwd, y, skin_z(body, kBayFwd, y, false) + 0.010f};
+                r.bay_hinge_aft[k] = {kBayAft, y, skin_z(body, kBayAft, y, false) + 0.010f};
+            }
         }
         const math::Vector3& fp = kCfg.lift_fan_pos_b;
         r.fan_exit = {static_cast<float>(fp.x), static_cast<float>(fp.y), static_cast<float>(fp.z)};
@@ -994,7 +1020,8 @@ struct F35bRig {
     const ProceduralPart finish = paint(0.084f, 0.088f, 0.093f, 0.46f);
     Parts p(finish);
     p.canopy = glass(0.95f, 0.86f, 0.62f); // gold ITO film
-    ProceduralPart coating = paint(0.056f, 0.060f, 0.066f, 0.40f);
+    const ProceduralPart ram = paint(0.056f, 0.060f, 0.066f, 0.40f);
+    ProceduralPart coating = ram;
     Mesh s(p.skin);
     const CanopyFit& c = a.canopy;
     const float ws = a.eye_x + c.ws_dx, tub = a.eye_x + c.tub_aft_dx;
@@ -1024,9 +1051,12 @@ struct F35bRig {
              24);
         Mesh mouth(p.dark);
         cap(mouth, Section{5.64f, 0.30f, -0.44f, 0.36f, 3.5f, 3.0f, side * 1.00f}, 24);
-        // Tail boom carrying the fin and stabilator.
+        // Tail boom carrying the fin and stabilator: it grows out of the
+        // fuselage's flank behind the wing root (its open front end inside
+        // the body) and runs on past the nozzle.
         loft(s,
-             {{-2.60f, 0.05f, -0.56f, -0.46f, 3.0f, 3.0f, side * 1.05f},
+             {{-0.80f, 0.06f, -0.40f, 0.10f, 3.0f, 3.0f, side * 1.00f},
+              {-1.70f, 0.22f, -0.58f, 0.26f, 3.0f, 3.0f, side * 1.04f},
               {-3.30f, 0.30f, -0.68f, 0.30f, 3.0f, 3.0f, side * 1.05f},
               {-5.85f, 0.28f, -0.65f, 0.25f, 3.0f, 3.0f, side * 1.05f},
               {-6.55f, 0.08f, -0.48f, 0.10f, 3.0f, 3.0f, side * 1.05f}},
@@ -1058,6 +1088,21 @@ struct F35bRig {
     door_well(bay, kAuxAft, kAuxFwd, kAuxHalfW - 0.04f, -0.35f, top);
     door_well(bay, kFanExitAft, kFanExitFwd, kFanExitHalfW - 0.04f, 0.02f, belly, false);
     door_well(bay, kBsm1, kBsmDoorFwd, kBsmDoorHalfW - 0.04f, 0.25f, belly);
+    {
+        // The weapons bays' dark interiors, a skin of shadow just under their
+        // doors' outer faces: hidden while the doors are shut.
+        constexpr int N = 6;
+        for (float side : {-1.0f, 1.0f}) {
+            auto at = [&](int i, int j) {
+                const float x = kBayAft + (kBayFwd - kBayAft) * static_cast<float>(i) / N;
+                const float y = side * (kBayIn + (kBayOut - kBayIn) * static_cast<float>(j) / N);
+                return V3{x, y, belly(x, y) + 0.003f};
+            };
+            for (int i = 0; i < N; ++i) {
+                for (int j = 0; j < N; ++j) bay.quad(at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1));
+            }
+        }
+    }
     {
         // LiftFan face: two-stage, 50 in, seen through the open inlet door.
         constexpr float kFanR = 0.64f, kFanZ = -0.30f;
@@ -1093,7 +1138,7 @@ struct F35bRig {
         moving.push_back(std::move(part));
         return moving.back();
     };
-    moving.reserve(32); // references from add() stay valid: never more parts than this
+    moving.reserve(48); // references from add() stay valid: never more parts than this
     const ProceduralPart inside = paint(0.36f, 0.37f, 0.38f, 0.55f); // light grey door inner faces
     auto door = [&](int joint, float x0, float x1, float y0, float y1, auto&& surface_z, bool on_top) {
         ProceduralPart& o = add(finish, joint);
@@ -1111,6 +1156,20 @@ struct F35bRig {
     auto wing = [](float x, float y) { return f35b_wing_lower_z(x, y); };
     door(kRollDoorL, kRollX - kRollHalfL, kRollX + kRollHalfL, -kRollY - kRollHalfW, -kRollY + kRollHalfW, wing, false);
     door(kRollDoorR, kRollX - kRollHalfL, kRollX + kRollHalfL, kRollY - kRollHalfW, kRollY + kRollHalfW, wing, false);
+    // Weapons-bay doors, each with the saw-tooth RAM edges fore and aft that
+    // swing open with it.
+    for (int k = 0; k < 4; ++k) {
+        const float side = k < 2 ? -1.0f : 1.0f;
+        const bool inboard = k % 2 == 0;
+        const float y0 = side * (inboard ? kBayIn : kBaySeam + 0.003f);
+        const float y1 = side * (inboard ? kBaySeam - 0.003f : kBayOut);
+        door(kBayInL + k, kBayAft, kBayFwd, std::min(y0, y1), std::max(y0, y1), belly, false);
+        ProceduralPart& rim_part = add(ram, kBayInL + k);
+        Mesh rim(rim_part);
+        const int teeth = std::max(2, static_cast<int>(std::lround(std::fabs(y1 - y0) / 0.12f)));
+        sawtooth(rim, kBayFwd + 0.005f, y0, y1, kBayTooth, 1.0f, teeth, belly, -0.012f);
+        sawtooth(rim, kBayAft - 0.005f, y0, y1, kBayTooth, -1.0f, teeth, belly, -0.012f);
+    }
     {
         // Roll-post nozzle exits in the wing, under their doors.
         Mesh post(p.dark);
@@ -1223,6 +1282,47 @@ struct F35bRig {
     return {};
 }
 
+/// @brief The F-35B's internal weapons-bay doors: 0 shut .. 1 open, per bay.
+struct WeaponBayDoors {
+    float left = 0.0f;
+    float right = 0.0f;
+};
+
+/// @brief How far a bay's doors stand open @p t_s seconds after a radar
+/// missile left it: they snap open, hold while it clears, then shut.
+[[nodiscard]] inline float bay_door_cycle(double t_s) noexcept {
+    using namespace airframe_build::f35b_layout;
+    auto ease = [](float u) {
+        u = std::clamp(u, 0.0f, 1.0f);
+        return u * u * (3.0f - 2.0f * u);
+    };
+    const auto t = static_cast<float>(t_s);
+    if (t < 0.0f) return 0.0f;
+    if (t < kBayOpenS) return ease(t / kBayOpenS);
+    return 1.0f - ease((t - kBayOpenS - kBayHoldS) / kBayShutS);
+}
+
+/// @brief The weapons-bay doors of the jet at index @p shooter, from the
+/// missiles in the air (sim::World::missiles): a bay stands open while a
+/// radar missile it launched clears the jet. Infrared missiles leave the
+/// external rails and open nothing. Consecutive launches take consecutive
+/// slots, so they come from alternate bays, as the stores system ripples
+/// them to keep the jet balanced. Cheap (one pass over the slots, no
+/// allocation): called once per jet per frame.
+template <class Missiles>
+[[nodiscard]] WeaponBayDoors weapon_bay_doors(const Missiles& missiles, int shooter) noexcept {
+    WeaponBayDoors bay;
+    int slot = 0;
+    for (const auto& m : missiles) {
+        if (m.active && m.shooter == shooter && !m.spec.infrared()) {
+            float& doors = slot % 2 == 0 ? bay.right : bay.left;
+            doors = std::max(doors, bay_door_cycle(m.body.tof));
+        }
+        ++slot;
+    }
+    return bay;
+}
+
 /// @brief The F-35B lift system's pose this frame: transforms for its doors,
 /// vane box and 3BSM segments, and where each lift jet leaves the airframe
 /// (body axes, world alignment) and which way it blows.
@@ -1233,9 +1333,11 @@ struct StovlPose {
     std::array<airframe_build::V3, 2> roll_pos{};                     ///< Roll posts, left then right (blowing down)
 };
 
-/// @brief Poses the F-35B from the flight model's lift-system snapshot.
+/// @brief Poses the F-35B from the flight model's lift-system snapshot and
+/// its weapons-bay doors (weapon_bay_doors()).
 /// Cheap (a few small matrices): called once per F-35B per frame.
-[[nodiscard]] inline StovlPose f35b_stovl_pose(const propulsion::StovlStatus& st) noexcept {
+[[nodiscard]] inline StovlPose f35b_stovl_pose(const propulsion::StovlStatus& st,
+                                               const WeaponBayDoors& bay = {}) noexcept {
     using namespace airframe_build;
     using namespace airframe_build::f35b_layout;
     const F35bRig& r = f35b_rig();
@@ -1256,6 +1358,14 @@ struct StovlPose {
         J[static_cast<size_t>(kFanDoorL + i)] = rotation_about(r.fan_exit_hinge[i], X, sgn * fan);
         J[static_cast<size_t>(kRollDoorL + i)] = rotation_about(r.roll_hinge[i], X, sgn * roll);
         J[static_cast<size_t>(kBsmDoorL + i)] = rotation_about(r.bsm_door_hinge[i], X, sgn * fan);
+    }
+    // Weapons bays: both doors of a bay swing their free edges (the seam)
+    // down about the bay's edges.
+    const float bay_open[2] = {kBayOpen * std::clamp(bay.left, 0.0f, 1.0f), kBayOpen * std::clamp(bay.right, 0.0f, 1.0f)};
+    constexpr float kBaySign[4] = {-1.0f, 1.0f, 1.0f, -1.0f}; // seam inboard (-y) or outboard (+y) of the hinge
+    for (size_t k = 0; k < 4; ++k) {
+        const V3 axis = r.bay_hinge_fwd[k] - r.bay_hinge_aft[k];
+        J[static_cast<size_t>(kBayInL) + k] = rotation_about(r.bay_hinge_fwd[k], axis, kBaySign[k] * bay_open[k / 2]);
     }
 
     // Vane box: every louvre turns about its own pivot, a shear in x by z.
@@ -1288,8 +1398,9 @@ struct StovlPose {
 }
 
 /// @brief Moving-part pose of @p type's airframe (none but the F-35B's).
-[[nodiscard]] inline JointPose airframe_pose(aircraft::AircraftType type, const propulsion::StovlStatus& st) noexcept {
-    if (type == aircraft::AircraftType::F35B_LIGHTNING_II) return f35b_stovl_pose(st).joints;
+[[nodiscard]] inline JointPose airframe_pose(aircraft::AircraftType type, const propulsion::StovlStatus& st,
+                                             const WeaponBayDoors& bay = {}) noexcept {
+    if (type == aircraft::AircraftType::F35B_LIGHTNING_II) return f35b_stovl_pose(st, bay).joints;
     return {};
 }
 
