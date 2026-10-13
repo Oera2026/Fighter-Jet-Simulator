@@ -8,6 +8,7 @@
 #include "fastjet/sim/ejection_seat.hpp"
 #include "fastjet/sim/gun.hpp"
 #include "fastjet/sim/missile.hpp"
+#include "fastjet/sim/missile_warning.hpp"
 #include "fastjet/sim/radar.hpp"
 #include <array>
 #include <cmath>
@@ -71,6 +72,7 @@ public:
     std::array<int, kMaxAircraft> chaff_load{};   ///< Chaff cartridges left
     std::array<int, kMaxAircraft> flare_load{};   ///< Flare cartridges left
     std::array<EjectionSeat, kMaxAircraft> seats{}; ///< Each jet's escape system
+    std::array<MissileWarningSystem, kMaxAircraft> maws{}; ///< Each jet's missile approach warner (read maws[i].status)
     int count{0};
     double time{0.0};
     bool dispersion{true};
@@ -352,6 +354,7 @@ private:
         step_missiles(dt);
         step_chaff(dt);
         step_flares(dt);
+        for (int i = 0; i < count; ++i) maws[static_cast<size_t>(i)].update(dt, i, aircraft[static_cast<size_t>(i)], missiles);
     }
 
     void fire_missiles(const std::array<AircraftControls, kMaxAircraft>& controls) noexcept {
