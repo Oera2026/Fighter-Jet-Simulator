@@ -25,16 +25,18 @@ public:
      *
      * @param fuel_kg Internal fuel remaining [kg].
      * @param type Aircraft model (defaults to F-16C).
+     * @param payload_kg Crew, ammunition and stores carried [kg].
      * @return MassProperties with gross mass and scaled inertia tensor.
      */
     [[nodiscard]] static MassProperties compute(
         double fuel_kg,
-        aircraft::AircraftType type = aircraft::AircraftType::F16_FIGHTING_FALCON
+        aircraft::AircraftType type = aircraft::AircraftType::F16_FIGHTING_FALCON,
+        double payload_kg = 0.0
     ) noexcept {
         const auto cfg = aircraft::AircraftConfig::get(type);
         const double fuel = std::max(0.0, fuel_kg);
         const double empty_mass = cfg.mass.empty_mass_kg;
-        const double gross_mass = empty_mass + fuel;
+        const double gross_mass = empty_mass + fuel + std::max(0.0, payload_kg);
 
         // Empty-airframe inertia
         const MassProperties empty = MassProperties::create(type);

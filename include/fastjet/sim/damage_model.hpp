@@ -7,6 +7,7 @@
 #include "fastjet/sim/combat_specs.hpp"
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 
 namespace fastjet::sim {
@@ -61,9 +62,12 @@ struct DamageRng {
  *  - Wing and tail hits cut control-surface authority; a wing or the
  *    structure as a whole can fail outright.
  *  - Cockpit hits can incapacitate the pilot.
+ *  - Over-G: past its rated load factor the airframe is overstressed; past
+ *    YIELD_FACTOR of it the wings take a permanent set (less roll authority,
+ *    a weaker structure); at ULTIMATE_FACTOR the structure fails outright.
  *
- * With no hits taken every effect is an exact identity, so an undamaged jet
- * flies bit-identically to one without a damage model.
+ * With no hits taken and no yield every effect is an exact identity, so an
+ * undamaged jet flies bit-identically to one without a damage model.
  */
 struct DamageState {
     static constexpr double ENGINE_DAMAGE_PER_HIT = 0.45;
@@ -73,6 +77,14 @@ struct DamageState {
     static constexpr double WING_DAMAGE_PER_HIT   = 0.22;
     static constexpr double TAIL_DAMAGE_PER_HIT   = 0.25;
     static constexpr double PILOT_HIT_CHANCE      = 0.30;
+    // Structural load limits, as multiples of the rated load factor. Design
+    // practice: no permanent deformation at limit load, failure at 1.5x it.
+    static constexpr double OVERSTRESS_FACTOR     = 1.03;  ///< Logged as an overstress (inspection)
+    static constexpr double YIELD_FACTOR          = 1.20;  ///< Permanent set begins
+    static constexpr double ULTIMATE_FACTOR       = 1.50;  ///< Structural failure
+    /// The load is filtered this much, so a single integration step's spike
+    /// does not count as a sustained structural load [s].
+    static constexpr double LOAD_FILTER_TAU_S     = 0.05;
 
     std::array<double, 2> engine_health{1.0, 1.0};
     int engine_count{1};
@@ -85,17 +97,61 @@ struct DamageState {
     double structure_used{0.0};
     double structure_capacity{8.0};
     bool pilot_incapacitated{false};
+    bool pilot_ejected{false};      ///< The cockpit is empty: the handle has been pulled
     bool destroyed{false};
     int hits_taken{0};
+    // Over-G
+    double g_limit_pos{9.0};
+    double g_limit_neg{-3.0};
+    double load_nz{1.0};            ///< Filtered structural load factor
+    double peak_load_ratio{0.0};    ///< Highest load / rated limit seen
+    double strength{1.0};           ///< Share of the ultimate strength left after yielding
+    bool overstressed{false};       ///< The rated limit has been exceeded
+    bool yielded{false};            ///< The wings have taken a permanent set
+    bool structural_failure{false}; ///< Broken by load, not by the enemy
 
     DamageState() noexcept = default;
 
     explicit DamageState(aircraft::AircraftType type) noexcept {
-        engine_count = aircraft::AircraftConfig::get(type).propulsion.engine_count;
+        const auto cfg = aircraft::AircraftConfig::get(type);
+        engine_count = cfg.propulsion.engine_count;
         structure_capacity = airframe_combat_spec(type).structure;
+        g_limit_pos = cfg.flcs.max_g_positive;
+        g_limit_neg = cfg.flcs.max_g_negative;
     }
 
-    [[nodiscard]] bool damaged() const noexcept { return hits_taken > 0; }
+    [[nodiscard]] bool damaged() const noexcept { return hits_taken > 0 || yielded; }
+
+    /// @brief Load as a multiple of the rated limit in its own direction.
+    [[nodiscard]] double load_ratio(double nz) const noexcept {
+        return nz >= 0.0 ? nz / g_limit_pos : nz / g_limit_neg;
+    }
+
+    /// @brief Apply the airframe's structural load factor for one step.
+    /// Returns true on the step the structure fails.
+    bool apply_load(double nz, double dt) noexcept {
+        if (destroyed || dt <= 0.0) return false;
+        load_nz += (nz - load_nz) * (1.0 - std::exp(-dt / LOAD_FILTER_TAU_S));
+        const double ratio = load_ratio(load_nz);
+        peak_load_ratio = std::max(peak_load_ratio, ratio);
+        if (ratio > OVERSTRESS_FACTOR) overstressed = true;
+        if (ratio >= ULTIMATE_FACTOR * strength) {
+            structural_failure = true;
+            destroyed = true;
+            return true;
+        }
+        if (ratio > YIELD_FACTOR) {
+            // Permanent set grows with the load past yield. A bent wing rolls
+            // less well, and a yielded structure breaks at a lower load.
+            const double set = std::clamp((ratio - YIELD_FACTOR) / (ULTIMATE_FACTOR - YIELD_FACTOR), 0.0, 1.0);
+            yielded = true;
+            const double wing = 1.0 - 0.5 * set;
+            wing_left = std::min(wing_left, wing);
+            wing_right = std::min(wing_right, wing);
+            strength = std::min(strength, 1.0 - 0.25 * set);
+        }
+        return false;
+    }
 
     /// @brief Thrust multiplier across the installed engines.
     [[nodiscard]] double thrust_factor() const noexcept {

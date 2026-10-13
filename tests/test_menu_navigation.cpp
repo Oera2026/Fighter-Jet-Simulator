@@ -80,6 +80,60 @@ void test_main_menu_keyboard_flow() {
     std::cout << "PASS\n";
 }
 
+void test_evade_setup_flow() {
+    std::cout << "[Test] Evade: pick the threat, then the jet, then launch... " << std::flush;
+    SettingsManager s;
+    s.load();
+    MenuSystem m(s, AppInfo{});
+    m.set_current_aircraft(fastjet::aircraft::AircraftType::F15EX_EAGLE_II);
+    m.open(ScreenId::MAIN, false);
+    frames(m);
+    focus_down_to(m, MainMenuScreen::EVADE);
+    press(m, NavCommand::ACCEPT);
+    frames(m);
+    assert(m.current_screen() == ScreenId::EVADE_DIFFICULTY && !m.poll_action());
+    // Opens on MEDIUM; the focused level is the choice.
+    assert(m.focused_id() == EvadeSetupScreen::kOptionBase + 1);
+    press(m, NavCommand::DOWN);
+    assert(m.evade_choice().difficulty == 2);
+
+    // BACK from the jet list returns to the threat list with the choice kept.
+    press(m, NavCommand::ACCEPT);
+    frames(m);
+    assert(m.current_screen() == ScreenId::EVADE_AIRCRAFT);
+    assert(m.evade_choice().jet == fastjet::aircraft::AircraftType::F15EX_EAGLE_II); // Opens on the jet you fly
+    press(m, NavCommand::BACK);
+    frames(m);
+    assert(m.current_screen() == ScreenId::EVADE_DIFFICULTY && m.focused_id() == EvadeSetupScreen::kOptionBase + 2);
+    press(m, NavCommand::DOWN); // EXPERT
+    focus_down_to(m, EvadeSetupScreen::kGo); // NEXT from the footer uses the choice
+    press(m, NavCommand::ACCEPT);
+    frames(m);
+    assert(m.current_screen() == ScreenId::EVADE_AIRCRAFT && m.evade_choice().difficulty == 3);
+
+    press(m, NavCommand::DOWN); // Typhoon
+    press(m, NavCommand::DOWN); // F-22A
+    assert(m.evade_choice().jet == fastjet::aircraft::AircraftType::F22_RAPTOR);
+    assert(!m.poll_action());
+    press(m, NavCommand::ACCEPT);
+    assert(m.poll_action() == MenuAction::START_EVADE);
+    assert(m.evade_choice().difficulty == 3 && m.evade_choice().jet == fastjet::aircraft::AircraftType::F22_RAPTOR);
+
+    // The F-35B is the last jet on the list.
+    m.open(ScreenId::EVADE_AIRCRAFT, false);
+    frames(m);
+    for (int i = 0; i < 4; ++i) press(m, NavCommand::DOWN); // From the F-15EX you fly
+    assert(m.evade_choice().jet == fastjet::aircraft::AircraftType::F35B_LIGHTNING_II);
+
+    // BACK from the threat list leaves for the main menu without launching.
+    m.open(ScreenId::EVADE_DIFFICULTY, false);
+    frames(m);
+    press(m, NavCommand::BACK);
+    frames(m);
+    assert(m.current_screen() == ScreenId::MAIN && !m.poll_action());
+    std::cout << "PASS\n";
+}
+
 void test_quit_confirmation() {
     std::cout << "[Test] Main menu: quit asks first, defaults to Cancel... " << std::flush;
     SettingsManager s;
@@ -250,6 +304,11 @@ void test_key_rebinding() {
     m.handle(InputEvent::key_capture(scancode::M)); // reserved: rejected, still listening
     frames(m, 2);
     assert(m.is_capturing_key());
+    m.handle(InputEvent::key_capture(scancode::F12)); // F-35B direct select
+    m.handle(InputEvent::key_capture(scancode::NUM_6)); // F-35B in the airframe menu
+    frames(m, 2);
+    assert(m.is_capturing_key());
+    assert(s.pending().controls.binding(InputAction::STOVL_MODE).primary == scancode::S);
     assert(s.pending().controls.binding(InputAction::PITCH_DOWN).primary == scancode::UP);
 
     m.handle(InputEvent::key_capture(scancode::A)); // steals A from RUDDER LEFT
@@ -311,6 +370,7 @@ int main() {
     std::cout << "=========================================================\n";
     test_main_menu_keyboard_flow();
     test_quit_confirmation();
+    test_evade_setup_flow();
     test_settings_edit_apply_revert();
     test_pointer_toggle_and_slider_drag();
     test_dropdown();

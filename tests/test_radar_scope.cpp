@@ -8,8 +8,13 @@
  * STT: designating a brick locks the jet through the world's radar, so the
  * target's RWR hears it; a broken lock drops back to RWS without relocking
  * by itself, and a stale brick cannot be locked.
+ * Narrower RWS scans refresh faster. ACM finds and locks a jet in a close
+ * fight that the 4-bar RWS block never sees.
+ * The 360 deg sweep display paints a jet behind the ownship once per turn
+ * of its beam, where it was, and scales itself to the nearest jet.
  */
 #include "fastjet/sim/radar_scope.hpp"
+#include "fastjet/sim/sweep_scope.hpp"
 #include <cassert>
 #include <cmath>
 #include <iostream>
@@ -213,11 +218,13 @@ void test_range_scales() {
     assert(scope.mode == RadarScope::Mode::STT);
     scope.range_down();
     run(*w, scope, DT);
-    assert(scope.range_index == 1); // bumped back out to 20 nm
+    assert(scope.range_index == 2); // bumped back out to 20 nm
     for (int i = 0; i < 6; ++i) scope.range_up();
-    assert(scope.range_index == 3);
+    assert(scope.range_index == 4);
     run(*w, scope, 2.0 * DT);
-    assert(scope.range_index == 1); // 14 nm is under 40% of 80 and 40 nm: stepped down to 20
+    assert(scope.range_index == 2); // 14 nm is under 40% of 80 and 40 nm: stepped down to 20
+    for (int i = 0; i < 6; ++i) scope.range_down();
+    assert(scope.range_index == 0 && scope.range_scale_m() == 5.0 * 1852.0);
     std::cout << "  -> PASSED\n";
 }
 
@@ -248,7 +255,217 @@ void test_new_world_resets_the_scope() {
     std::cout << "  -> PASSED\n";
 }
 
+void test_narrow_rws_scan() {
+    std::cout << "[FCR] RWS azimuth A6 / A3 / A1: narrower scans refresh faster...\n";
+    auto w = two_jets({15000.0, 0.0, 0.0}, 0.0);
+    RadarScope scope;
+    scope.sync(*w, 0);
+    const double frame_s[3] = {FRAME_S, FRAME_S / 2.0, FRAME_S / 6.0};
+    for (int k = 0; k < 3; ++k) {
+        assert(scope.rws_az_index == k);
+        const auto c = cruise();
+        double t = 0.0;
+        while (scope.frame == 0) {
+            w->step(DT, c);
+            scope.step(DT, *w, 0);
+            t += DT;
+            assert(t < 20.0);
+        }
+        std::cout << "    A" << static_cast<int>(RadarScope::kRwsAzLimitsDeg[static_cast<size_t>(k)] / 10.0)
+                  << ": frame " << t << " s, " << scope.hit_count << " brick\n";
+        assert(std::abs(t - frame_s[k]) < 0.02);
+        assert(scope.hit_count == 1); // dead ahead: in every scan
+        scope.cycle_scan();
+        assert(scope.frame == 0 && scope.hit_count == 0);
+    }
+    assert(scope.rws_az_index == 0);
+    // 20 deg off the nose is outside A1.
+    w = two_jets({15000.0 * std::cos(20.0 * DEG), 15000.0 * std::sin(20.0 * DEG), 0.0}, 0.0);
+    scope.cycle_scan();
+    scope.cycle_scan();
+    run(*w, scope, 3.0 * FRAME_S / 6.0);
+    assert(scope.rws_az_index == 2 && scope.frame >= 2 && scope.hit_count == 0);
+    std::cout << "  -> PASSED\n";
+}
+
+/// Pitch the ownship up by @p pitch (level wings) and keep it there.
+void set_pitch(sim::World& w, double pitch) {
+    w.aircraft[0].state.q_att = math::Quaternion::from_euler(0.0, pitch, 0.0);
+}
+
+void test_acm_auto_acquires_in_a_close_fight() {
+    std::cout << "[FCR] ACM: nose-referenced scans lock the bandit that RWS never sees...\n";
+    // 1.5 km ahead and 600 m above: 22 deg up, well outside the 4-bar block.
+    const math::Vector3 above(1500.0, 0.0, -600.0);
+    {
+        auto w = two_jets(above, 0.0);
+        RadarScope scope;
+        run(*w, scope, FRAME_S + 0.2);
+        assert(scope.hit_count == 0 && !w->radars[0].locked());
+    }
+    // ACM 20x30 with the jet above the HUD: nothing. Pull the nose onto it: locked.
+    auto w = two_jets(above, 0.0);
+    RadarScope scope;
+    scope.sync(*w, 0);
+    scope.range_up(); // pilot's CRM scale, 40 nm
+    scope.toggle_master_mode(*w);
+    assert(scope.acm && scope.mode == RadarScope::Mode::ACM);
+    assert(scope.range_index == RadarScope::ACM_RANGE_INDEX);
+    assert(scope.acm_scan == RadarScope::AcmScan::HUD_20X30);
+    const double up = std::atan2(600.0, 1500.0);
+    run(*w, scope, 2.0);
+    assert(!w->radars[0].locked() && scope.mode == RadarScope::Mode::ACM);
+
+    // 10x60 reaches 50 deg up the lift vector: it finds the jet with the nose level.
+    scope.cycle_scan();
+    assert(scope.acm_scan == RadarScope::AcmScan::VERTICAL_10X60);
+    double t = 0.0;
+    while (scope.mode != RadarScope::Mode::STT) {
+        w->aircraft[1].state.pos_ned = w->aircraft[0].position() + above; // hold the geometry
+        run(*w, scope, DT);
+        t += DT;
+        assert(t < 3.0);
+    }
+    std::cout << "    10x60: locked " << up / DEG << " deg up after " << t << " s\n";
+    assert(scope.locked_target(*w) == 1 && w->rwr(1).level == sim::RwrStatus::Level::LOCK);
+    assert(scope.range_index == 0); // 1 nm: STT steps down to the 5 nm scale
+
+    // TMS aft goes back to the ACM scan, not RWS.
+    scope.undesignate(*w);
+    assert(scope.mode == RadarScope::Mode::ACM && !w->radars[0].locked());
+
+    // 20x30 with the nose pulled 15 deg up puts the jet in the HUD.
+    scope.cycle_scan();
+    scope.cycle_scan();
+    assert(scope.acm_scan == RadarScope::AcmScan::HUD_20X30);
+    t = 0.0;
+    while (scope.mode != RadarScope::Mode::STT) {
+        set_pitch(*w, up - 7.0 * DEG);
+        w->aircraft[1].state.pos_ned = w->aircraft[0].position() + above;
+        run(*w, scope, DT);
+        t += DT;
+        assert(t < 3.0);
+    }
+    std::cout << "    20x30: locked after " << t << " s\n";
+
+    // BORE: only a jet on the nose.
+    scope.undesignate(*w);
+    scope.cycle_scan();
+    scope.cycle_scan();
+    assert(scope.acm_scan == RadarScope::AcmScan::BORE);
+    for (int i = 0; i < 100; ++i) {
+        set_pitch(*w, up - 5.0 * DEG);
+        w->aircraft[1].state.pos_ned = w->aircraft[0].position() + above;
+        run(*w, scope, DT);
+    }
+    assert(scope.mode == RadarScope::Mode::ACM);
+    for (int i = 0; i < 100; ++i) {
+        set_pitch(*w, up);
+        w->aircraft[1].state.pos_ned = w->aircraft[0].position() + above;
+        run(*w, scope, DT);
+    }
+    assert(scope.mode == RadarScope::Mode::STT);
+    std::cout << "    BORE: locked on the nose only\n";
+
+    // Back to CRM: the lock goes and the pilot's range scale returns.
+    scope.toggle_master_mode(*w);
+    assert(!scope.acm && scope.mode == RadarScope::Mode::RWS && !w->radars[0].locked());
+    assert(scope.range_index == RadarScope::DEFAULT_RANGE_INDEX + 1);
+    std::cout << "  -> PASSED\n";
+}
+
+void test_acm_range_gate() {
+    std::cout << "[FCR] ACM ignores jets beyond 10 nm...\n";
+    auto w = two_jets({25000.0, 0.0, 0.0}, 0.0); // 13.5 nm dead ahead
+    RadarScope scope;
+    scope.sync(*w, 0);
+    scope.set_master_mode(*w, true); // the dogfight switch
+    scope.set_master_mode(*w, true); // already there: no change
+    assert(scope.acm && scope.mode == RadarScope::Mode::ACM);
+    scope.cycle_scan();
+    scope.cycle_scan(); // BORE, right on it
+    run(*w, scope, 2.0);
+    assert(scope.mode == RadarScope::Mode::ACM && !w->radars[0].locked());
+    // Inside 10 nm on the boresight, wherever the nose has trimmed to.
+    const math::Vector3 nose = w->aircraft[0].state.q_att.rotate_body_to_ned(math::Vector3(1.0, 0.0, 0.0));
+    w->aircraft[1].state.pos_ned = w->aircraft[0].position() + nose * 15000.0;
+    run(*w, scope, 0.3);
+    assert(scope.mode == RadarScope::Mode::STT);
+    std::cout << "  -> PASSED\n";
+}
+
 } // namespace
+
+void test_sweep_paints_all_round_once_a_turn() {
+    std::cout << "[SWEEP] The beam paints a jet in the six once a turn, where it was...\n";
+    using sim::SweepScope;
+    // Directly astern at 0.5 nm: out of the FCR's reach, 180 deg round the beam.
+    auto w = two_jets(math::Vector3(-926.0, 0.0, 0.0), 0.0);
+    SweepScope sweep;
+    const auto c = cruise();
+    auto fly = [&](double seconds) {
+        for (int i = 0; i < static_cast<int>(seconds / DT + 0.5); ++i) {
+            w->step(DT, c);
+            sweep.update(*w, 0, DT);
+        }
+    };
+    fly(0.45 * SweepScope::PERIOD_S);
+    assert(sweep.blip_count == 0); // The beam has not reached 6 o'clock yet
+    fly(0.1 * SweepScope::PERIOD_S);
+    assert(sweep.blip_count == 1 && sweep.blips[0].id == 1);
+    const double painted = sweep.blips[0].painted_s;
+    const math::Vector3 at_paint = sweep.blips[0].pos;
+    std::cout << "    painted at " << painted << " s, bearing "
+              << SweepScope::relative_bearing(w->aircraft[0].state, at_paint) / DEG << " deg, scale "
+              << SweepScope::SCALES_NM[static_cast<size_t>(sweep.scale)] << " nm\n";
+    assert(std::abs(painted - 0.5 * SweepScope::PERIOD_S) < 0.02);
+    assert(std::abs(SweepScope::relative_bearing(w->aircraft[0].state, at_paint) / DEG - 180.0) < 3.0);
+    assert(SweepScope::SCALES_NM[static_cast<size_t>(sweep.scale)] == 1.0); // Fits a half-mile fight
+
+    // Between paints the blip holds where the jet was; one turn later it moves on.
+    fly(0.5 * SweepScope::PERIOD_S);
+    assert(sweep.blips[0].painted_s == painted && sweep.blips[0].pos.x == at_paint.x);
+    assert(sweep.age(sweep.blips[0]) > 0.4);
+    fly(0.55 * SweepScope::PERIOD_S);
+    assert(sweep.blip_count == 1 && std::abs(sweep.blips[0].painted_s - painted - SweepScope::PERIOD_S) < 0.05);
+    assert(sweep.blips[0].pos.x > at_paint.x + 400.0); // 250 m/s for a turn
+
+    // A jet that goes down fades out and is gone within two turns.
+    w->aircraft[1].crashed = true;
+    fly(2.0 * SweepScope::PERIOD_S);
+    assert(sweep.blip_count == 0);
+    std::cout << "  -> PASSED\n";
+}
+
+void test_sweep_scale_follows_the_nearest_jet() {
+    std::cout << "[SWEEP] The range scale fits the nearest jet, with hysteresis...\n";
+    using sim::SweepScope;
+    auto scale_for = [](double nm) {
+        auto w = two_jets(math::Vector3(0.0, nm * 1852.0, 0.0), 0.0);
+        SweepScope sweep;
+        sweep.update(*w, 0, DT);
+        return SweepScope::SCALES_NM[static_cast<size_t>(sweep.scale)];
+    };
+    assert(scale_for(0.5) == 1.0);
+    assert(scale_for(1.5) == 2.0);
+    assert(scale_for(3.0) == 5.0);
+    assert(scale_for(10.0) == 20.0); // Evade's start, with room to spare
+    assert(scale_for(60.0) == 40.0); // Past the largest: on the rim
+
+    // Once set, it changes only as the beam passes the nose and past the band.
+    auto w = two_jets(math::Vector3(0.0, 0.5 * 1852.0, 0.0), 0.0);
+    SweepScope sweep;
+    sweep.update(*w, 0, DT);
+    w->aircraft[1].state.pos_ned.y = 0.93 * 1852.0; // Inside the 1 nm hysteresis band
+    for (int i = 0; i < static_cast<int>(1.5 * SweepScope::PERIOD_S / DT); ++i) sweep.update(*w, 0, DT);
+    assert(SweepScope::SCALES_NM[static_cast<size_t>(sweep.scale)] == 1.0);
+    w->aircraft[1].state.pos_ned.y = 1.2 * 1852.0;
+    sweep.update(*w, 0, 0.1 * SweepScope::PERIOD_S);
+    assert(SweepScope::SCALES_NM[static_cast<size_t>(sweep.scale)] == 1.0); // Not mid-turn
+    for (int i = 0; i < static_cast<int>(SweepScope::PERIOD_S / DT); ++i) sweep.update(*w, 0, DT);
+    assert(SweepScope::SCALES_NM[static_cast<size_t>(sweep.scale)] == 2.0);
+    std::cout << "  -> PASSED\n";
+}
 
 int main() {
     std::cout << "=========================================================\n";
@@ -261,6 +478,11 @@ int main() {
     test_range_scales();
     test_no_radar();
     test_new_world_resets_the_scope();
+    test_narrow_rws_scan();
+    test_acm_auto_acquires_in_a_close_fight();
+    test_acm_range_gate();
+    test_sweep_paints_all_round_once_a_turn();
+    test_sweep_scale_follows_the_nearest_jet();
     std::cout << "\nAll radar scope tests passed successfully!\n";
     return 0;
 }

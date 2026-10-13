@@ -27,6 +27,8 @@ struct RadarSpec {
         case T::F22_RAPTOR:          return {true, "22", 46300.0, 60.0, 20.0, 2.0, 0.45};
         // No air-to-air radar: the A-10 fights with its eyes and its gun.
         case T::A10_THUNDERBOLT:     return {false, "", 0.0, 0.0, 0.0, 0.0, 0.0};
+        // AN/APG-81 AESA: fixed array, +-60 deg electronic scan.
+        case T::F35B_LIGHTNING_II:   return {true, "35", 46300.0, 60.0, 20.0, 2.0, 0.45};
     }
     return {};
 }

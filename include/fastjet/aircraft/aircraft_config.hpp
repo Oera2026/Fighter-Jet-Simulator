@@ -16,6 +16,9 @@ struct MassConfig {
     double Iyy{75674.0};
     double Izz{85552.0};
     double Ixz{1331.0};
+    /// Pilot(s), full gun ammunition and a typical air-to-air loadout with its
+    /// launchers. Carried on top of the empty mass and fuel in every flight.
+    double combat_payload_kg{0.0};
 };
 
 /**
@@ -62,6 +65,13 @@ struct AeroConfig {
     double pitch_damping{ -10.0 };     ///< Cmq pitch damping derivative
     double roll_damping{ -0.45 };      ///< Clp roll damping derivative
     double yaw_damping{ -0.20 };       ///< Cnr yaw damping derivative
+    // Stall. x is the linear (attached-flow) lift over cl_max: 1.0 is where a
+    // straight lift line would reach CLmax.
+    double stall_peak_x{1.30};         ///< Lift rounds off to CLmax by this x
+    double stall_break_x{1.50};        ///< Post-stall lift loss starts here...
+    double stall_width_x{1.00};        ///< ...and is complete this much further on
+    double cn_90{1.60};                ///< Flat-plate normal-force coefficient at 90 deg alpha
+    double cm_90{0.30};                ///< Nose-down pitching moment at 90 deg alpha
 };
 
 /**
@@ -72,7 +82,8 @@ struct FLCSConfig {
         DIGITAL_FBW_G_ALPHA,  ///< F-16 & F-15EX: G-command / Alpha-limited digital FBW
         CAREFREE_DELTA_CANARD,///< Eurofighter: Relaxed pitch stability carefree FBW
         FBW_TVC_ALLOCATED,    ///< F-22: 5th-gen FBW with unified aero and 2D TVC
-        HYDRO_SAS_AUGMENTED   ///< A-10: Mechanical linkage with dual pitch/yaw SAS
+        HYDRO_SAS_AUGMENTED,  ///< A-10: Mechanical linkage with dual pitch/yaw SAS
+        UNIFIED_STOVL         ///< F-35B: G/alpha FBW up-and-away; unified STOVL law once converted
     };
 
     LawType law_type{LawType::DIGITAL_FBW_G_ALPHA};
@@ -99,6 +110,41 @@ struct LandingGearConfig {
 };
 
 /**
+ * @brief Shaft-driven lift system of a STOVL jet (F-35B: Rolls-Royce LiftSystem).
+ *
+ * Thrusts are the installed sea-level-static ratings with the system fully
+ * converted at maximum STOVL power; they scale with the engine's power and
+ * its density lapse. Positions are body axes from the CG [m] (x fwd, y right,
+ * z down). Unequipped airframes keep the defaults and never use it.
+ */
+struct StovlConfig {
+    bool equipped{false};
+    double lift_fan_thrust_n{0.0};      ///< LiftFan through the vane box
+    double nozzle_thrust_n{0.0};        ///< Core + bypass through the 3BSM with the fan clutched
+    double roll_post_thrust_n{0.0};     ///< Both roll posts together (bypass air)
+    math::Vector3 lift_fan_pos_b{};     ///< Vane-box exit
+    math::Vector3 nozzle_pos_b{};       ///< 3BSM exit, nozzle down
+    math::Vector3 roll_post_pos_b{};    ///< Right roll post (the left is mirrored)
+    math::Vector3 fan_inlet_pos_b{};    ///< LiftFan inlet, where its intake momentum drag acts
+    double fan_mass_flow_kgs{0.0};      ///< LiftFan airflow at full power (intake momentum drag)
+    double fan_split_authority{0.0};    ///< LiftFan IGV thrust modulation for pitch, share of fan thrust
+    double nozzle_max_deg{95.0};        ///< 3BSM: 0 aft .. 90 down .. max
+    double nozzle_rate_dps{40.0};
+    double nozzle_yaw_max_deg{0.0};     ///< 3BSM lateral vectoring for yaw
+    double nozzle_yaw_rate_dps{30.0};
+    double vane_min_deg{0.0};           ///< Vane box: fan thrust vector from vertical, + aft
+    double vane_max_deg{0.0};
+    double vane_rate_dps{30.0};
+    double door_open_s{6.0};            ///< All STOVL doors open
+    double door_close_s{5.0};
+    double clutch_engage_s{7.0};        ///< LiftFan clutch engagement, spin-up and lock-up
+    double clutch_release_s{2.5};
+    double max_conversion_kcas{250.0};  ///< Conversion to STOVL inhibited above this
+    double tsfc_stovl{1.8e-5};          ///< Fuel per newton of total lift-system thrust [kg/(N s)]
+    double tau_spool_s{0.35};           ///< Small-signal thrust response in STOVL engine mode
+};
+
+/**
  * @brief Complete unified aircraft configuration specification.
  */
 struct AircraftConfig {
@@ -109,6 +155,7 @@ struct AircraftConfig {
     AeroConfig aero{};
     FLCSConfig flcs{};
     LandingGearConfig gear{};
+    StovlConfig stovl{};
 
     /**
      * @brief Returns the verified technical configuration for any supported aircraft.
@@ -125,7 +172,9 @@ struct AircraftConfig {
                 // scaled to the empty weight; FuelSystem scales them back up with fuel.
                 cfg.mass = MassConfig{
                     8935.8, 3175.1, 19187.0,
-                    12373.0, 72723.0, 82216.0, 1279.0
+                    12373.0, 72723.0, 82216.0, 1279.0,
+                    // Pilot 100, 510 x 20 mm 130, 2 AIM-120 + 2 AIM-9 480, rails and pylons 90
+                    800.0
                 };
                 cfg.propulsion = PropulsionConfig{
                     1, 4450.0, 75600.0, 129000.0,
@@ -138,7 +187,8 @@ struct AircraftConfig {
                     27.87, 9.144, 3.450, 3.0, 40.0,
                     0.020, 0.16, 4.0, 1.4,
                     0.86, 1.05, 0.026, 0.017,
-                    0.025, 0.006, -10.0, -0.45, -0.20
+                    0.025, 0.006, -10.0, -0.45, -0.20,
+                    1.30, 1.50, 1.00, 1.80, 0.36
                 };
                 cfg.flcs = FLCSConfig{
                     FLCSConfig::LawType::DIGITAL_FBW_G_ALPHA,
@@ -158,7 +208,9 @@ struct AircraftConfig {
                 // 31,700 lb empty, 13,550 lb internal fuel, 81,000 lb MTOW
                 cfg.mass = MassConfig{
                     14379.0, 6146.0, 36741.0,
-                    42500.0, 255000.0, 290000.0, 3100.0
+                    42500.0, 255000.0, 290000.0, 3100.0,
+                    // Crew of two 200, 510 x 20 mm 130, 4 AIM-120 + 2 AIM-9 780, pylons and launchers 190
+                    1300.0
                 };
                 // 2x GE F110-GE-129 engines: 34,000 lbf dry (151.2 kN), 59,000 lbf AB (262.4 kN)
                 cfg.propulsion = PropulsionConfig{
@@ -173,7 +225,8 @@ struct AircraftConfig {
                     56.49, 13.045, 4.858, 3.01, 45.0,
                     0.0175, 0.12, 4.4, 1.45,
                     0.88, 1.15, 0.028, 0.018,
-                    0.045, 0.008, -12.5, -0.42, -0.22
+                    0.045, 0.008, -12.5, -0.42, -0.22,
+                    1.30, 1.50, 1.00, 1.70, 0.30
                 };
                 // Modern Digital Fly-By-Wire system
                 cfg.flcs = FLCSConfig{
@@ -195,7 +248,9 @@ struct AircraftConfig {
                 // 11,000 kg empty, 4,998 kg fuel, 23,500 kg MTOW
                 cfg.mass = MassConfig{
                     11000.0, 4998.0, 23500.0,
-                    19500.0, 98000.0, 115000.0, 1500.0
+                    19500.0, 98000.0, 115000.0, 1500.0,
+                    // Pilot 100, 150 x 27 mm 75, 4 BVR + 2 ASRAAM 800, launchers 125
+                    1100.0
                 };
                 // 2x Eurojet EJ200: 120.0 kN dry, 180.0 kN AB. Dry supercruise at Mach 1.50!
                 cfg.propulsion = PropulsionConfig{
@@ -210,7 +265,8 @@ struct AircraftConfig {
                     51.20, 10.950, 4.220, 2.34, 53.0,
                     0.0150, 0.14, 3.8, 1.60,
                     0.90, 1.10, 0.020, 0.014,
-                    0.040, 0.005, -9.0, -0.38, -0.18
+                    0.040, 0.005, -9.0, -0.38, -0.18,
+                    1.30, 1.60, 1.20, 1.80, 0.30
                 };
                 // Quadruple carefree handling digital FBW
                 cfg.flcs = FLCSConfig{
@@ -232,7 +288,9 @@ struct AircraftConfig {
                 // 19,659 kg empty (43,340 lb), 8,165 kg fuel (18,000 lb), 37,875 kg MTOW
                 cfg.mass = MassConfig{
                     19659.0, 8165.0, 37875.0,
-                    61012.0, 379629.0, 427082.0, 4745.0
+                    61012.0, 379629.0, 427082.0, 4745.0,
+                    // Pilot 100, 480 x 20 mm 125, 6 AIM-120 + 2 AIM-9 1080, bay launchers 195
+                    1500.0
                 };
                 // 2x F119-PW-100: 232.0 kN dry, 312.0 kN AB. Dry supercruise at Mach 1.82!
                 // 2D Pitch TVC nozzles (+/- 20 deg)
@@ -246,9 +304,10 @@ struct AircraftConfig {
                 // S_ref = 78.04 m^2 (840 sq ft), b = 13.56 m, c_bar = 6.40 m
                 cfg.aero = AeroConfig{
                     78.04, 13.564, 6.401, 2.36, 48.0,
-                    0.0165, 0.13, 3.9, 1.65,
+                    0.0165, 0.13, 3.9, 2.00,
                     0.92, 1.12, 0.022, 0.015,
-                    0.035, 0.004, -14.0, -0.40, -0.25
+                    0.035, 0.004, -14.0, -0.40, -0.25,
+                    1.30, 1.60, 1.20, 1.90, 0.25
                 };
                 // Integrated FBW + 2D TVC Mixer
                 cfg.flcs = FLCSConfig{
@@ -270,7 +329,9 @@ struct AircraftConfig {
                 // 11,321 kg empty (24,959 lb), 4,990 kg fuel (11,000 lb), 22,680 kg MTOW
                 cfg.mass = MassConfig{
                     11321.0, 4990.0, 22680.0,
-                    47047.0, 69689.0, 106432.0, -2440.0
+                    47047.0, 69689.0, 106432.0, -2440.0,
+                    // Pilot 100, 1,150 x 30 mm 790, 2 AIM-9 + ECM pod 270, pylons 340
+                    1500.0
                 };
                 // 2x GE TF34-GE-100A: 80.6 kN dry, NO AFTERBURNER!
                 // High nacelle mount pitch coupling: thrust line Z offset = -1.2 m
@@ -290,7 +351,8 @@ struct AircraftConfig {
                     47.01, 17.526, 3.030, 6.54, 0.0,
                     0.043, 0.055, 5.1, 1.80,
                     0.65, 0.85, 0.055, 0.045,
-                    0.060, 0.000, -11.0, -0.55, -0.28
+                    0.060, 0.000, -11.0, -0.55, -0.28,
+                    1.15, 1.25, 0.60, 1.50, 0.35
                 };
                 // Mechanical linkage with dual Pitch/Yaw Stability Augmentation System (SAS)
                 cfg.flcs = FLCSConfig{
@@ -304,6 +366,73 @@ struct AircraftConfig {
                     math::Vector3(-0.40, -2.62, 0.35),
                     math::Vector3(-0.40, 2.62, 0.35),
                     4.80e5, 5.50e4, 1.50, 0.48, 35.0
+                };
+                break;
+            }
+
+            case AircraftType::F35B_LIGHTNING_II: {
+                cfg.display_name = "F-35B Lightning II";
+                // Figures from docs/f35b-reference.md (sources tagged there).
+                // 32,472 lb empty, 13,100 lb internal fuel, 60,000 lb class MTOW. Inertias
+                // are estimates (F-16 tensor scaled by m L^2), taken back to the empty weight.
+                cfg.mass = MassConfig{
+                    14729.0, 5942.0, 27200.0,
+                    26850.0, 128850.0, 150300.0, 2140.0,
+                    // Pilot 100, 4 AIM-120C internal 610, GAU-22/A pod with 220 x 25 mm 290
+                    1000.0
+                };
+                // F135-PW-600: 27,000 lbf (120.1 kN) military, 41,000 lbf class (182.4 kN)
+                // reheat in CTOL (P&W). Reheat is not available in STOVL.
+                cfg.propulsion = PropulsionConfig{
+                    1, 6000.0, 120100.0, 182400.0,
+                    true, false, 1.0,
+                    3.0, 1.5, 0.5,
+                    2.20e-5, 5.40e-5, 0.0,
+                    false, 0.0, 0.0
+                };
+                // S_ref = 460 sq ft (42.7 m^2), b = 35 ft (10.67 m), MAC 4.51 m, LE sweep 34.1.
+                // CD0 0.021 subsonic, peaking at the blunt fuselage's 0.046 transonic; the
+                // supersonic plateau is set so reheat runs out at the M1.6 limit (this
+                // engine model's ram recovery is the F119's, more than a BPR 0.57 F135
+                // gets). CLmax 1.5 near 35 deg with no hard stall out to the 50 deg limit.
+                cfg.aero = AeroConfig{
+                    42.70, 10.670, 4.510, 2.67, 34.1,
+                    0.0210, 0.15, 3.3, 1.50,
+                    0.88, 1.10, 0.025, 0.036,
+                    0.030, 0.004, -11.0, -0.40, -0.22,
+                    1.30, 1.60, 1.20, 1.80, 0.30
+                };
+                // F-35B: +7.0 / -3.0 G, 50 deg AoA limiter, ~200 deg/s roll.
+                cfg.flcs = FLCSConfig{
+                    FLCSConfig::LawType::UNIFIED_STOVL,
+                    7.0, -3.0, 50.0, 200.0
+                };
+                // Wheelbase 6.02 m, track 4.34 m, wheels 1.9 m below the CG.
+                cfg.gear = LandingGearConfig{
+                    math::Vector3(5.40, 0.0, 0.40), 1.40e5, 1.70e4,
+                    math::Vector3(-0.60, -2.17, 0.40),
+                    math::Vector3(-0.60, 2.17, 0.40),
+                    5.00e5, 6.00e4, 1.50, 0.50, 30.0
+                };
+                // F135-PW-600 + Rolls-Royce LiftSystem, P&W hover split: 40,650 lbf =
+                // LiftFan 18,680 + 3BSM 18,680 + roll posts 2 x 1,645 lbf. Post positions
+                // are estimates: the fan sits just behind the cockpit (~5 m from the
+                // nose) and the swivelled 3BSM exit under the aft fuselage (~13.3 m);
+                // equal fan/nozzle thrust puts the CG midway, so the arms are equal.
+                // 3BSM 0-95 deg in 2.5 s; vane box 54 deg in < 2 s; fan limit 250 KCAS;
+                // conversion ~15 s to STOVL, ~10 s back.
+                cfg.stovl = StovlConfig{
+                    true,
+                    83090.0, 83090.0, 14630.0,
+                    math::Vector3(4.20, 0.0, 0.60),
+                    math::Vector3(-4.20, 0.0, 0.70),
+                    math::Vector3(-0.30, 2.40, 0.30),
+                    math::Vector3(4.20, 0.0, -1.00),
+                    230.0, 0.10,
+                    95.0, 38.0, 12.0, 30.0,
+                    -5.0, 49.0, 27.0,
+                    6.0, 5.0, 7.0, 2.5, 250.0,
+                    1.8e-5, 0.35
                 };
                 break;
             }

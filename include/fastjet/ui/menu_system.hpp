@@ -3,6 +3,8 @@
 #include "fastjet/ui/input_events.hpp"
 #include "fastjet/ui/screen.hpp"
 #include "fastjet/ui/screens/credits_screen.hpp"
+#include "fastjet/ui/screens/dogfight_setup_screen.hpp"
+#include "fastjet/ui/screens/evade_setup_screen.hpp"
 #include "fastjet/ui/screens/main_menu_screen.hpp"
 #include "fastjet/ui/screens/settings_screen.hpp"
 #include <algorithm>
@@ -38,6 +40,18 @@ public:
         screens_[index(ScreenId::MAIN)] = std::make_unique<MainMenuScreen>();
         screens_[index(ScreenId::SETTINGS)] = std::make_unique<SettingsScreen>();
         screens_[index(ScreenId::CREDITS)] = std::make_unique<CreditsScreen>();
+        screens_[index(ScreenId::EVADE_DIFFICULTY)] =
+            std::make_unique<EvadeSetupScreen>(EvadeSetupScreen::Step::DIFFICULTY, evade_choice_);
+        screens_[index(ScreenId::EVADE_AIRCRAFT)] =
+            std::make_unique<EvadeSetupScreen>(EvadeSetupScreen::Step::AIRCRAFT, evade_choice_);
+        screens_[index(ScreenId::DOGFIGHT_GEOMETRY)] =
+            std::make_unique<DogfightSetupScreen>(DogfightSetupScreen::Step::GEOMETRY, dogfight_choice_);
+        screens_[index(ScreenId::DOGFIGHT_LOADOUT)] =
+            std::make_unique<DogfightSetupScreen>(DogfightSetupScreen::Step::LOADOUT, dogfight_choice_);
+        screens_[index(ScreenId::DOGFIGHT_SKILL)] =
+            std::make_unique<DogfightSetupScreen>(DogfightSetupScreen::Step::SKILL, dogfight_choice_);
+        screens_[index(ScreenId::DOGFIGHT_AIRCRAFT)] =
+            std::make_unique<DogfightSetupScreen>(DogfightSetupScreen::Step::AIRCRAFT, dogfight_choice_);
         rebuild_theme();
         subscription_ = settings_.subscribe([this](SettingsEvent, const SettingsManager&) { rebuild_theme(); });
     }
@@ -51,6 +65,11 @@ public:
     void set_key_name_provider(KeyNameProvider provider) { key_names_ = std::move(provider); }
     void set_resolutions(std::vector<Resolution> list) { resolutions_ = std::move(list); }
     void set_status_text(std::string text) { status_ = std::move(text); }
+    void set_current_aircraft(aircraft::AircraftType type) noexcept { current_aircraft_ = type; }
+    /// @brief Difficulty index (sim::EvadeDifficulty order) the evade set-up opens on.
+    void set_evade_difficulty(int difficulty) noexcept { evade_choice_.difficulty = difficulty; }
+    [[nodiscard]] const DogfightChoice& dogfight_choice() const noexcept { return dogfight_choice_; }
+    [[nodiscard]] DogfightChoice& dogfight_choice() noexcept { return dogfight_choice_; }
     /// @brief Quality preset the GL context was created with (restart detection).
     void set_launch_quality(QualityPreset q) noexcept { launch_quality_ = q; }
 
@@ -226,6 +245,8 @@ public:
     [[nodiscard]] const Theme& active_theme() const noexcept { return theme_; }
     [[nodiscard]] SettingsScreen& settings_screen() { return static_cast<SettingsScreen&>(*screens_[index(ScreenId::SETTINGS)]); }
     [[nodiscard]] const std::optional<std::string>& toast_text() const noexcept { return toast_text_; }
+    /// @brief Threat level and jet picked on the evade set-up screens (read on START_EVADE).
+    [[nodiscard]] const EvadeChoice& evade_choice() const noexcept { return evade_choice_; }
 
 private:
     // -- State -----------------------------------------------------------------
@@ -281,6 +302,9 @@ private:
     KeyNameProvider key_names_;
     std::vector<Resolution> resolutions_;
     std::string status_;
+    aircraft::AircraftType current_aircraft_ = aircraft::AircraftType::F16_FIGHTING_FALCON;
+    EvadeChoice evade_choice_{};
+    DogfightChoice dogfight_choice_{};
     QualityPreset launch_quality_ = QualityPreset::ULTRA;
 
     std::array<std::unique_ptr<Screen>, static_cast<size_t>(ScreenId::COUNT)> screens_;
@@ -809,6 +833,8 @@ private:
             {3840, 2160}, {2560, 1440}, {1920, 1080}, {1600, 900}, {1366, 768}, {1280, 720}};
         return resolutions_.empty() ? kFallback : resolutions_;
     }
+
+    aircraft::AircraftType current_aircraft() const override { return current_aircraft_; }
 
     std::string key_name(int32_t sc) const override {
         if (key_names_) {

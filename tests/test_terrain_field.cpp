@@ -93,9 +93,9 @@ void test_height_is_non_negative_and_bounded() {
             max_h = std::fmax(max_h, h);
         }
     }
-    assert(max_h <= TerrainField::BASE_AMP + 1.0f && "Height must respect BASE_AMP");
+    assert(max_h <= TerrainField::MAX_HEIGHT + 1.0f && "Height must respect MAX_HEIGHT");
 
-    std::printf("PASSED (peak %.0f m, cap %.0f m) ", max_h, TerrainField::BASE_AMP);
+    std::printf("PASSED (peak %.0f m, cap %.0f m) ", max_h, TerrainField::MAX_HEIGHT);
     std::cout << "\n";
 }
 
@@ -147,6 +147,107 @@ void test_slope_produces_tilted_normal() {
     std::cout << "\n";
 }
 
+// ---------------------------------------------------------------------------
+// The canyon: it has to be flyable, not just look like a canyon.
+// ---------------------------------------------------------------------------
+
+using Canyon = TerrainField::Canyon;
+
+static float canyon_height(float s, float d) {
+    float x, y;
+    Canyon::from_axis(s, Canyon::across_at(s, d), x, y);
+    return TerrainField::height(x, y);
+}
+
+/// The river line must run unbroken from mouth to mouth: one hill across it
+/// and a pilot following the river flies into the ground.
+void test_canyon_floor_is_continuous() {
+    std::cout << "[Test] Canyon: Floor Runs Unbroken Mouth To Mouth... ";
+    float worst = -1e9f;
+    for (float s = -1500.0f; s <= Canyon::LENGTH + 1500.0f; s += 20.0f) {
+        const float above = canyon_height(s, 0.0f) - Canyon::floor_elevation(s);
+        worst = std::fmax(worst, above);
+        assert(above < 10.0f && "Nothing may stand on the river line");
+    }
+    std::printf("PASSED (highest point on the river line %.1f m above the floor)\n", worst);
+}
+
+/// Walls must be tall enough to hide in: rim well above the floor everywhere
+/// between the mouths.
+void test_canyon_walls_are_deep() {
+    std::cout << "[Test] Canyon: Walls Stand 420 m Above The Floor... ";
+    float shallowest = 1e9f;
+    for (float s = 1500.0f; s <= Canyon::LENGTH - 1500.0f; s += 100.0f) {
+        const float d = Canyon::rim_half_width(s) + 150.0f;
+        const float floor_h = Canyon::floor_elevation(s);
+        for (float side : {-1.0f, 1.0f}) {
+            const float depth = canyon_height(s, side * d) - floor_h;
+            shallowest = std::fmin(shallowest, depth);
+        }
+    }
+    assert(shallowest > 420.0f && "The canyon must be deep enough to fly inside");
+    std::printf("PASSED (shallowest rim %.0f m)\n", shallowest);
+}
+
+/// The gorge is the tight part. Half-way up its walls there must still be
+/// room for a fighter's turn radius allowance and span: 200 m wall to wall.
+void test_gorge_is_tight_but_passable() {
+    std::cout << "[Test] Canyon: Gorge Narrow But Passable At Mid-Depth... ";
+    float narrowest = 1e9f, widest_floor = 0.0f;
+    for (float s = Canyon::GORGE_START + 500.0f; s <= Canyon::GORGE_END - 500.0f; s += 100.0f) {
+        const float level = Canyon::floor_elevation(s) + 350.0f;
+        float width = 0.0f;
+        for (float side : {-1.0f, 1.0f}) {
+            float d = 0.0f;
+            while (d < 2000.0f && canyon_height(s, side * d) < level) d += 2.0f;
+            width += d;
+        }
+        narrowest = std::fmin(narrowest, width);
+        widest_floor = std::fmax(widest_floor, 2.0f * Canyon::floor_half_width(s));
+    }
+    assert(narrowest > 200.0f && "The gorge must leave room to fly at mid-depth");
+    assert(narrowest < 700.0f && "...and still be a gorge");
+    assert(widest_floor < 200.0f && "The gorge floor must be narrow");
+    std::printf("PASSED (narrowest %.0f m at mid-depth)\n", narrowest);
+}
+
+/// No bend tighter than a fighter can follow: radius of the river line in the
+/// world, from three points 60 m apart.
+void test_canyon_bends_are_flyable() {
+    std::cout << "[Test] Canyon: Tightest Bend Within A Fighter's Turn... ";
+    float tightest = 1e9f;
+    auto point = [](float s, float& x, float& y) { Canyon::from_axis(s, Canyon::centre(s), x, y); };
+    for (float s = 0.0f; s <= Canyon::LENGTH; s += 30.0f) {
+        float x0, y0, x1, y1, x2, y2;
+        point(s - 60.0f, x0, y0);
+        point(s, x1, y1);
+        point(s + 60.0f, x2, y2);
+        const float a = std::hypot(x1 - x0, y1 - y0);
+        const float b = std::hypot(x2 - x1, y2 - y1);
+        const float c = std::hypot(x2 - x0, y2 - y0);
+        const float area2 = std::fabs((x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0));
+        if (area2 < 1e-3f) continue;
+        tightest = std::fmin(tightest, a * b * c / (2.0f * area2));
+    }
+    // 850 m: 3 G at 300 kt, 7 G at 480 kt.
+    assert(tightest > 850.0f && "Bends must be flyable at fighter speeds");
+    std::printf("PASSED (tightest bend radius %.0f m)\n", tightest);
+}
+
+/// The mesh strip and the field agree on where the canyon is.
+void test_canyon_lies_inside_its_mesh_strip() {
+    std::cout << "[Test] Canyon: Gorge And Walls Lie Inside The Detail Mesh... ";
+    for (float s = -1000.0f; s <= Canyon::LENGTH + 1000.0f; s += 250.0f) {
+        const float d = Canyon::rim_half_width(s) + 300.0f;
+        for (float side : {-1.0f, 0.0f, 1.0f}) {
+            float x, y;
+            Canyon::from_axis(s, Canyon::across_at(s, side * d), x, y);
+            assert(Canyon::in_strip(x, y, 50.0f) && "Canyon walls must be inside the high-resolution strip");
+        }
+    }
+    std::cout << "PASSED\n";
+}
+
 int main() {
     std::cout << "=== Procedural Terrain Field Verification ===\n";
     test_airfield_basin_is_flat();
@@ -155,6 +256,11 @@ int main() {
     test_height_is_non_negative_and_bounded();
     test_normals_are_unit_and_upward();
     test_slope_produces_tilted_normal();
+    test_canyon_floor_is_continuous();
+    test_canyon_walls_are_deep();
+    test_gorge_is_tight_but_passable();
+    test_canyon_bends_are_flyable();
+    test_canyon_lies_inside_its_mesh_strip();
     std::cout << "All Terrain Field tests passed successfully!\n\n";
     return 0;
 }

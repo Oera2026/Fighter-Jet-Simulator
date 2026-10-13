@@ -88,6 +88,21 @@ struct EvadeProfile {
     }
 };
 
+enum class WeaponsLoadout : uint8_t {
+    GUNS_ONLY,
+    GUNS_AND_IR,
+    FULL_LOADOUT,
+};
+
+[[nodiscard]] constexpr const char* to_string(WeaponsLoadout w) noexcept {
+    switch (w) {
+        case WeaponsLoadout::GUNS_ONLY:    return "GUNS ONLY";
+        case WeaponsLoadout::GUNS_AND_IR:  return "GUNS + HEAT SEEKERS";
+        case WeaponsLoadout::FULL_LOADOUT: return "FULL COMBAT LOAD";
+    }
+    return "?";
+}
+
 struct EngagementSetup {
     EngagementMode mode{EngagementMode::DOGFIGHT};
     EvadeDifficulty evade_difficulty{EvadeDifficulty::MEDIUM};
@@ -96,6 +111,7 @@ struct EngagementSetup {
     AiSkill skill{AiSkill::VETERAN};
     StartGeometry geometry{StartGeometry::HEAD_ON_MERGE};
     RangeProfile range_profile{RangeProfile::CONSTANT_TURN};
+    WeaponsLoadout loadout{WeaponsLoadout::GUNS_ONLY};
     double altitude_m{5000.0};
     double speed_mps{250.0};
     double hard_deck_agl_m{1000.0};
@@ -261,11 +277,19 @@ public:
                 BfmPilot(i == BANDIT ? bandit_skill : s.skill, s.seed * 2654435761u + static_cast<uint32_t>(i) * 97u + 1u);
             ai[static_cast<size_t>(i)].hard_deck_agl_m = s.hard_deck_agl_m;
         }
+        // A bandit held to transonic speed let anyone escape by running in
+        // reheat. He chases supersonic, still held to the pilot's dynamic
+        // pressure limits, where the FLCS behaves.
+        ai[BANDIT].max_chase_mach = DOGFIGHT_CHASE_MACH;
+        ai[BANDIT].far_chase_q_pa = EVADE_FAR_CHASE_Q_PA;
 
         shooter = MissileShooter{};
         shooter.reset();
         evader = EvasionPilot{};
         evader.reset();
+        const AirframeMissileLoadout own_loadout = airframe_missile_loadout(s.own_type);
+        const AirframeMissileLoadout bandit_loadout = airframe_missile_loadout(s.bandit_type);
+
         if (evade) {
             // Hunting a runner: he follows you low and fast, within the airframe's safe envelope.
             ai[BANDIT].hard_deck_agl_m = std::min(s.hard_deck_agl_m, EVADE_HARD_DECK_AGL_M);
@@ -273,13 +297,35 @@ public:
             ai[BANDIT].far_chase_q_pa = EVADE_FAR_CHASE_Q_PA;
             world.radars[BANDIT].enable(OWN, profile.radar_acquire_s);
             const bool radar = world.radars[BANDIT].spec.fitted;
+            world.missile_spec[BANDIT] = missile_specs::aim120c();
             world.missile_load[BANDIT] = radar ? profile.missiles : 0;
             shooter.doctrine = radar ? profile.doctrine : LaunchDoctrine::NONE;
             shooter.shoot_shoot = profile.shoot_shoot;
             setup_data.time_limit_s = profile.survive_s;
+        } else {
+            // Dogfight mode: load weapons according to s.loadout
+            switch (s.loadout) {
+                case WeaponsLoadout::GUNS_ONLY:
+                    world.missile_load[OWN] = 0;
+                    world.missile_load[BANDIT] = 0;
+                    break;
+                case WeaponsLoadout::GUNS_AND_IR:
+                    world.missile_spec[OWN] = own_loadout.srm_spec;
+                    world.missile_load[OWN] = own_loadout.srm_count;
+                    world.missile_spec[BANDIT] = bandit_loadout.srm_spec;
+                    world.missile_load[BANDIT] = bandit_loadout.srm_count;
+                    break;
+                case WeaponsLoadout::FULL_LOADOUT:
+                    world.missile_spec[OWN] = own_loadout.mrm_count > 0 ? own_loadout.mrm_spec : own_loadout.srm_spec;
+                    world.missile_load[OWN] = own_loadout.mrm_count + own_loadout.srm_count;
+                    world.missile_spec[BANDIT] = bandit_loadout.mrm_count > 0 ? bandit_loadout.mrm_spec : bandit_loadout.srm_spec;
+                    world.missile_load[BANDIT] = bandit_loadout.mrm_count + bandit_loadout.srm_count;
+                    break;
+            }
         }
         chaff_at_start_ = world.chaff_load[OWN];
         unlocked_far_s_ = 0.0;
+        eject_timer_.fill(0.0);
         range_pilot = RangeTargetPilot{};
         range_pilot.profile = s.range_profile;
         range_pilot.target_altitude_m = alt;
@@ -313,9 +359,19 @@ public:
                 controls[idx] = visual_fight ? bfm : defend;
             } else if (ai_controlled[idx]) {
                 controls[idx] = ai[idx].update(dt, self, foe);
+                if (evade_mode() && idx == BANDIT) {
+                    controls[idx].pickle = false;
+                    controls[idx].dispense = false;
+                    controls[idx].dispense_flare = false;
+                }
             } else if (i == BANDIT && setup_data.geometry == StartGeometry::GUNNERY_RANGE) {
                 controls[idx] = range_pilot.update(dt, self);
             }
+        }
+        // AI pilots in a jet that is going down get out.
+        for (int i = 0; i < world.count; ++i) {
+            const auto idx = static_cast<size_t>(i);
+            if (ai_controlled[idx] && should_eject(i, dt)) controls[idx].eject = true;
         }
         // Once the fight is decided the survivors hold fire.
         if (finished()) {
@@ -344,13 +400,32 @@ public:
     static constexpr double ESCAPE_HOLD_S = 10.0;
     static constexpr double EVADE_HARD_DECK_AGL_M = 500.0;
     static constexpr double EVADE_CHASE_MACH = 1.6;
+    static constexpr double DOGFIGHT_CHASE_MACH = 1.4;
     static constexpr double EVADE_FAR_CHASE_Q_PA = 95000.0; ///< ~390 m/s at sea level, ~510 m/s at 5 km
     static constexpr double VISUAL_FIGHT_RANGE_M = 4000.0;
+
+    /// Time an AI pilot takes to decide to eject from a doomed jet [s].
+    static constexpr double EJECT_DECISION_S = 1.5;
 
 private:
     int events_read_{0};
     int chaff_at_start_{0};
     double unlocked_far_s_{0.0};
+    std::array<double, World::kMaxAircraft> eject_timer_{};
+
+    /// @brief A conscious pilot in a jet that is destroyed, or that has broken
+    /// itself by over-G, pulls the handle once he has taken it in.
+    bool should_eject(int i, double dt) noexcept {
+        const auto idx = static_cast<size_t>(i);
+        const Aircraft& a = world.aircraft[idx];
+        const bool doomed = a.damage.destroyed || a.damage.structural_failure;
+        if (!doomed || a.crashed || a.damage.pilot_incapacitated || world.seats[idx].initiated()) {
+            eject_timer_[idx] = 0.0;
+            return false;
+        }
+        eject_timer_[idx] += dt;
+        return eject_timer_[idx] >= EJECT_DECISION_S;
+    }
 
     /**
      * @brief Evade start: you heading north, the bandit behind you, nose on,
@@ -393,9 +468,10 @@ private:
     /// neither jet starts with a spooled-down core. Fuel burnt is refilled.
     static void prespool(Aircraft& a, double lever) noexcept {
         const auto air = environment::Atmosphere1976::compute(a.state.altitude(), a.state.airspeed());
-        for (int i = 0; i < 1600; ++i) (void)a.engine.update(lever, air, Aircraft::DT);
+        // 15 s: long enough for the core to spool up and the afterburner to light.
+        for (int i = 0; i < 3000; ++i) (void)a.engine.update(lever, air, Aircraft::DT);
         a.engine.fuel_kg = aircraft::AircraftConfig::get(a.type).mass.internal_fuel_capacity_kg;
-        a.mass = fdm::FuelSystem::compute(a.engine.fuel_kg, a.type);
+        a.refresh_mass();
     }
 
     void tally(double dt) noexcept {

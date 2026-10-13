@@ -12,7 +12,8 @@ namespace fastjet::propulsion {
 /**
  * @brief High-fidelity propulsion model supporting single and twin installations,
  * dry turbofans (A-10), supersonic afterburning turbofans (F-16, F-15EX, Typhoon, F-22),
- * altitude/Mach lapse, spool dynamics, nacelle pitch-thrust coupling, and 2D thrust vectoring.
+ * altitude/Mach lapse, spool dynamics, nacelle pitch-thrust coupling, 2D thrust vectoring,
+ * and the F135-PW-600's STOVL power mode (shaft power to the LiftFan raises total thrust).
  *
  * Zero dynamic heap allocation; safe to execute at 200 Hz in the hot physics loop.
  */
@@ -20,9 +21,15 @@ class MultiEngine {
 public:
     aircraft::AircraftType aircraft_type{aircraft::AircraftType::F16_FIGHTING_FALCON};
     aircraft::PropulsionConfig config{};
+    aircraft::StovlConfig stovl_config{};
 
     double commanded_thrust_n{0.0};
     double net_thrust_n{0.0};
+    /// Thrust from the core (dry) spool, which accelerates slowly.
+    double core_thrust_n{0.0};
+    /// Afterburner increment on top of the core. It lights only once the core
+    /// is near military power, then comes in quickly.
+    double ab_thrust_n{0.0};
     double fuel_kg{3175.1};
     double fuel_flow_kgs{0.0};
 
@@ -34,6 +41,26 @@ public:
     // Thrust vectoring pitch command [-1.0, +1.0] -> [-max_deg, +max_deg]
     double tvc_pitch_cmd{0.0};
     double tvc_pitch_actual_deg{0.0};
+
+    /// LiftFan clutch engagement [0, 1], set each step from the lift system.
+    /// Engaged, the LP turbine drives the fan and the engine's maximum dry
+    /// thrust rises toward the total STOVL lift rating; net thrust is then the
+    /// whole lift system's (StovlLiftSystem splits it).
+    double lift_fan_clutch{0.0};
+    /// STOVL engine mode: reheat locked out and the fast small-signal thrust
+    /// response the jet-borne height loop needs.
+    bool stovl_mode{false};
+
+    /// Lever detents: cutoff, idle and military power.
+    static constexpr double DETENT_CUTOFF = 0.03;
+    static constexpr double DETENT_IDLE   = 0.08;
+    static constexpr double DETENT_MIL    = 0.85;
+
+    /// The afterburner lights once the core reaches this share of military
+    /// thrust (~90% RPM on a low-bypass turbofan).
+    static constexpr double AB_LIGHT_CORE_FRACTION = 0.80;
+    /// Afterburner shut-down time constant [s].
+    static constexpr double AB_CANCEL_TAU_S = 0.3;
 
     constexpr MultiEngine() noexcept {
         configure(aircraft::AircraftType::F16_FIGHTING_FALCON);
@@ -60,17 +87,40 @@ public:
         aircraft_type = type;
         const auto a_cfg = aircraft::AircraftConfig::get(type);
         config = a_cfg.propulsion;
+        stovl_config = a_cfg.stovl;
         const double new_capacity = a_cfg.mass.internal_fuel_capacity_kg;
         fuel_kg = preserve_fuel
             ? std::clamp(prev_fraction, 0.0, 1.0) * new_capacity
             : new_capacity;
         commanded_thrust_n = 0.0;
         net_thrust_n = 0.0;
+        core_thrust_n = 0.0;
+        ab_thrust_n = 0.0;
         fuel_flow_kgs = 0.0;
         dry_power = 0.0;
         ab_power = 0.0;
         tvc_pitch_cmd = 0.0;
         tvc_pitch_actual_deg = 0.0;
+        lift_fan_clutch = 0.0;
+        stovl_mode = false;
+    }
+
+    /// @brief Maximum dry thrust at sea level static [N]: military power,
+    /// raised toward the total lift rating as the LiftFan clutch engages.
+    [[nodiscard]] double max_dry_rating_n() const noexcept {
+        if (lift_fan_clutch <= 0.0) return config.static_dry_thrust_n;
+        const double stovl_total = stovl_config.lift_fan_thrust_n + stovl_config.nozzle_thrust_n
+                                 + stovl_config.roll_post_thrust_n;
+        return config.static_dry_thrust_n + lift_fan_clutch * (stovl_total - config.static_dry_thrust_n);
+    }
+
+    /// @brief Lever position in the dry range that asks for @p thrust_n of
+    /// steady net thrust at @p air (the STOVL control law's thrust demand).
+    [[nodiscard]] double lever_for_thrust(double thrust_n, const environment::AirData& air) const noexcept {
+        const double rating = thrust_n / (std::max)(1e-3, lapse_factor(air, false));
+        const double span = max_dry_rating_n() - config.static_idle_thrust_n;
+        const double dry = std::clamp((rating - config.static_idle_thrust_n) / span, 0.0, 1.0);
+        return DETENT_IDLE + dry * (DETENT_MIL - DETENT_IDLE);
     }
 
     /**
@@ -129,9 +179,8 @@ public:
         double static_rating = 0.0;
         bool in_ab = false;
 
-        constexpr double DETENT_CUTOFF = 0.03;
-        constexpr double DETENT_IDLE   = 0.08;
-        constexpr double DETENT_MIL    = 0.85;
+        const double dry_max = max_dry_rating_n();
+        if (stovl_mode) ab_gate_open = false;
 
         if (u < DETENT_CUTOFF) {
             detent_state = input::ThrottleController::DetentState::CUTOFF;
@@ -158,7 +207,7 @@ public:
             dry_power = std::clamp((u - DETENT_IDLE) / mil_range, 0.0, 1.0);
             ab_power = 0.0;
             static_rating = config.static_idle_thrust_n +
-                            dry_power * (config.static_dry_thrust_n - config.static_idle_thrust_n);
+                            dry_power * (dry_max - config.static_idle_thrust_n);
         } else {
             // Wet / Afterburner range (0.85 to 1.00)
             detent_state = input::ThrottleController::DetentState::AFTERBURNER;
@@ -173,17 +222,31 @@ public:
         // Apply installed atmospheric lapse
         commanded_thrust_n = static_rating * lapse_factor(air, in_ab);
 
+        // Split the demand into core and afterburner. In reheat the core runs
+        // at military power and the afterburner supplies the rest; the total
+        // is the same steady thrust as before.
+        const double core_target = (in_ab ? config.static_dry_thrust_n : static_rating) * lapse_factor(air, false);
+        const double ab_target = in_ab ? (std::max)(0.0, commanded_thrust_n - core_target) : 0.0;
+
         // Spool dynamics
         if (dt > 0.0) {
-            double tau = config.tau_spool_up;
-            if (in_ab) {
-                tau = config.tau_ab_light;
-            } else if (commanded_thrust_n < net_thrust_n) {
-                tau = config.tau_spool_down;
-            }
+            // Core: slow spool-up, quicker spool-down.
+            const double core_tau = stovl_mode ? stovl_config.tau_spool_s
+                                  : (core_target < core_thrust_n) ? config.tau_spool_down : config.tau_spool_up;
+            core_thrust_n += (core_target - core_thrust_n) * (1.0 - std::exp(-dt / (std::max)(0.05, core_tau)));
 
-            const double alpha = 1.0 - std::exp(-dt / (std::max)(0.05, tau));
-            net_thrust_n += (commanded_thrust_n - net_thrust_n) * alpha;
+            // Afterburner: lights only once the core is close to military
+            // power. Slamming the lever from idle into full reheat used to
+            // bring the whole thrust in on the 0.5 s light-off time constant,
+            // skipping the several seconds a real core takes to spool up.
+            const double mil_core = config.static_dry_thrust_n * lapse_factor(air, false);
+            const bool ab_lit = in_ab && core_thrust_n >= AB_LIGHT_CORE_FRACTION * mil_core;
+            const double ab_goal = ab_lit ? ab_target : 0.0;
+            const double ab_tau = ab_lit ? config.tau_ab_light : AB_CANCEL_TAU_S;
+            ab_thrust_n += (ab_goal - ab_thrust_n) * (1.0 - std::exp(-dt / (std::max)(0.05, ab_tau)));
+            ab_thrust_n = (std::max)(0.0, ab_thrust_n);
+
+            net_thrust_n = core_thrust_n + ab_thrust_n;
 
             // TVC nozzle actuator rate limit (60 deg/s)
             if (config.has_thrust_vectoring) {
@@ -193,13 +256,18 @@ public:
                 tvc_pitch_actual_deg += std::clamp(delta, -max_rate, max_rate);
             }
         } else {
+            core_thrust_n = core_target;
+            ab_thrust_n = ab_target;
             net_thrust_n = commanded_thrust_n;
         }
 
         net_thrust_n = (std::max)(0.0, net_thrust_n);
 
         // Fuel burn calculation
-        const double tsfc = in_ab ? config.tsfc_ab : config.tsfc_dry;
+        const double tsfc = in_ab ? config.tsfc_ab
+                          : (lift_fan_clutch > 0.0)
+                              ? config.tsfc_dry + lift_fan_clutch * (stovl_config.tsfc_stovl - config.tsfc_dry)
+                              : config.tsfc_dry;
         fuel_flow_kgs = has_fuel ? (net_thrust_n * tsfc) : 0.0;
         if (dt > 0.0) {
             fuel_kg = (std::max)(0.0, fuel_kg - fuel_flow_kgs * dt);
@@ -248,11 +316,15 @@ public:
         fuel_kg = (fuel_load_kg >= 0.0) ? std::clamp(fuel_load_kg, 0.0, cap) : cap;
         commanded_thrust_n = 0.0;
         net_thrust_n = 0.0;
+        core_thrust_n = 0.0;
+        ab_thrust_n = 0.0;
         fuel_flow_kgs = 0.0;
         dry_power = 0.0;
         ab_power = 0.0;
         tvc_pitch_cmd = 0.0;
         tvc_pitch_actual_deg = 0.0;
+        lift_fan_clutch = 0.0;
+        stovl_mode = false;
     }
 };
 

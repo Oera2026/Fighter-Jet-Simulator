@@ -56,8 +56,8 @@ public:
         switch (id) {
             case START: svc.emit(svc.in_flight() ? MenuAction::RESUME_FLIGHT : MenuAction::START_FLIGHT); break;
             case MISSION: svc.emit(MenuAction::OPEN_MISSION_SELECT); break;
-            case DOGFIGHT: svc.emit(MenuAction::START_DOGFIGHT); break;
-            case EVADE: svc.emit(MenuAction::START_EVADE); break;
+            case DOGFIGHT: svc.navigate(ScreenId::DOGFIGHT_GEOMETRY, true); break;
+            case EVADE: svc.navigate(ScreenId::EVADE_DIFFICULTY, true); break;
             case SETTINGS: svc.navigate(ScreenId::SETTINGS, true); break;
             case CREDITS: svc.navigate(ScreenId::CREDITS, true); break;
             case QUIT: confirm_quit(svc); break;
@@ -160,7 +160,7 @@ private:
             case START: return flying ? "Return to the cockpit." : "Line up on runway 09 in the selected airframe.";
             case MISSION: return "Choose an airframe, review its envelope and set up the sortie.";
             case DOGFIGHT: return "1v1 guns BFM against an AI bandit. F10 cycles the set-up, F11 the skill.";
-            case EVADE: return "A bandit with radar missiles hunts you from your six. Survive. F11 cycles difficulty.";
+            case EVADE: return "A bandit with radar missiles hunts you from your six. Choose the threat and your jet, then survive.";
             case SETTINGS: return "Graphics, audio, controls and accessibility.";
             case CREDITS: return "Data sources and open-source libraries.";
             case QUIT: return flying ? "End this flight and close the simulator." : "Close the simulator.";

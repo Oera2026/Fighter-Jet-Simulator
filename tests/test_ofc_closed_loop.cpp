@@ -36,7 +36,7 @@ constexpr double DEG = M_PI / 180.0;
 constexpr AircraftType ALL_AIRCRAFT[] = {
     AircraftType::F16_FIGHTING_FALCON, AircraftType::F15EX_EAGLE_II,
     AircraftType::EUROFIGHTER_TYPHOON, AircraftType::F22_RAPTOR,
-    AircraftType::A10_THUNDERBOLT};
+    AircraftType::A10_THUNDERBOLT, AircraftType::F35B_LIGHTNING_II};
 
 struct Outcome {
     bool   crashed{false};

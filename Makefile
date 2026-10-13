@@ -15,7 +15,8 @@ TESTS = test_atmosphere test_ballistic test_gyroscopic test_performance \
         test_aircraft_specs test_multi_aircraft_performance test_model_glb \
         test_user_settings test_menu_navigation test_render_fidelity test_thread_pool \
         test_aircraft_entity test_guns test_air_combat_geometry test_bfm_ai \
-        test_missiles test_evade_mode test_radar_scope
+        test_missiles test_evade_mode test_radar_scope test_flight_realism \
+        test_ejection test_jet_cockpits test_stovl
 
 TARGETS = $(addprefix $(BIN_DIR)/, $(TESTS))
 
@@ -156,6 +157,18 @@ test_evade_mode: $(BIN_DIR)/test_evade_mode
 test_radar_scope: $(BIN_DIR)/test_radar_scope
 	./$(BIN_DIR)/test_radar_scope
 
+test_flight_realism: $(BIN_DIR)/test_flight_realism
+	./$(BIN_DIR)/test_flight_realism
+
+test_ejection: $(BIN_DIR)/test_ejection
+	./$(BIN_DIR)/test_ejection
+
+test_stovl: $(BIN_DIR)/test_stovl
+	./$(BIN_DIR)/test_stovl
+
+test_jet_cockpits: $(BIN_DIR)/test_jet_cockpits
+	./$(BIN_DIR)/test_jet_cockpits
+
 test_propulsion: $(BIN_DIR)/test_propulsion
 	./$(BIN_DIR)/test_propulsion
 
@@ -222,6 +235,10 @@ run_all: all
 	@./$(BIN_DIR)/test_missiles
 	@./$(BIN_DIR)/test_evade_mode
 	@./$(BIN_DIR)/test_radar_scope
+	@./$(BIN_DIR)/test_flight_realism
+	@./$(BIN_DIR)/test_ejection
+	@./$(BIN_DIR)/test_jet_cockpits
+	@./$(BIN_DIR)/test_stovl
 	@echo "================ All Tests Completed Successfully! ================"
 
 clean:

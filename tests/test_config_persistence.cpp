@@ -33,6 +33,7 @@ void test_json_serialization_and_file_persistence() {
     original.btn_speedbrake_extend = 7;
     original.btn_speedbrake_retract = 8;
     original.btn_parking_brake = 21;
+    original.btn_stovl_mode = 9;
 
     // 1. Serialize to JSON string
     const std::string json_str = original.to_json();
@@ -70,6 +71,18 @@ void test_json_serialization_and_file_persistence() {
     assert(loaded.btn_speedbrake_extend == 7);
     assert(loaded.btn_speedbrake_retract == 8);
     assert(loaded.btn_parking_brake == 21);
+    assert(loaded.btn_stovl_mode == 9);
+
+    // A profile saved before the STOVL button existed keeps its default
+    // instead of landing on button 0 (trim up).
+    std::string legacy = json_str;
+    const std::size_t comma = legacy.find(",\n    \"stovl_mode\"");
+    assert(comma != std::string::npos);
+    legacy.erase(comma, legacy.find('\n', comma + 2) - comma);
+    ControllerProfile from_legacy;
+    assert(from_legacy.from_json(legacy));
+    assert(from_legacy.btn_parking_brake == 21);
+    assert(from_legacy.btn_stovl_mode == ControllerProfile{}.btn_stovl_mode);
 
     // Clean up temporary test file
     std::remove(test_filepath.c_str());

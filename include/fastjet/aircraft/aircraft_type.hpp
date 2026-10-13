@@ -13,7 +13,8 @@ enum class AircraftType {
     F15EX_EAGLE_II,        ///< Boeing F-15EX Eagle II twin F110-GE-129 digital FBW heavy fighter
     EUROFIGHTER_TYPHOON,   ///< Eurofighter Typhoon twin EJ200 delta-canard carefree FBW fighter
     F22_RAPTOR,            ///< Lockheed Martin F-22A Raptor 5th-gen 2D TVC air dominance fighter
-    A10_THUNDERBOLT        ///< Fairchild Republic A-10C Warthog twin TF34 high-bypass CAS attack jet
+    A10_THUNDERBOLT,       ///< Fairchild Republic A-10C Warthog twin TF34 high-bypass CAS attack jet
+    F35B_LIGHTNING_II      ///< Lockheed Martin F-35B STOVL: F135-PW-600 + Rolls-Royce LiftSystem
 };
 
 [[nodiscard]] constexpr std::string_view to_string(AircraftType type) noexcept {
@@ -23,6 +24,7 @@ enum class AircraftType {
         case AircraftType::EUROFIGHTER_TYPHOON: return "Eurofighter Typhoon";
         case AircraftType::F22_RAPTOR:          return "F-22A Raptor";
         case AircraftType::A10_THUNDERBOLT:     return "A-10C Thunderbolt II";
+        case AircraftType::F35B_LIGHTNING_II:   return "F-35B Lightning II";
     }
     return "Unknown Aircraft";
 }
@@ -36,6 +38,7 @@ enum class AircraftType {
         case AircraftType::EUROFIGHTER_TYPHOON: return "TYPHOON";
         case AircraftType::F22_RAPTOR:          return "F-22A";
         case AircraftType::A10_THUNDERBOLT:     return "A-10C";
+        case AircraftType::F35B_LIGHTNING_II:   return "F-35B";
     }
     return "UNKNOWN";
 }
@@ -48,6 +51,7 @@ enum class AircraftType {
         case AircraftType::EUROFIGHTER_TYPHOON: return "2X EJ200";
         case AircraftType::F22_RAPTOR:          return "2X F119-PW-100";
         case AircraftType::A10_THUNDERBOLT:     return "2X TF34-GE-100A";
+        case AircraftType::F35B_LIGHTNING_II:   return "F135-PW-600";
     }
     return "UNKNOWN";
 }
@@ -63,6 +67,7 @@ enum class AircraftType {
         case AircraftType::EUROFIGHTER_TYPHOON: return "2 ENG  9.0G  SUPERCRUISE M1.50";
         case AircraftType::F22_RAPTOR:          return "2 ENG  9.0G  SUPERCRUISE M1.82  TVC";
         case AircraftType::A10_THUNDERBOLT:     return "2 ENG  7.33G  M0.56  NO AB";
+        case AircraftType::F35B_LIGHTNING_II:   return "1 ENG  7.0G  M1.60  STOVL";
     }
     return "";
 }
@@ -79,6 +84,9 @@ enum class AircraftType {
     }
     if (str == "a10" || str == "a-10" || str == "warthog" || str == "thunderbolt") {
         return AircraftType::A10_THUNDERBOLT;
+    }
+    if (str == "f35" || str == "f35b" || str == "f-35" || str == "f-35b" || str == "lightning") {
+        return AircraftType::F35B_LIGHTNING_II;
     }
     return AircraftType::F16_FIGHTING_FALCON;
 }

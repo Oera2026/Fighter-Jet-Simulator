@@ -138,7 +138,21 @@ Findings on the way:
   the time limit went from 6/24 to 12/24, and ace-over-novice perch conversions from 3/12 to 8/12.
 - **Chase speed cap by dynamic pressure.** The BFM pilot's transonic chase cap is now also limited
   to q ≤ 75 kPa (the FLCS problem corner). In evade the bandit may chase at up to 95 kPa while more
-  than 6 km out, which lets identical jets match speeds. Dogfight behaviour is unchanged.
+  than 6 km out, which lets identical jets match speeds.
+- **The dogfight bandit could not kill a predictable player (2026-09-26).** Measured over 24 seeds
+  against scripted players, a jet flying straight in reheat was never hit, and novices and veterans
+  emptied all 511 rounds at a steady 5 G turner for no hits. There were three causes:
+  (1) The AI's roll loop (1.6 stick/rad on a 300°/s rate-command FLCS) rocked the wings ±10° at
+  2 Hz whenever it held a bank, and the nose yawed with them. It is now a roll-rate command,
+  3/s × bank error, scaled by the jet's full-stick roll rate.
+  (2) Inside 1.5 km the perceived track carried the bandit's acceleration forward, not just his
+  velocity. Before, a 5 G turn was led from where the target had been heading a reaction time
+  earlier, 10–15 m behind it. Beyond 1.5 km perception is unchanged, which leaves the evade
+  missile-defence figures where they were.
+  (3) The dogfight bandit now chases to Mach 1.4 (still under the q limits), so running short of
+  full reheat no longer escapes.
+  Now veterans and aces kill a 5 G turner 24/24 from every set-up, and an ace behind a straight
+  runner kills 24/24. `test_bfm_ai` checks both.
 - **A supersonic run is a real escape.** An AMRAAM launched from Mach 1.5 cannot run down a Mach 1.5
   target from more than ~11 km in the tail. HARD therefore starts inside the no-escape zone.
 - `World::step` keeps the new subsystems in one out-of-line call. Inlining them changed FMA

@@ -177,7 +177,8 @@ int main() {
         AircraftType::F15EX_EAGLE_II,
         AircraftType::EUROFIGHTER_TYPHOON,
         AircraftType::F22_RAPTOR,
-        AircraftType::A10_THUNDERBOLT
+        AircraftType::A10_THUNDERBOLT,
+        AircraftType::F35B_LIGHTNING_II
     };
 
     std::vector<PerfResult> results;

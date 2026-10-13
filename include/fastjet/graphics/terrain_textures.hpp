@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fastjet/core/thread_pool.hpp"
+#include "fastjet/graphics/canyon_glsl.hpp"
 #include "fastjet/graphics/gl_common.hpp"
 #include "fastjet/graphics/shader.hpp"
 #include "fastjet/graphics/shader_library.hpp"
@@ -117,7 +118,7 @@ private:
             uniform vec2  uOrigin;     // world XY of the level's corner [m]
             uniform float uSize;       // level edge [m]
             uniform float uHeightTexel; // one height texel in UV
-        )") + glsl::COMMON + glsl::TERRAIN_MATERIAL + R"(
+        )") + glsl::COMMON + glsl::TERRAIN_MATERIAL + canyon_glsl() + R"(
             void main() {
                 vec2 xy = uOrigin + vUV * uSize;
                 float h = texture(uHeight, vUV).r;
@@ -131,6 +132,8 @@ private:
                 // A large distance disables the close-range detail: it is
                 // added per pixel at run time instead.
                 GroundSample g = ground_material(vec3(xy, -h), h, -n.z, 1.0e9);
+                // The mesa country's own palette; the river is added per pixel.
+                canyon_shade(g, canyon_sd(xy), vec3(xy, -h), h, -n.z, 0.0);
                 // Square-root encoding keeps precision in the dark albedos
                 // that grass and soil live in.
                 float cover = g.water > 0.5 ? 1.0 : g.forest * 0.95;

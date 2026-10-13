@@ -39,6 +39,11 @@ struct AudioSample {
 /// recordings. New emitter: three short chirps. Lock: a steady pulsed beep.
 /// Missile launch: a fast two-tone warble that holds while the missile is guided.
 ///
+/// The F-35B lift system is synthesised as well (no LiftFan recording ships
+/// with the sim): broadband jet roar plus the fan's blade-passing whine, both
+/// following LiftFan thrust, a hydraulic clunk as the doors start or finish
+/// moving, and a click when the keyboard throttle drops into the STOVL detent.
+///
 /// NOTE: If sound files are not installed in assets/sounds/, the recorded
 /// channels stay silent (no procedural substitutes for engine or airflow).
 ///
@@ -84,6 +89,39 @@ private:
     double rwr_phase_ = 0.0;      // Oscillator phase [cycles]
     float rwr_env_ = 0.0f;        // Click-free on/off envelope
     int prev_rwr_level_ = 0;
+
+    // STOVL lift system synthesis (audio thread reads, main thread sets under the stream lock)
+    float lift_fan_level_ = 0.0f;  // Target loudness 0..1 from LiftFan thrust
+    float lift_fan_env_ = 0.0f;    // ...smoothed, as the fan spools
+    double lift_fan_phase_ = 0.0;  // Blade-passing oscillator [cycles]
+    float roar_lp1_ = 0.0f;        // Two one-pole low-passes shaping the roar
+    float roar_lp2_ = 0.0f;
+    uint32_t noise_state_ = 0x9E3779B9u;
+    float clunk_env_ = 0.0f;       // Door clunk one-shot
+    double clunk_phase_ = 0.0;
+    float click_env_ = 0.0f;       // Throttle detent click one-shot
+    double click_phase_ = 0.0;
+    propulsion::StovlMode prev_stovl_mode_ = propulsion::StovlMode::CTOL;
+
+    // Combat procedural audio synthesis (audio thread reads, main thread sets under stream lock)
+    bool gun_firing_ = false;
+    double gun_phase_ = 0.0;
+    float gun_env_ = 0.0f;
+    float gun_rumble_lp_ = 0.0f;
+
+    float ir_growl_level_ = 0.0f;
+    bool ir_locked_ = false;
+    double ir_tone_phase_ = 0.0;
+    double ir_am_phase_ = 0.0;
+    float ir_env_ = 0.0f;
+
+    float launch_whoosh_env_ = 0.0f;
+    float launch_whoosh_lp_ = 0.0f;
+
+    float blast_env_ = 0.0f;
+    float blast_lp1_ = 0.0f;
+    float blast_lp2_ = 0.0f;
+    double blast_phase_ = 0.0;
 
     // State transition tracking
     bool prev_on_ground_     = false;
@@ -193,6 +231,27 @@ public:
 
     bool is_initialized() const noexcept { return initialized_; }
 
+    /// @brief Throttle lever dropped into the STOVL hold detent.
+    void cue_detent() noexcept {
+        if (!initialized_) return;
+        StreamLock lock(stream_);
+        click_env_ = 1.0f;
+    }
+
+    /// @brief Missile launch whoosh SFX cue
+    void cue_missile_launch() noexcept {
+        if (!initialized_) return;
+        StreamLock lock(stream_);
+        launch_whoosh_env_ = 1.0f;
+    }
+
+    /// @brief Detonation explosion blast SFX cue
+    void cue_explosion(float intensity = 1.0f) noexcept {
+        if (!initialized_) return;
+        StreamLock lock(stream_);
+        blast_env_ = std::clamp(intensity, 0.0f, 1.0f);
+    }
+
     /// @brief Update audio playback and mix active sample channels into stream
     void update(const graphics::AvionicsTelemetry& tel,
                 double dynamic_pressure,
@@ -201,6 +260,8 @@ public:
         if (!initialized_ || !enabled_) return;
 
         update_rwr(tel);
+        update_stovl(tel);
+        update_combat(tel);
 
         // If no authentic samples are installed on disk, run completely silent without queuing buffer
         const bool any_sample_loaded = (sfx_spool_.loaded || sfx_afterburner_.loaded ||
@@ -215,10 +276,20 @@ public:
         StreamLock lock(stream_);
 
         // If aircraft is crashed, silence propulsion and aerodynamic rush loops
-        if (tel.is_crashed) {
+        if (tel.is_crashed && !tel.pilot_ejected) {
             sfx_spool_.is_playing = false;
             sfx_afterburner_.is_playing = false;
             sfx_wind_.is_playing = false;
+        } else if (tel.pilot_ejected) {
+            // Out in the airflow: no engine, just the wind until the canopy opens.
+            sfx_spool_.is_playing = false;
+            sfx_afterburner_.is_playing = false;
+            if (sfx_wind_.loaded) {
+                const double q_norm = std::clamp(dynamic_pressure / 60000.0, 0.0, 1.0);
+                sfx_wind_.is_playing = q_norm > 0.0005;
+                sfx_wind_.current_gain = static_cast<float>(std::sqrt(q_norm) * 0.5);
+                sfx_wind_.current_rate = static_cast<float>(0.85 + 0.35 * q_norm);
+            }
         } else {
             // 1. Spool sample parameters
             if (sfx_spool_.loaded) {
@@ -290,6 +361,56 @@ private:
         prev_rwr_level_ = level;
     }
 
+    /// @brief LiftFan loudness from its thrust; a clunk on every lift-system
+    /// mode change (doors starting to move, or reaching their stops).
+    void update_stovl(const graphics::AvionicsTelemetry& tel) noexcept {
+        constexpr double LIFT_FAN_RATED_N = 83100.0; // 18,680 lbf in a full-power hover (P&W)
+        const propulsion::StovlStatus& st = tel.stovl;
+        const bool live = st.equipped && !tel.is_crashed && !tel.pilot_ejected;
+        StreamLock lock(stream_);
+        lift_fan_level_ = live ? static_cast<float>(std::clamp(st.lift_fan_thrust_n / LIFT_FAN_RATED_N, 0.0, 1.0)) : 0.0f;
+        if (live && st.mode != prev_stovl_mode_) clunk_env_ = 1.0f;
+        prev_stovl_mode_ = st.mode;
+    }
+
+    /// @brief Synthesise the lift system into @p out (audio thread).
+    void mix_stovl(float* out, int num_samples) noexcept {
+        constexpr double DT = 1.0 / SAMPLE_RATE;
+        if (lift_fan_level_ <= 0.0f && lift_fan_env_ < 1e-4f && clunk_env_ < 1e-4f && click_env_ < 1e-4f) return;
+        for (int i = 0; i < num_samples; ++i) {
+            // ~0.5 s spool lag, so the roar swells as the fan comes up.
+            lift_fan_env_ += (lift_fan_level_ - lift_fan_env_) * 4.5e-5f;
+            noise_state_ ^= noise_state_ << 13;
+            noise_state_ ^= noise_state_ >> 17;
+            noise_state_ ^= noise_state_ << 5;
+            const float white = static_cast<float>(noise_state_) * (2.0f / 4294967296.0f) - 1.0f;
+
+            // Roar: white noise low-passed at ~900 Hz plus a heavier ~280 Hz rumble.
+            roar_lp1_ += (white - roar_lp1_) * 0.13f;
+            roar_lp2_ += (roar_lp1_ - roar_lp2_) * 0.04f;
+            const float roar = roar_lp1_ * 0.6f + roar_lp2_ * 1.6f;
+            // Blade-passing whine, rising in pitch as the fan spools up.
+            lift_fan_phase_ = std::fmod(lift_fan_phase_ + (900.0 + 900.0 * lift_fan_env_) * DT, 1.0);
+            const double ph = 2.0 * M_PI * lift_fan_phase_;
+            const float whine = static_cast<float>(0.25 * std::sin(ph) + 0.08 * std::sin(2.0 * ph)) * lift_fan_env_;
+            const float fan = (roar + whine) * lift_fan_env_ * 0.35f * engine_bus_gain_;
+
+            // Door clunk: a 55 Hz thump with a noise transient, ~0.15 s decay.
+            clunk_phase_ = std::fmod(clunk_phase_ + 55.0 * DT, 1.0);
+            const float clunk = (static_cast<float>(std::sin(2.0 * M_PI * clunk_phase_)) + white * clunk_env_ * 0.3f) *
+                                clunk_env_ * 0.45f * alerts_bus_gain_;
+            clunk_env_ *= 0.99985f;
+            // Detent click: a 2.2 kHz tick, ~10 ms decay.
+            click_phase_ = std::fmod(click_phase_ + 2200.0 * DT, 1.0);
+            const float click = static_cast<float>(std::sin(2.0 * M_PI * click_phase_)) * click_env_ * 0.2f * alerts_bus_gain_;
+            click_env_ *= 0.9977f;
+
+            const float v = fan + clunk + click;
+            out[i * 2 + 0] = std::clamp(out[i * 2 + 0] + v, -1.0f, 1.0f);
+            out[i * 2 + 1] = std::clamp(out[i * 2 + 1] + v, -1.0f, 1.0f);
+        }
+    }
+
     /// @brief Synthesise the RWR tone into @p out (audio thread).
     void mix_rwr(float* out, int num_samples) noexcept {
         constexpr double DT = 1.0 / SAMPLE_RATE;
@@ -332,6 +453,88 @@ private:
             out[i * 2 + 0] = std::clamp(out[i * 2 + 0] + v, -1.0f, 1.0f);
             out[i * 2 + 1] = std::clamp(out[i * 2 + 1] + v, -1.0f, 1.0f);
             rwr_clock_ += DT;
+        }
+    }
+
+    /// @brief Update combat sound triggers from telemetry
+    void update_combat(const graphics::AvionicsTelemetry& tel) noexcept {
+        const bool live = tel.combat.active && !tel.is_crashed && !tel.pilot_ejected;
+        StreamLock lock(stream_);
+        gun_firing_ = live && tel.combat.gun_firing;
+        ir_growl_level_ = (live && tel.combat.ir_seeker_active) ? 1.0f : 0.0f;
+        ir_locked_ = live && tel.combat.ir_seeker_locked;
+    }
+
+    /// @brief Synthesise gun, Sidewinder growl/screech, launch whoosh and detonation blasts into @p out (audio thread)
+    void mix_combat(float* out, int num_samples) noexcept {
+        constexpr double DT = 1.0 / SAMPLE_RATE;
+        if (!gun_firing_ && gun_env_ < 1e-4f &&
+            ir_growl_level_ <= 0.0f && ir_env_ < 1e-4f &&
+            launch_whoosh_env_ < 1e-4f && blast_env_ < 1e-4f) {
+            return;
+        }
+
+        for (int i = 0; i < num_samples; ++i) {
+            noise_state_ ^= noise_state_ << 13;
+            noise_state_ ^= noise_state_ >> 17;
+            noise_state_ ^= noise_state_ << 5;
+            const float white = static_cast<float>(noise_state_) * (2.0f / 4294967296.0f) - 1.0f;
+
+            // 1. M61A1 Vulcan Cannon: 100 Hz (6,000 RPM) pulse train + low rumble
+            const float gun_target = gun_firing_ ? 1.0f : 0.0f;
+            gun_env_ += (gun_target - gun_env_) * 0.015f;
+            float gun_val = 0.0f;
+            if (gun_env_ > 1e-4f) {
+                gun_phase_ = std::fmod(gun_phase_ + 100.0 * DT, 1.0);
+                const float pulse = (gun_phase_ < 0.22) ? (std::sin(static_cast<float>(2.0 * M_PI * gun_phase_ * 4.5)) + white * 0.45f) : 0.0f;
+                gun_rumble_lp_ += (white - gun_rumble_lp_) * 0.035f;
+                gun_val = (pulse * 0.65f + gun_rumble_lp_ * 0.75f) * gun_env_ * 0.50f * alerts_bus_gain_;
+            }
+
+            // 2. Sidewinder IR Growl/Screech
+            const float ir_target = ir_growl_level_;
+            ir_env_ += (ir_target - ir_env_) * 0.005f;
+            float ir_val = 0.0f;
+            if (ir_env_ > 1e-4f) {
+                if (ir_locked_) {
+                    // High-pitched lock screech (420 Hz + 840 Hz harmonic)
+                    ir_tone_phase_ = std::fmod(ir_tone_phase_ + 420.0 * DT, 1.0);
+                    ir_am_phase_   = std::fmod(ir_am_phase_ + 840.0 * DT, 1.0);
+                    const float s1 = std::sin(static_cast<float>(2.0 * M_PI * ir_tone_phase_));
+                    const float s2 = std::sin(static_cast<float>(2.0 * M_PI * ir_am_phase_));
+                    ir_val = (s1 * 0.65f + s2 * 0.35f) * ir_env_ * 0.28f * alerts_bus_gain_;
+                } else {
+                    // Low growl buzz (85 Hz AM tone with rasp)
+                    ir_am_phase_   = std::fmod(ir_am_phase_ + 85.0 * DT, 1.0);
+                    ir_tone_phase_ = std::fmod(ir_tone_phase_ + 170.0 * DT, 1.0);
+                    const float mod = 0.55f + 0.45f * std::sin(static_cast<float>(2.0 * M_PI * ir_am_phase_));
+                    const float tone = std::sin(static_cast<float>(2.0 * M_PI * ir_tone_phase_));
+                    ir_val = (tone * mod + white * 0.18f) * ir_env_ * 0.24f * alerts_bus_gain_;
+                }
+            }
+
+            // 3. Missile launch whoosh
+            float whoosh_val = 0.0f;
+            if (launch_whoosh_env_ > 1e-4f) {
+                launch_whoosh_lp_ += (white - launch_whoosh_lp_) * (0.05f + 0.15f * (1.0f - launch_whoosh_env_));
+                whoosh_val = launch_whoosh_lp_ * launch_whoosh_env_ * 0.45f * alerts_bus_gain_;
+                launch_whoosh_env_ *= 0.99988f; // ~0.8s tail
+            }
+
+            // 4. Detonation blast (45 Hz shockwave thump + heavy rumble)
+            float blast_val = 0.0f;
+            if (blast_env_ > 1e-4f) {
+                blast_phase_ = std::fmod(blast_phase_ + 45.0 * DT, 1.0);
+                blast_lp1_ += (white - blast_lp1_) * 0.04f;
+                blast_lp2_ += (blast_lp1_ - blast_lp2_) * 0.02f;
+                const float thump = std::sin(static_cast<float>(2.0 * M_PI * blast_phase_));
+                blast_val = (thump * 0.55f + blast_lp2_ * 1.4f + blast_lp1_ * 0.4f) * blast_env_ * 0.65f * alerts_bus_gain_;
+                blast_env_ *= 0.99993f; // ~1.5s decay
+            }
+
+            const float v = gun_val + ir_val + whoosh_val + blast_val;
+            out[i * 2 + 0] = std::clamp(out[i * 2 + 0] + v, -1.0f, 1.0f);
+            out[i * 2 + 1] = std::clamp(out[i * 2 + 1] + v, -1.0f, 1.0f);
         }
     }
 
@@ -416,6 +619,8 @@ private:
             }
         }
         mix_rwr(out, num_samples);
+        mix_stovl(out, num_samples);
+        mix_combat(out, num_samples);
     }
 
     /// @brief Load a .wav file from disk and convert to target 44.1kHz stereo Float32 format

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "fastjet/aircraft/aircraft_type.hpp"
 #include "fastjet/ui/settings_manager.hpp"
 #include "fastjet/ui/theme.hpp"
 #include "fastjet/ui/widgets.hpp"
@@ -19,7 +20,18 @@
 
 namespace fastjet::ui {
 
-enum class ScreenId : uint8_t { MAIN = 0, SETTINGS, CREDITS, COUNT };
+enum class ScreenId : uint8_t {
+    MAIN = 0,
+    SETTINGS,
+    CREDITS,
+    EVADE_DIFFICULTY,
+    EVADE_AIRCRAFT,
+    DOGFIGHT_GEOMETRY,
+    DOGFIGHT_LOADOUT,
+    DOGFIGHT_SKILL,
+    DOGFIGHT_AIRCRAFT,
+    COUNT
+};
 
 /// @brief Requests the menu raises for the application to act on.
 enum class MenuAction : uint8_t {
@@ -27,7 +39,7 @@ enum class MenuAction : uint8_t {
     RESUME_FLIGHT,       ///< In flight: close the pause menu
     OPEN_MISSION_SELECT, ///< Hand over to the tactical aircraft/sortie menu
     START_DOGFIGHT,      ///< Begin a 1v1 guns engagement against an AI bandit
-    START_EVADE,         ///< Begin evade mode: survive a bandit hunting you with missiles and gun
+    START_EVADE,         ///< Begin evade mode with MenuSystem::evade_choice(): survive a bandit hunting you
     QUIT,
 };
 
@@ -84,6 +96,8 @@ public:
     virtual const std::vector<Resolution>& resolutions() const = 0;
     virtual QualityPreset launch_quality() const = 0;
     virtual std::string key_name(int32_t scancode) const = 0;
+    /// @brief The airframe the host is flying (default for aircraft pickers).
+    virtual aircraft::AircraftType current_aircraft() const = 0;
 
     virtual void navigate(ScreenId screen, bool forward) = 0;
     virtual void emit(MenuAction action) = 0;

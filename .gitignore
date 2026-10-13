@@ -23,8 +23,8 @@ Makefile.cmake
 .vscode/
 .idea/
 
-# Graphify cache
-graphify-out/cache/
+# Graphify knowledge graph (generated locally by `graphify update .`)
+graphify-out/
 
 # Scratch directory
 scratch/

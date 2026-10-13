@@ -1,6 +1,7 @@
 #pragma once
 
 #include "f16_aero_model.hpp"
+#include "compressible_lift.hpp"
 #include "../aircraft/aircraft_type.hpp"
 #include "../aircraft/aircraft_config.hpp"
 #include <cmath>
@@ -9,10 +10,10 @@
 namespace fastjet::aero {
 
 /**
- * @brief Unified aerodynamic model supporting all 5 combat aircraft.
+ * @brief Unified aerodynamic model supporting all six combat aircraft.
  * Delegates to NASA TP-1538 wind-tunnel lookup tables for F-16C, and utilizes
  * high-fidelity DATCOM / NASA TM dimensional polar synthesis with compressibility,
- * wave drag, damping derivatives, and high-alpha vortex lift for F-15EX, Typhoon, F-22, and A-10.
+ * wave drag, damping derivatives, and high-alpha vortex lift for F-15EX, Typhoon, F-22, A-10 and F-35B.
  *
  * Zero dynamic heap allocation.
  */
@@ -57,6 +58,11 @@ public:
         }
         const double ackeret = 1.0 / std::sqrt((std::max)(mach * mach - 1.0, 1e-6));
         return std::clamp(ackeret, 1.0, plateau);
+    }
+
+    [[nodiscard]] static constexpr double smoothstep(double t) noexcept {
+        t = std::clamp(t, 0.0, 1.0);
+        return t * t * (3.0 - 2.0 * t);
     }
 
     /**
@@ -126,36 +132,65 @@ public:
 
         const ControlSurfaces ctrl = controls.clamped();
 
-        // 1. Lift Coefficient (CL)
-        // High-alpha vortex lift model for Typhoon (canard-delta) and F-22 (diamond wing + chine)
-        double cl_linear = config.cl_alpha * alpha_rad;
-        double cl_vortex = 0.0;
+        constexpr double DEG_TO_RAD = M_PI / 180.0;
+        const double sin_a = std::sin(alpha_rad);
+        const double cos_a = std::cos(alpha_rad);
 
+        // 1. Low-speed lift and drag-due-to-lift against alpha, through the stall.
+        // Attached flow: the lift line, plus leading-edge vortex lift on the
+        // Typhoon (canard-delta) and F-22 (chined diamond wing), plus the
+        // stabilator's own lift.
+        double cl_vortex = 0.0;
         if (aircraft_type == aircraft::AircraftType::EUROFIGHTER_TYPHOON ||
             aircraft_type == aircraft::AircraftType::F22_RAPTOR) {
             // Polhamus leading-edge suction analogy for slender/delta wings:
             // CL_vortex ~ K_v * sin^2(alpha) * cos(alpha)
             constexpr double K_V = 2.4;
-            const double sin_a = std::sin(alpha_rad);
-            const double cos_a = std::cos(alpha_rad);
-            cl_vortex = K_V * sin_a * sin_a * cos_a;
+            cl_vortex = K_V * sin_a * std::abs(sin_a) * cos_a;
+        }
+        const double cl_delta_e = 0.40 * (ctrl.delta_e * DEG_TO_RAD);
+        const double cl_linear = config.cl_alpha * alpha_rad + cl_vortex + cl_delta_e;
+
+        // x: attached lift over CLmax. The lift rounds off to CLmax by
+        // stall_peak_x, holds, then falls away to a flat plate between
+        // stall_break_x and stall_break_x + stall_width_x. Beyond 90 deg the
+        // jet is flying tail first and is a flat plate throughout.
+        const double x = std::abs(cl_linear) / config.cl_max;
+        const double stall = std::abs(coeffs.alpha_deg) >= 90.0
+            ? 1.0 : smoothstep((x - config.stall_break_x) / config.stall_width_x);
+        const double peak_onset = 2.0 - config.stall_peak_x;
+        double cl_attached = x;
+        if (x >= config.stall_peak_x) {
+            cl_attached = 1.0;
+        } else if (x > peak_onset) {
+            cl_attached = x - (x - peak_onset) * (x - peak_onset) / (4.0 * (1.0 - peak_onset));
+        }
+        cl_attached = std::copysign(cl_attached * config.cl_max, cl_linear);
+
+        const double cl_plate = config.cn_90 * sin_a * cos_a;
+        const double cl_low_speed = (1.0 - stall) * cl_attached + stall * cl_plate;
+
+        // Drag due to lift as K * cl_alpha * CL * tan(alpha): on the lift line
+        // (tan(alpha) ~ CL / cl_alpha) this is exactly the polar's K * CL^2,
+        // but it keeps climbing with alpha once the lift is capped, as the
+        // leading-edge suction is lost and the force leans back towards the
+        // normal of the wing. It then blends to the flat plate.
+        const double tan_a = std::tan(std::clamp(alpha_rad, -1.48, 1.48));
+        const double cd_lift_attached = config.k_induced * config.cl_alpha * std::abs(cl_attached * tan_a);
+        const double cd_lift_low_speed = (1.0 - stall) * cd_lift_attached
+                                       + stall * config.cn_90 * sin_a * sin_a;
+
+        // 2. Compressibility on lift and drag-due-to-lift together.
+        double cd_lift = cd_lift_low_speed;
+        coeffs.CL = cl_low_speed;
+        if (mach > 0.0) {
+            const auto lift = CompressibleLift::apply(cl_low_speed, cd_lift_low_speed, config.cl_max,
+                                                      coeffs.alpha_deg, prandtl_glauert(mach), mach);
+            coeffs.CL = lift.cl;
+            cd_lift = lift.cd_lift;
         }
 
-        // Elevator / Stabilator lift contribution
-        constexpr double DEG_TO_RAD = M_PI / 180.0;
-        const double cl_delta_e = 0.40 * (ctrl.delta_e * DEG_TO_RAD);
-
-        double raw_cl = cl_linear + cl_vortex + cl_delta_e;
-        // Clamp to aerodynamic stall limit
-        const double max_cl = (aircraft_type == aircraft::AircraftType::F22_RAPTOR) ? 2.2 : config.cl_max;
-        coeffs.CL = std::clamp(raw_cl, -max_cl, max_cl);
-
-        // 2. Drag Coefficient (CD)
-        // Polar: CD = CD0 + k * CL^2
-        const double cd_induced = config.k_induced * (coeffs.CL * coeffs.CL);
-        coeffs.CD = config.cd0 + cd_induced;
-
-        // Compressibility and wave drag
+        coeffs.CD = config.cd0 + cd_lift;
         if (mach > 0.0) {
             coeffs.CD += wave_drag(mach);
             coeffs.CD += dynamic_pressure_drag(q_bar);
@@ -172,14 +207,27 @@ public:
         double static_margin = 0.05; // Standard 5% positive for F-15 and A-10
         if (aircraft_type == aircraft::AircraftType::EUROFIGHTER_TYPHOON ||
             aircraft_type == aircraft::AircraftType::F22_RAPTOR) {
-            static_margin = (mach < 1.0) ? -0.08 : +0.06; // Transonic aerodynamic center shift
+            // Transonic aerodynamic-centre shift: unstable subsonic, stable
+            // supersonic. The AC moves aft progressively through the transonic
+            // region; a step at M1.0 kicked the jet's pitch trim as it crossed.
+            static_margin = -0.08 + 0.14 * smoothstep((mach - 0.95) / 0.20);
+        } else if (aircraft_type == aircraft::AircraftType::F35B_LIGHTNING_II) {
+            // F-35: relaxed stability, ~5% MAC unstable subsonic, ~10% stable supersonic.
+            static_margin = -0.05 + 0.15 * smoothstep((mach - 0.95) / 0.20);
         }
         const double cm_alpha = -config.cl_alpha * static_margin;
         const double cm_delta_e = -0.90 * (ctrl.delta_e * DEG_TO_RAD); // Pitch control surface power
         const double lon_damping = config.c_bar / (2.0 * v_safe);
         const double cm_q = config.pitch_damping * (lon_damping * state.omega_b.y);
 
-        coeffs.Cm = cm_alpha * alpha_rad + cm_delta_e + cm_q;
+        // Once stalled the wing's centre of pressure moves to mid-chord, well
+        // behind the CG: a nose-down moment that grows to cm_90 at 90 deg and
+        // swaps the ends of a jet flying tail first. The tail keeps a little
+        // authority in the wing's wake.
+        const double cm_static = (1.0 - stall) * (cm_alpha * alpha_rad)
+                               + stall * (-config.cm_90 * sin_a);
+        const double tail_power = 1.0 - 0.6 * stall;
+        coeffs.Cm = cm_static + tail_power * cm_delta_e + cm_q;
 
         // Speedbrake pitch increment
         if (ctrl.speedbrake > 0.0) {
@@ -204,10 +252,10 @@ public:
         coeffs.Cn = +0.16 * beta_rad - 0.10 * (ctrl.delta_r * DEG_TO_RAD) +
                     config.yaw_damping * (lat_damping * r_rate);
 
-        // Apply compressibility scaling to lift and moments (continuous in Mach)
+        // Compressibility scaling of the moments and side force (continuous in
+        // Mach). Lift was scaled above, together with its drag.
         if (mach > 0.0) {
             const double pg = prandtl_glauert(mach);
-            coeffs.CL *= pg;
             coeffs.CY *= pg;
             coeffs.Cl *= pg;
             coeffs.Cn *= pg;

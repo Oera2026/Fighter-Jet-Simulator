@@ -134,7 +134,7 @@ public:
         trigger = false;
         if (!self.alive()) return out;
 
-        const TrackSample seen = perceived_track();
+        const TrackSample seen = perceived_track(self.state.pos_ned);
         // His ATA on us is judged from his (delayed) flight path.
         const AirCombatGeometry geo = geometry_to(self.state, seen);
         const double his_ata = AirCombatGeometry::angle_between(seen.vel, self.state.pos_ned - seen.pos);
@@ -355,14 +355,39 @@ public:
             cooldown_timer_ = std::max(0.0, cooldown_timer_ - dt);
         }
         out.trigger = trigger;
+
+        // ---- Countermeasure employment ----
+        if (situation == Situation::DEFENSIVE) {
+            flare_timer_ -= dt;
+            if (flare_timer_ <= 0.0) {
+                out.dispense_flare = true;
+                out.dispense = true;
+                flare_timer_ = (skill.uses_energy ? 1.0 : 2.2) + 0.4 * rng_.uniform();
+            }
+        }
+
+        // ---- Missile employment ----
+        missile_cooldown_ = std::max(0.0, missile_cooldown_ - dt);
+        if (situation == Situation::OFFENSIVE && missile_cooldown_ <= 0.0 && skill.uses_energy) {
+            if (geo.range > 800.0 && geo.range < 12000.0 && geo.ata < 20.0 * DEG) {
+                out.pickle = true;
+                missile_cooldown_ = 4.0;
+            }
+        }
         return out;
     }
 
     /// @brief Corner speed from the jet's own wing, CLmax, weight and G limit.
     [[nodiscard]] static double corner_speed(const Aircraft& self, const aircraft::AircraftConfig& cfg) noexcept {
-        const double rho = environment::Atmosphere1976::compute(self.state.altitude()).density;
+        const auto atm = environment::Atmosphere1976::compute(self.state.altitude());
         const double w = self.mass.mass_kg * fdm::SixDoFFDM::GRAVITY_ACCEL;
-        return std::sqrt(2.0 * cfg.flcs.max_g_positive * w / (rho * cfg.aero.s_ref * cfg.aero.cl_max));
+        const double k = 2.0 * cfg.flcs.max_g_positive * w / (atm.density * cfg.aero.s_ref * cfg.aero.cl_max);
+        double v = std::sqrt(k);
+        for (int i = 0; i < 4; ++i) {
+            const double f = aero::CompressibleLift::clmax_mach_factor(v / atm.speed_of_sound);
+            v = std::sqrt(k / f);
+        }
+        return v;
     }
 
 private:
@@ -376,6 +401,9 @@ private:
     static constexpr double G_OFFSET_RATE = 12.0; ///< [G/s]
     static constexpr double MAX_CHASE_Q_PA = 75000.0; ///< ~350 m/s at sea level, ~450 m/s at 5 km
     static constexpr double MANOEUVRE_RANGE_M = 6000.0;
+    static constexpr double ROLL_BANDWIDTH_RAD_S = 3.0;
+    static constexpr double ROLL_RATE_DAMPING = 0.2;
+    static constexpr double SEE_TURN_RANGE_M = 1500.0;
     static constexpr int kTrackLen = 48;
     static constexpr double kTrackPeriod = 0.02; // 50 Hz
 
@@ -400,6 +428,8 @@ private:
     math::Vector3 prev_to_aim_{};
     math::Vector3 los_rate_{};
     bool has_prev_aim_{false};
+    double flare_timer_{0.0};
+    double missile_cooldown_{0.0};
     DamageRng rng_{};
 
     double gaussian() noexcept {
@@ -417,7 +447,7 @@ private:
 
     /// @brief The bandit as seen reaction_s ago, extrapolated to now at constant
     /// velocity: exact for a straight flier, late on every manoeuvre.
-    [[nodiscard]] TrackSample perceived_track() const noexcept {
+    [[nodiscard]] TrackSample perceived_track(const math::Vector3& own_pos) const noexcept {
         const int lag = std::clamp(static_cast<int>(skill.reaction_s / kTrackPeriod + 0.5), 0, kTrackLen - 1);
         int idx = track_head_;
         for (int i = 0; i < lag; ++i) {
@@ -428,6 +458,10 @@ private:
         TrackSample s = track_[static_cast<size_t>(idx)];
         const double age = time_ - s.time;
         s.pos += s.vel * age;
+        if (skill.uses_energy && (s.pos - own_pos).norm() < SEE_TURN_RANGE_M) {
+            s.pos += s.acc * (0.5 * age * age);
+            s.vel += s.acc * age;
+        }
         s.time = time_;
         return s;
     }
@@ -515,8 +549,9 @@ private:
         // Bank to put the lift vector (-Z body) on f.
         const double phi_err = std::atan2(f_b.y, -f_b.z);
         const double p = s.omega_b.x;
-        // A hand on the stick has a lag of its own (~60 ms).
-        const double roll_raw = std::clamp(1.6 * phi_err - 0.25 * p, -1.0, 1.0);
+        const double p_full = std::max(0.5, cfg.flcs.max_roll_rate_dps * DEG);
+        const double p_want = ROLL_BANDWIDTH_RAD_S * phi_err - ROLL_RATE_DAMPING * p;
+        const double roll_raw = std::clamp(p_want / p_full, -1.0, 1.0);
         roll_stick_ += (roll_raw - roll_stick_) * (1.0 - std::exp(-dt / 0.06));
         out.stick.roll_stick = roll_stick_;
 

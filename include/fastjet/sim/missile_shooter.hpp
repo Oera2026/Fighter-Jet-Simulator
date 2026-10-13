@@ -9,7 +9,7 @@ namespace fastjet::sim {
 /// @brief When a pilot is willing to take a missile shot.
 enum class LaunchDoctrine : uint8_t {
     NONE,      ///< Guns only
-    MAX_RANGE, ///< As soon as the missile can reach a target that holds course: easy to defeat by turning away
+    MAX_RANGE, ///< As soon as the missile can reach a target that holds course, never from inside 3 km: easy to defeat by turning away
     NO_ESCAPE, ///< Only when the missile still catches a target that turns cold and runs
 };
 
@@ -78,6 +78,10 @@ public:
         const double range = los.norm();
         const math::Vector3 nose = a.state.q_att.rotate_body_to_ned(math::Vector3(1.0, 0.0, 0.0));
         if (range < spec.min_launch_range_m) return false;
+        // An Rmax shooter takes his shots from range; in a knife fight he
+        // fights with the gun. (An AMRAAM fired from inside 3 km in a turning
+        // fight is a no-escape shot, the next level's doctrine.)
+        if (doctrine == LaunchDoctrine::MAX_RANGE && range < RMAX_MIN_SHOT_RANGE_M) return false;
         if (AirCombatGeometry::angle_between(nose, los) > spec.max_launch_ata_deg * M_PI / 180.0) return false;
 
         if (eval_timer_ > 0.0) return false;
@@ -92,6 +96,9 @@ public:
         ++launches;
         return true;
     }
+
+    /// Closest an Rmax-doctrine pilot will take a missile shot [m].
+    static constexpr double RMAX_MIN_SHOT_RANGE_M = 3000.0;
 
 private:
     static constexpr double SALVO_SPACING_S = 1.5;

@@ -49,6 +49,7 @@ struct ControllerProfile {
     int btn_speedbrake_extend{4};
     int btn_speedbrake_retract{5};
     int btn_parking_brake{6};
+    int btn_stovl_mode{7}; ///< F-35B STOVL/CTOL conversion button (each press toggles)
 
     /**
      * @brief Serializes profile to formatted JSON string.
@@ -86,7 +87,8 @@ struct ControllerProfile {
         ss << "    \"trim_right\": " << btn_trim_right << ",\n";
         ss << "    \"speedbrake_extend\": " << btn_speedbrake_extend << ",\n";
         ss << "    \"speedbrake_retract\": " << btn_speedbrake_retract << ",\n";
-        ss << "    \"parking_brake\": " << btn_parking_brake << "\n";
+        ss << "    \"parking_brake\": " << btn_parking_brake << ",\n";
+        ss << "    \"stovl_mode\": " << btn_stovl_mode << "\n";
         ss << "  }\n";
         ss << "}\n";
 
@@ -171,9 +173,9 @@ struct ControllerProfile {
             const std::size_t b_close = json_str.find('}', b_open);
             if (b_open != std::string::npos && b_close != std::string::npos) {
                 const std::string b_str = json_str.substr(b_open, b_close - b_open + 1);
-                auto get_btn = [&](const std::string& key) -> int {
+                auto get_btn = [&](const std::string& key, int fallback = 0) -> int {
                     std::string s = extract_from_block(b_str, key);
-                    return s.empty() ? 0 : std::stoi(s);
+                    return s.empty() ? fallback : std::stoi(s);
                 };
                 btn_trim_up = get_btn("trim_up");
                 btn_trim_down = get_btn("trim_down");
@@ -182,6 +184,9 @@ struct ControllerProfile {
                 btn_speedbrake_extend = get_btn("speedbrake_extend");
                 btn_speedbrake_retract = get_btn("speedbrake_retract");
                 btn_parking_brake = get_btn("parking_brake");
+                // Added later: a profile saved before it keeps the default
+                // rather than landing on button 0 (trim up).
+                btn_stovl_mode = get_btn("stovl_mode", btn_stovl_mode);
             }
         }
 

@@ -68,11 +68,11 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(ColorblindMode
 /// style layouts in place on AZERTY/QWERTZ keyboards.
 namespace scancode {
 inline constexpr int32_t NONE = 0;
-inline constexpr int32_t A = 4, B = 5, C = 6, D = 7, F = 9, G = 10, H = 11, I = 12, J = 13, L = 15, M = 16, P = 19, R = 21, T = 23, V = 25;
+inline constexpr int32_t A = 4, B = 5, C = 6, D = 7, E = 8, F = 9, G = 10, H = 11, I = 12, J = 13, K = 14, L = 15, M = 16, O = 18, P = 19, Q = 20, R = 21, S = 22, T = 23, V = 25, X = 27;
 inline constexpr int32_t MINUS = 45, EQUALS = 46, LEFTBRACKET = 47, RIGHTBRACKET = 48;
-inline constexpr int32_t NUM_1 = 30, NUM_5 = 34;
+inline constexpr int32_t NUM_1 = 30, NUM_6 = 35;
 inline constexpr int32_t RETURN = 40, ESCAPE = 41, BACKSPACE = 42, TAB = 43, SPACE = 44;
-inline constexpr int32_t F1 = 58, F8 = 65;
+inline constexpr int32_t F1 = 58, F8 = 65, F12 = 69;
 inline constexpr int32_t PAGE_UP = 75, DELETE_KEY = 76, PAGE_DOWN = 78;
 inline constexpr int32_t RIGHT = 79, LEFT = 80, DOWN = 81, UP = 82;
 inline constexpr int32_t LCTRL = 224, LSHIFT = 225;
@@ -104,6 +104,13 @@ enum class InputAction : uint8_t {
     ANTENNA_UP,
     ANTENNA_DOWN,
     MFD_PAGE,
+    RADAR_MODE,
+    RADAR_SCAN,
+    FIRE_MISSILE,
+    WEAPON_SELECT,
+    DISPENSE_FLARE,
+    EJECT,
+    STOVL_MODE, ///< F-35B STOVL/CTOL conversion button (latched)
     COUNT
 };
 inline constexpr size_t kInputActionCount = static_cast<size_t>(InputAction::COUNT);
@@ -151,14 +158,21 @@ inline constexpr std::array<ActionInfo, kInputActionCount> kActionInfo = {{
     {"antenna_up",       {scancode::EQUALS, scancode::NONE}},
     {"antenna_down",     {scancode::MINUS, scancode::NONE}},
     {"mfd_page",         {scancode::P, scancode::NONE}},
+    {"radar_mode",       {scancode::K, scancode::NONE}},
+    {"radar_scan",       {scancode::O, scancode::NONE}},
+    {"fire_missile",     {scancode::RETURN, scancode::NONE}},
+    {"weapon_select",    {scancode::Q, scancode::NONE}},
+    {"dispense_flare",   {scancode::X, scancode::NONE}},
+    {"eject",            {scancode::E, scancode::NONE}},
+    {"stovl_mode",       {scancode::S, scancode::NONE}},
 }};
 
 /// @brief Keys owned by fixed hotkeys (menu, camera, airframe, detents,
 /// throttle hardware) that must not be captured by a rebind.
 [[nodiscard]] constexpr bool is_reserved_scancode(int32_t sc) noexcept {
     return sc == scancode::ESCAPE ||
-           (sc >= scancode::F1 && sc <= scancode::F8) ||
-           (sc >= scancode::NUM_1 && sc <= scancode::NUM_5) ||
+           (sc >= scancode::F1 && sc <= scancode::F8) || sc == scancode::F12 ||
+           (sc >= scancode::NUM_1 && sc <= scancode::NUM_6) ||
            sc == scancode::H || sc == scancode::I || sc == scancode::J || sc == scancode::M;
 }
 

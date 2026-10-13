@@ -44,6 +44,14 @@ struct FlightSimHarness {
         state.q_att = math::Quaternion::identity();
     }
 
+    /// @brief Run the engine up to @p throttle at the current flight condition
+    /// (a jet flying at speed has its engine running; the core takes seconds
+    /// to spool and the afterburner lights only once it has).
+    void prespool(double throttle) {
+        const auto air = environment::Atmosphere1976::compute(state.altitude(), state.airspeed());
+        for (int i = 0; i < 3000; ++i) (void)engine.update(throttle, air, DT);
+    }
+
     void step(double throttle, const flcs::PilotCommands& cmd) {
         const auto air = environment::Atmosphere1976::compute(state.altitude(), state.airspeed());
         const double thrust = engine.update(throttle, air, DT);
@@ -73,6 +81,7 @@ void test_f15ex_high_speed_dash() {
     // Trim at 12,000 m (tropopause) at Mach 1.5
     const auto air = environment::Atmosphere1976::compute(12000.0, 440.0);
     sim.trim_level(12000.0, 440.0);
+    sim.prespool(1.0);
 
     // Full afterburner acceleration
     flcs::PilotCommands cmd{};
@@ -178,7 +187,7 @@ void test_lift_continuous_through_transonic() {
 
     for (AircraftType t : {AircraftType::F16_FIGHTING_FALCON, AircraftType::F15EX_EAGLE_II,
                            AircraftType::EUROFIGHTER_TYPHOON, AircraftType::F22_RAPTOR,
-                           AircraftType::A10_THUNDERBOLT}) {
+                           AircraftType::A10_THUNDERBOLT, AircraftType::F35B_LIGHTNING_II}) {
         const aero::AircraftAeroModel aero(t);
         double prev_cl = aero.compute_coefficients(s, ctrl, 20000.0, 0.70).CL;
         double worst = 0.0;

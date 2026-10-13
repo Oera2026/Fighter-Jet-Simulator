@@ -194,6 +194,36 @@ struct Quaternion {
     }
 
     /**
+     * @brief Quaternion of a NED-to-body DCM (the inverse of to_dcm_ned_to_body),
+     * by Shepperd's method: divide by the largest component, so the result
+     * stays accurate at every attitude.
+     */
+    [[nodiscard]] static Quaternion from_dcm_ned_to_body(const Matrix3x3& m) noexcept {
+        const double trace = m(0, 0) + m(1, 1) + m(2, 2);
+        Quaternion q;
+        if (trace >= m(0, 0) && trace >= m(1, 1) && trace >= m(2, 2)) {
+            const double w4 = 2.0 * std::sqrt(std::max(0.0, 1.0 + trace));
+            q = {0.25 * w4, (m(1, 2) - m(2, 1)) / w4, (m(2, 0) - m(0, 2)) / w4, (m(0, 1) - m(1, 0)) / w4};
+        } else if (m(0, 0) >= m(1, 1) && m(0, 0) >= m(2, 2)) {
+            const double x4 = 2.0 * std::sqrt(std::max(0.0, 1.0 + m(0, 0) - m(1, 1) - m(2, 2)));
+            q = {(m(1, 2) - m(2, 1)) / x4, 0.25 * x4, (m(0, 1) + m(1, 0)) / x4, (m(0, 2) + m(2, 0)) / x4};
+        } else if (m(1, 1) >= m(2, 2)) {
+            const double y4 = 2.0 * std::sqrt(std::max(0.0, 1.0 - m(0, 0) + m(1, 1) - m(2, 2)));
+            q = {(m(2, 0) - m(0, 2)) / y4, (m(0, 1) + m(1, 0)) / y4, 0.25 * y4, (m(1, 2) + m(2, 1)) / y4};
+        } else {
+            const double z4 = 2.0 * std::sqrt(std::max(0.0, 1.0 - m(0, 0) - m(1, 1) + m(2, 2)));
+            q = {(m(0, 1) - m(1, 0)) / z4, (m(0, 2) + m(2, 0)) / z4, (m(1, 2) + m(2, 1)) / z4, 0.25 * z4};
+        }
+        q.normalize();
+        return q;
+    }
+
+    /// @brief Quaternion of a body-to-NED DCM (columns are the body axes in NED).
+    [[nodiscard]] static Quaternion from_dcm_body_to_ned(const Matrix3x3& c) noexcept {
+        return from_dcm_ned_to_body(c.transpose());
+    }
+
+    /**
      * @brief Spherical Linear Interpolation (slerp) between two unit quaternions.
      * @param q0 Start quaternion (t = 0)
      * @param q1 End quaternion (t = 1)

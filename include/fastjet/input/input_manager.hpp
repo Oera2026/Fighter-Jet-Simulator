@@ -31,6 +31,10 @@ public:
     double yaw_in{0.0};        // [-1.0, +1.0]
     double throttle_in{0.0};   // [0.0, 1.0]
 
+    // STOVL/CTOL button: true on the update the button went down. The
+    // host latches the mode; holding the button does not toggle it again.
+    bool stovl_button_pressed{false};
+
     explicit InputManager(std::shared_ptr<IJoystickDriver> drv) noexcept
         : driver(std::move(drv)) {}
 
@@ -89,16 +93,24 @@ public:
             brakes.parking_brake = !brakes.parking_brake;
         }
 
-        // 7. Update Engine Throttle Detents and Thrust
+        // 7. STOVL/CTOL Mode Button (on the throttle, rising edge only)
+        const bool stovl_btn = driver->get_button(config.throttle_device, config.btn_stovl_mode);
+        stovl_button_pressed = stovl_btn && !stovl_button_held_;
+        stovl_button_held_ = stovl_btn;
+
+        // 8. Update Engine Throttle Detents and Thrust
         throttle.update(throttle_in);
 
-        // 8. Synthesize PilotCommands with Digital Trim Hat
+        // 9. Synthesize PilotCommands with Digital Trim Hat
         const double final_pitch = std::clamp(pitch_in + trim_hat.trim_pitch, -1.0, 1.0);
         const double final_roll  = std::clamp(roll_in  + trim_hat.trim_roll,  -1.0, 1.0);
         const double final_yaw   = yaw_in;
 
         return {final_pitch, final_roll, final_yaw};
     }
+
+private:
+    bool stovl_button_held_{false};
 };
 
 } // namespace input

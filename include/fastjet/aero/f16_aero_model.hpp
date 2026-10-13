@@ -1,6 +1,7 @@
 #pragma once
 
 #include "interpolator.hpp"
+#include "compressible_lift.hpp"
 #include "control_surfaces.hpp"
 #include "tp1538_tables.hpp"
 #include "../fdm/aircraft_forces.hpp"
@@ -74,12 +75,27 @@ public:
     // Mach tuck: aerodynamic centre shifts aft transonically, producing a
     // nose-down pitching moment increment.
     static constexpr double CM_TUCK_MAX = -0.030;
+    // Aft shift of the aerodynamic centre through the transonic region, as a
+    // fraction of the mean chord: Delta Cm = -shift * CL.
+    static constexpr double AC_SHIFT_MAX   = 0.12;
+    static constexpr double AC_SHIFT_START = 0.90;
+    static constexpr double AC_SHIFT_END   = 1.20;
 
     // --- Speedbrake ------------------------------------------------------
     // Fully extended F-16 airbrakes add roughly Delta CD = +0.025 and, being
     // mounted above and below the tailpipe, a small nose-up pitch increment.
     static constexpr double CD_SPEEDBRAKE_FULL = 0.025;
     static constexpr double CM_SPEEDBRAKE_FULL = 0.006;
+
+    // --- Stall and reversed flow -------------------------------------------
+    /// Low-speed maximum lift coefficient of the table (35 deg, LEF down).
+    static constexpr double CL_MAX_LOW_SPEED = 1.55;
+    /// Flat-plate normal-force coefficient at 90 deg (matches the table's 90 deg row).
+    static constexpr double CN_90 = 1.80;
+    /// Pitching moment at 90 deg (matches the table's 90 deg row).
+    static constexpr double CM_90 = -0.36;
+    /// Skin-friction drag flying tail first.
+    static constexpr double CD_REVERSED_MIN = 0.03;
 
     /**
      * @brief Prandtl-Glauert compressibility factor 1/sqrt(|1 - M^2|).
@@ -212,9 +228,30 @@ public:
             TP1538Tables::ALPHA_GRID, TP1538Tables::CM_Q, coeffs.alpha_deg
         );
 
-        coeffs.CL = cl_static + lon_damping_factor * cl_q * q_rate;
-        coeffs.CD = cd_static + lon_damping_factor * cd_q * q_rate;
-        coeffs.Cm = cm_static + lon_damping_factor * cm_q * q_rate;
+        // Past 90 deg the jet is flying tail first: the wing is a flat plate
+        // whose force stays normal to it, and the tail-first flow is unstable
+        // in pitch, so the jet swaps ends. Continuous with the 90 deg row.
+        double cl_s = cl_static, cd_s = cd_static, cm_s = cm_static;
+        double cd_zero_lift = 0.0;
+        const bool reversed = std::abs(coeffs.alpha_deg) > 90.0;
+        if (reversed) {
+            const double sa = std::sin(alpha_rad);
+            const double ca = std::cos(alpha_rad);
+            cl_s = CN_90 * sa * ca;
+            cd_s = CN_90 * sa * sa + CD_REVERSED_MIN * ca * ca;
+            cm_s = CM_90 * sa;
+            cd_zero_lift = CD_REVERSED_MIN;
+        } else if (mach > 0.0) {
+            cd_zero_lift = Interpolator::interp3d<
+                TP1538Tables::N_ALPHA, TP1538Tables::N_DE, TP1538Tables::N_LEF>(
+                TP1538Tables::ALPHA_GRID, TP1538Tables::ELEVATOR_GRID, TP1538Tables::LEF_GRID,
+                TP1538Tables::TABLE_CD, 0.0, ctrl.delta_e, ctrl.delta_lef
+            );
+        }
+
+        coeffs.CL = cl_s + lon_damping_factor * cl_q * q_rate;
+        coeffs.CD = cd_s + lon_damping_factor * cd_q * q_rate;
+        coeffs.Cm = cm_s + lon_damping_factor * cm_q * q_rate;
 
         // 2. Lateral-Directional Interpolations: CY, Cl, Cn
         const double cy_static = Interpolator::interp2d<
@@ -270,18 +307,33 @@ public:
             const double m = std::clamp(mach, 0.0, 2.50);
             const double pg = prandtl_glauert(m);
 
-            // Lift and lateral coefficients scale with the PG factor.
-            coeffs.CL *= pg;
+            // Lift gains from compressibility only where the flow is
+            // attached, is capped by the falling CLmax, and pays the drag of
+            // the lift it actually makes (see CompressibleLift).
+            const auto lift = CompressibleLift::apply(
+                coeffs.CL, std::max(0.0, coeffs.CD - cd_zero_lift), CL_MAX_LOW_SPEED,
+                coeffs.alpha_deg, pg, m);
+            coeffs.CL = lift.cl;
+            coeffs.CD = cd_zero_lift + lift.cd_lift;
+
+            // Lateral coefficients scale with the PG factor.
             coeffs.CY *= pg;
             coeffs.Cl *= pg;
             coeffs.Cn *= pg;
 
-            // Pitching moment scales, plus the transonic aft AC shift (Mach tuck).
+            // Pitching moment scales, plus the transonic aft AC shift: a
+            // nose-down trim change (Mach tuck) and a gain in static stability
+            // as the aerodynamic centre moves aft of the CG. The table's
+            // relaxed stability is a subsonic property; supersonic, the real
+            // F-16 is stable, and left unstable here the FLCS fought a
+            // divergent pitch oscillation at high dynamic pressure.
             coeffs.Cm *= pg;
             if (m > MACH_CRIT) {
                 const double t = std::clamp((m - MACH_CRIT) / (MACH_PEAK - MACH_CRIT), 0.0, 1.0);
                 coeffs.Cm += CM_TUCK_MAX * t * t * (3.0 - 2.0 * t);
             }
+            const double t_ac = std::clamp((m - AC_SHIFT_START) / (AC_SHIFT_END - AC_SHIFT_START), 0.0, 1.0);
+            coeffs.Cm -= AC_SHIFT_MAX * t_ac * t_ac * (3.0 - 2.0 * t_ac) * coeffs.CL;
 
             // Wave drag adds to the profile drag.
             coeffs.CD += wave_drag(m);

@@ -156,6 +156,54 @@ void test_hud_supersonic_and_centering() {
     std::cout << "PASSED (Clean 4-digit speed and Mach readout generated up to Mach 2+)\n";
 }
 
+/// The F-35B flies with a helmet display: no combiner, so after the
+/// aircraft-referenced "virtual HUD" come helmet-fixed flight data; in
+/// STOVL the lift-system symbology joins the virtual HUD. Every other jet's
+/// HUD is one masked set, unchanged.
+void test_f35b_helmet_symbology() {
+    std::cout << "[Test 6] F-35B Helmet Display: Helmet-Fixed Data & STOVL Symbology... ";
+
+    HUDCollimator hud;
+    FlightState state{};
+    state.pos_ned = Vector3(0.0, 0.0, -300.0);
+    state.vel_b   = Vector3(150.0, 0.0, 0.0);
+    IMUData imu{};
+    imu.Nz = 1.0;
+
+    AvionicsTelemetry tel;
+    hud.build_symbology(state, imu, false, tel);
+    assert(!hud.helmet_mounted() && hud.masked_vertex_count() == hud.vertex_count());
+
+    tel.aircraft_type = fastjet::aircraft::AircraftType::F35B_LIGHTNING_II;
+    tel.stovl.equipped = true;
+    hud.build_symbology(state, imu, false, tel);
+    assert(hud.helmet_mounted());
+    const size_t ctol_virtual = hud.masked_vertex_count();
+    assert(hud.vertex_count() > ctol_virtual + 40 && "helmet-fixed airspeed, altitude and heading missing");
+
+    // Converted and jet-borne, hovering: mode block, VS scale, hover pad,
+    // radar altitude; over the conversion speed limit, the caution too.
+    tel.stovl.mode = fastjet::propulsion::StovlMode::STOVL;
+    tel.stovl.conversion = 1.0;
+    tel.stovl.control_phase = 2;
+    tel.stovl.nozzle_pitch_deg = 90.0;
+    tel.stovl.hover_thrust_margin = 1.06;
+    state.vel_b = Vector3(1.0, 0.0, 0.0);
+    hud.build_symbology(state, imu, false, tel);
+    const size_t hover_virtual = hud.masked_vertex_count();
+    assert(hover_virtual > ctol_virtual + 150 && "STOVL symbology missing from the virtual HUD");
+    state.vel_b = Vector3(150.0, 0.0, 0.0); // ~290 KCAS at 300 m: above the 250 KCAS conversion limit
+    tel.stovl.control_phase = 0;
+    hud.build_symbology(state, imu, false, tel);
+    const size_t fast = hud.masked_vertex_count();
+    tel.stovl.mode = fastjet::propulsion::StovlMode::CTOL;
+    tel.stovl.conversion = 0.0;
+    hud.build_symbology(state, imu, false, tel);
+    assert(hud.masked_vertex_count() < fast && hud.masked_vertex_count() == ctol_virtual);
+
+    std::cout << "PASSED (virtual HUD " << ctol_virtual << ", hover " << hover_virtual << " vertices)\n";
+}
+
 int main() {
     std::cout << "=================================================================\n";
     std::cout << "         F-16 HUD CLIPPING & STENCIL APERTURE VERIFICATION       \n";
@@ -166,6 +214,7 @@ int main() {
     test_fpm_ghost_clamping();
     test_hud_typography_and_resolution();
     test_hud_supersonic_and_centering();
+    test_f35b_helmet_symbology();
 
     std::cout << "\nAll HUD Clipping and Aperture Tests Passed Successfully!\n";
     return 0;

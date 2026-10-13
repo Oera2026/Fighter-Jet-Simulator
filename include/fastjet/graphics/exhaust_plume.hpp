@@ -53,12 +53,36 @@ public:
         if (!vao_ || (afterburner <= 0.0f && core_glow <= 0.0f)) return;
         shader_.use();
         shader_.set_int("uHdrOutput", 1);
+        shader_.set_int("uMode", 0);
         shader_.set_mat4("uViewProj", view_proj_rot);
         shader_.set_mat4("uModel", model);
         shader_.set_float("uAfterburner", afterburner);
         shader_.set_float("uGlow", core_glow);
         shader_.set_float("uTime", time_s);
+        draw();
+    }
 
+    /// @brief Draws a dry lift jet (F-35B in STOVL): no flame, only the
+    /// faint shimmer of a fast column of air, spreading as it goes. The
+    /// LiftFan's is cold and grey-blue; the 3BSM's dry core warm.
+    /// @param model As render(), with the column's own radius and length.
+    /// @param strength Thrust relative to the post's rating, ~[0, 1.5].
+    /// @param warmth 0 cold (fan, roll posts) .. 1 hot (engine core).
+    void render_jet(const Mat4& view_proj_rot, const Mat4& model, float strength, float warmth, float time_s) {
+        if (!vao_ || strength <= 0.01f) return;
+        shader_.use();
+        shader_.set_int("uHdrOutput", 1);
+        shader_.set_int("uMode", 1);
+        shader_.set_mat4("uViewProj", view_proj_rot);
+        shader_.set_mat4("uModel", model);
+        shader_.set_float("uAfterburner", strength);
+        shader_.set_float("uGlow", warmth);
+        shader_.set_float("uTime", time_s);
+        draw();
+    }
+
+private:
+    void draw() {
         glEnable(GL_DEPTH_TEST);
         glDepthMask(GL_FALSE);
         glDisable(GL_CULL_FACE);
@@ -72,7 +96,6 @@ public:
         glDepthMask(GL_TRUE);
     }
 
-private:
     GLuint vao_ = 0;
     GLuint vbo_ = 0;
     GLsizei vertex_count_ = 0;
@@ -135,13 +158,20 @@ private:
             layout (location = 1) in float aT;
             uniform mat4 uViewProj;
             uniform mat4 uModel;
+            uniform int uMode;
             out float vT;
             out vec3 vPos;      // eye-relative
             out vec3 vAxisPos;  // nozzle frame
             void main() {
                 vT = aT;
-                vAxisPos = aPos;
-                vec4 p = uModel * vec4(aPos, 1.0);
+                vec3 q = aPos;
+                // A dry jet spreads instead of tapering like a flame.
+                if (uMode == 1) {
+                    float r = length(q.yz);
+                    q.yz = r > 1e-4 && aT >= 0.0 ? q.yz / r * (1.0 + 1.3 * aT) : vec2(0.0);
+                }
+                vAxisPos = q;
+                vec4 p = uModel * vec4(q, 1.0);
                 vPos = p.xyz;
                 gl_Position = uViewProj * p;
             }
@@ -156,8 +186,23 @@ private:
             uniform float uAfterburner;
             uniform float uGlow;
             uniform float uTime;
+            uniform int uMode;
         )") + glsl::COMMON + glsl::OUTPUT + R"(
             void main() {
+                if (uMode == 1) {
+                    // Dry lift jet (uAfterburner: strength, uGlow: warmth).
+                    if (vT < 0.0) discard;
+                    vec3 axis = normalize(mat3(uModel) * vec3(1.0, 0.0, 0.0));
+                    vec3 v = normalize(-vPos);
+                    vec3 radial = normalize(mat3(uModel) * vec3(0.0, vAxisPos.yz));
+                    vec3 side = normalize(radial - axis * dot(radial, axis));
+                    float column = pow(abs(dot(side, normalize(v - axis * dot(v, axis)))), 1.5);
+                    float fade = pow(1.0 - vT, 1.3) * smoothstep(0.0, 0.06, vT);
+                    float turb = 0.55 + 0.45 * vnoise(vec2(vT * 7.0 - uTime * 11.0, vAxisPos.y * 2.5 + uTime * 4.0));
+                    vec3 c = mix(vec3(0.78, 0.82, 0.88), vec3(1.0, 0.82, 0.66), uGlow);
+                    FragColor = scene_output(c * (0.08 + 0.03 * uGlow) * uAfterburner * column * fade * turb, 1.0);
+                    return;
+                }
                 if (vT < 0.0) {
                     // Nozzle interior glow: turbine-face heat, dull red to orange.
                     float r = length(vAxisPos.yz);

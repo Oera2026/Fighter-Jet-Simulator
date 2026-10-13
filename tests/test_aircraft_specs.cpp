@@ -169,6 +169,44 @@ void test_a10_specifications() {
     std::cout << "  -> A-10C specs passed.\n";
 }
 
+void test_f35b_specifications() {
+    std::cout << "[TEST] Validating F-35B Lightning II specifications...\n";
+    const auto cfg = AircraftConfig::get(AircraftType::F35B_LIGHTNING_II);
+
+    // 32,472 lb empty (14,729 kg), 13,100 lb internal fuel (5,942 kg)
+    assert(std::abs(cfg.mass.empty_mass_kg - 14729.0) < 1.0);
+    assert(std::abs(cfg.mass.internal_fuel_capacity_kg - 5942.0) < 1.0);
+
+    // F135-PW-600: 27,000 lbf mil, 41,000 lbf class reheat
+    assert(cfg.propulsion.engine_count == 1);
+    assert(cfg.propulsion.has_afterburner);
+    assert(std::abs(cfg.propulsion.static_dry_thrust_n / 4.44822 - 27000.0) < 100.0);
+    assert(std::abs(cfg.propulsion.static_ab_thrust_n / 4.44822 - 41000.0) < 100.0);
+
+    // 460 sq ft, 35 ft span
+    assert(std::abs(cfg.aero.s_ref - 42.7) < 0.1);
+    assert(std::abs(cfg.aero.b_span - 10.67) < 0.01);
+
+    // 7 G, 50 deg AoA, unified STOVL law
+    assert(cfg.flcs.law_type == FLCSConfig::LawType::UNIFIED_STOVL);
+    assert(cfg.flcs.max_g_positive == 7.0);
+    assert(cfg.flcs.alpha_limit_deg == 50.0);
+
+    // Lift system: 40,650 lbf = 18,680 + 18,680 + 2 x 1,645 (P&W)
+    assert(cfg.stovl.equipped);
+    assert(std::abs(cfg.stovl.lift_fan_thrust_n / 4.44822 - 18680.0) < 10.0);
+    assert(std::abs(cfg.stovl.nozzle_thrust_n / 4.44822 - 18680.0) < 10.0);
+    assert(std::abs(cfg.stovl.roll_post_thrust_n / 4.44822 - 3290.0) < 10.0);
+    assert(cfg.stovl.nozzle_max_deg == 95.0);
+    assert(cfg.stovl.max_conversion_kcas == 250.0);
+    // Fan forward of the CG, 3BSM aft, roll posts out under the wings.
+    assert(cfg.stovl.lift_fan_pos_b.x > 3.0 && cfg.stovl.nozzle_pos_b.x < -3.0);
+    assert(cfg.stovl.roll_post_pos_b.y > 2.0);
+    // Only the F-35B carries one.
+    assert(!AircraftConfig::get(AircraftType::F22_RAPTOR).stovl.equipped);
+    std::cout << "  -> F-35B specs passed.\n";
+}
+
 } // namespace
 
 int main() {
@@ -181,6 +219,7 @@ int main() {
     test_typhoon_specifications();
     test_f22_specifications();
     test_a10_specifications();
+    test_f35b_specifications();
 
     std::cout << "\nAll aircraft specifications successfully verified!\n";
     return 0;

@@ -10,7 +10,8 @@ namespace fastjet::graphics {
 
 enum class CameraMode {
     COCKPIT = 0,
-    CHASE   = 1
+    CHASE   = 1,
+    PADLOCK = 2
 };
 
 /// @brief Camera rig managing the pilot's Design Eye Point (DEP) and G-load spring-damper dynamics
@@ -65,7 +66,50 @@ public:
     void set_mode(CameraMode m) noexcept { mode_ = m; }
     CameraMode mode() const noexcept { return mode_; }
     void toggle_mode() noexcept {
-        mode_ = (mode_ == CameraMode::COCKPIT) ? CameraMode::CHASE : CameraMode::COCKPIT;
+        if (mode_ == CameraMode::COCKPIT) {
+            mode_ = CameraMode::CHASE;
+        } else {
+            mode_ = CameraMode::COCKPIT;
+            reset_head_look();
+        }
+    }
+
+    void toggle_padlock() noexcept {
+        if (mode_ == CameraMode::PADLOCK) {
+            mode_ = CameraMode::COCKPIT;
+            reset_head_look();
+        } else {
+            mode_ = CameraMode::PADLOCK;
+        }
+    }
+
+    /// @brief Track target in body coordinates respecting physiological neck limits
+    /// @param dt Timestep in seconds
+    /// @param target_dir_b Unit line-of-sight vector to target in ownship body frame (+X nose, +Y right, +Z belly)
+    void update_padlock(double dt, const math::Vector3& target_dir_b, bool has_target) noexcept {
+        if (mode_ != CameraMode::PADLOCK) return;
+        if (!has_target) {
+            // Smoothly recenter head if target lost
+            head_yaw_ += (0.0f - head_yaw_) * std::clamp(static_cast<float>(dt * 4.0), 0.0f, 1.0f);
+            head_pitch_ += (0.0f - head_pitch_) * std::clamp(static_cast<float>(dt * 4.0), 0.0f, 1.0f);
+            return;
+        }
+
+        // Body frame: +X forward, +Y right, +Z down
+        // Target yaw: rotation around +Z (right is positive) -> atan2(Y, X)
+        // Target pitch: elevation above horizon (up is positive) -> atan2(-Z, sqrt(X*X + Y*Y))
+        const float target_yaw = static_cast<float>(std::atan2(target_dir_b.y, target_dir_b.x));
+        const double ground_proj = std::sqrt(target_dir_b.x * target_dir_b.x + target_dir_b.y * target_dir_b.y);
+        const float target_pitch = static_cast<float>(std::atan2(-target_dir_b.z, ground_proj));
+
+        // Clamped by human neck mobility inside bubble canopy
+        const float clamped_yaw = std::clamp(target_yaw, -HEAD_YAW_LIMIT, HEAD_YAW_LIMIT);
+        const float clamped_pitch = std::clamp(target_pitch, HEAD_PITCH_MIN, HEAD_PITCH_MAX);
+
+        // Smooth anatomical tracking slew (~8 rad/s head rate)
+        const float slew = std::clamp(static_cast<float>(dt * 8.0), 0.0f, 1.0f);
+        head_yaw_ += (clamped_yaw - head_yaw_) * slew;
+        head_pitch_ += (clamped_pitch - head_pitch_) * slew;
     }
 
     void zoom_chase(float delta) noexcept {
@@ -183,7 +227,7 @@ public:
 
     /// @brief World-space eye position in NED frame [m]
     math::Vector3 eye_pos_ned(const fdm::FlightState& state) const noexcept {
-        if (mode_ == CameraMode::COCKPIT) {
+        if (mode_ != CameraMode::CHASE) {
             const math::Vector3 eye_b = eye_pos_body();
             return state.pos_ned + state.q_att.rotate_body_to_ned(eye_b);
         } else {

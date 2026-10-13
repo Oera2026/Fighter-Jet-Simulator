@@ -12,9 +12,12 @@
 #include "fastjet/flcs/imu_sensor.hpp"
 #include "fastjet/flcs/onboard_flight_computer.hpp"
 #include "fastjet/flcs/pilot_commands.hpp"
+#include "fastjet/flcs/stovl_control_law.hpp"
 #include "fastjet/gear/landing_gear.hpp"
 #include "fastjet/input/avionics_controls.hpp"
 #include "fastjet/propulsion/multi_engine.hpp"
+#include "fastjet/propulsion/stovl_lift_system.hpp"
+#include "fastjet/propulsion/stovl_status.hpp"
 #include "fastjet/sim/damage_model.hpp"
 #include "fastjet/sim/gun.hpp"
 #include <algorithm>
@@ -34,7 +37,11 @@ struct AircraftControls {
     double brake_left{0.0};        ///< Toe brakes [0, 1]
     double brake_right{0.0};
     bool trigger{false};           ///< Gun trigger held
-    bool dispense{false};          ///< Countermeasure dispense switch (one program per press)
+    bool pickle{false};            ///< Missile release / pickle button pressed
+    bool dispense{false};          ///< Countermeasure dispense switch (chaff: one program per press)
+    bool dispense_flare{false};    ///< Countermeasure dispense switch (flares: one program per press)
+    bool eject{false};             ///< Ejection handle pulled
+    bool stovl_mode{false};        ///< STOVL/CTOL button state: true requests STOVL (F-35B only)
 };
 
 /**
@@ -48,6 +55,11 @@ struct AircraftControls {
  *
  * Every jet carries its own turbulence state: gusts are felt where the
  * aircraft is, not shared across the sky.
+ *
+ * The F-35B adds its lift system: while it is engaged (converting or in
+ * STOVL) the unified STOVL control law flies the jet in place of the FLCS's
+ * up-and-away law, and the lift system's forces and moments replace the plain
+ * thrust along body X.
  *
  * Zero heap allocation; safe in the 200 Hz loop.
  */
@@ -72,6 +84,9 @@ public:
     environment::WindTurbulenceModel wind{};
     GunSystem gun{};
     DamageState damage{};
+    propulsion::StovlStatus stovl{};      ///< Lift-system snapshot after the latest step (read-only for consumers)
+    propulsion::StovlLiftSystem lift;     ///< F-35B LiftFan, 3BSM and roll posts (unequipped on other jets)
+    flcs::StovlControlLaw stovl_law;      ///< F-35B unified STOVL law
 
     bool crashed{false};
     double time{0.0};
@@ -79,8 +94,8 @@ public:
     Aircraft() noexcept : Aircraft(aircraft::AircraftType::F16_FIGHTING_FALCON) {}
 
     explicit Aircraft(aircraft::AircraftType t) noexcept
-        : type(t), engine(t), landing_gear(t), aero_model(t), flcs(t), ofc(t) {
-        mass = fdm::FuelSystem::compute(engine.fuel_kg, t);
+        : type(t), engine(t), landing_gear(t), aero_model(t), flcs(t), ofc(t), lift(t), stovl_law(t) {
+        refresh_mass();
         wind.base_wind_speed_mps = 5.0;
         gun.configure(t);
         damage = DamageState{t};
@@ -96,7 +111,10 @@ public:
         flcs.configure(t);
         ofc.configure(t);
         landing_gear.configure(t);
-        mass = fdm::FuelSystem::compute(engine.fuel_kg, t);
+        lift.configure(t);
+        stovl_law.configure(t);
+        stovl = propulsion::StovlStatus{};
+        refresh_mass();
         gun.configure(t);
         damage = DamageState{t};
     }
@@ -111,12 +129,52 @@ public:
         ofc.reset();
         flcs.reset();
         speedbrake.position = 0.0;
-        mass = fdm::FuelSystem::compute(engine.fuel_kg, type);
+        refresh_mass();
         forces = fdm::AircraftForces{};
         imu = flcs::IMUData{};
         imu.Nz = 1.0;
         gun.configure(type);
         damage = DamageState{type};
+        lift.reset();
+        stovl_law.reset();
+        stovl = propulsion::StovlStatus{};
+        aero_force_b_ = math::Vector3::zero();
+    }
+
+    /// @brief Put an F-35B straight into the converted STOVL configuration
+    /// (doors open, LiftFan clutched, nozzle down) for hover and approach starts.
+    /// No effect on jets without a lift system. Call after reset().
+    ///
+    /// @param fuel_kg Fuel to start with, or negative to keep what is on board.
+    ///        A jet-borne start needs a light jet: with the combat payload the
+    ///        F-35B hovers out of ground effect up to ~2,300 kg of fuel and has
+    ///        a useful control margin below ~1,600 kg.
+    ///
+    /// The engine starts at hover thrust for the jet's weight, so a hover start
+    /// (zero velocity, ~3 deg nose up) holds where it is placed; the throttle
+    /// lever should sit at kStovlThrottleDetent.
+    void start_converted_stovl(double fuel_kg = -1.0) noexcept {
+        if (!lift.config.equipped) return;
+        if (fuel_kg >= 0.0) {
+            engine.fuel_kg = std::min(fuel_kg, aircraft::AircraftConfig::get(type).mass.internal_fuel_capacity_kg);
+            refresh_mass();
+        }
+        lift.start_converted();
+        stovl_law.reset();
+        engine.lift_fan_clutch = 1.0;
+        engine.stovl_mode = true;
+        engine.ab_thrust_n = 0.0;
+        engine.core_thrust_n = std::min(mass.mass_kg * fdm::SixDoFFDM::GRAVITY_ACCEL, engine.max_dry_rating_n());
+        engine.net_thrust_n = engine.core_thrust_n;
+        refresh_stovl_status(engine.net_thrust_n, true,
+                             environment::GroundCollision::get_agl(state) - lift.config.nozzle_pos_b.z,
+                             environment::Atmosphere1976::compute(state.altitude(), state.airspeed()));
+    }
+
+    /// @brief Rebuild mass and inertia from the fuel on board and the combat payload.
+    void refresh_mass() noexcept {
+        mass = fdm::FuelSystem::compute(engine.fuel_kg, type,
+                                        aircraft::AircraftConfig::get(type).mass.combat_payload_kg);
     }
 
     /// @brief Re-seed this jet's turbulence so jets in one sky do not share gusts.
@@ -124,7 +182,7 @@ public:
 
     /// @brief Still in the fight: flying, intact and with a conscious pilot at the controls.
     [[nodiscard]] bool alive() const noexcept {
-        return !crashed && !damage.destroyed && !damage.pilot_incapacitated;
+        return !crashed && !damage.destroyed && !damage.pilot_incapacitated && !damage.pilot_ejected;
     }
 
     /// @brief One fixed 200 Hz physics step.
@@ -136,7 +194,7 @@ public:
         // it falls out of the sky on its own aerodynamics.
         damage.update(dt);
         AircraftControls cmd = in;
-        if (damage.destroyed || damage.pilot_incapacitated) {
+        if (damage.destroyed || damage.pilot_incapacitated || damage.pilot_ejected) {
             cmd.stick = {};
             cmd.trigger = false;
         }
@@ -145,9 +203,28 @@ public:
         imu = flcs::IMUData::read(state, forces, mass, air.dynamic_pressure);
 
         // OFC intercept: overrides the pilot while GLOC or Auto-GCAS is active.
-        const flcs::PilotCommands effective = ofc.update(dt, state, imu, cmd.stick, landing_gear.deployed);
+        const bool lift_on = lift.engaged();
+        const flcs::PilotCommands effective =
+            ofc.update(dt, state, imu, cmd.stick, landing_gear.deployed, lift_on);
 
-        auto surfaces = flcs.update(dt, state, effective, air.dynamic_pressure, forces, mass);
+        aero::ControlSurfaces surfaces{};
+        double lever = cmd.throttle;
+        propulsion::StovlEffectorCommands lift_cmd{};
+        bool ctol_ok = true;
+        if (lift_on) {
+            const double agl_now = environment::GroundCollision::get_agl(state);
+            const double wheel_depth = landing_gear.struts[1].pos_b.z + landing_gear.struts[1].rest_length;
+            const auto law = stovl_law.update(
+                dt, state, imu, effective, cmd.throttle, mass, aero_force_b_,
+                wind.compute_relative_velocity(state.vel_b, agl_now, state.q_att), air,
+                agl_now - wheel_depth, landing_gear.mains_on_ground(), lift, engine);
+            surfaces = flcs.drive_surfaces(dt, law.de_deg, law.da_deg, law.dr_deg, imu.Nz);
+            lever = law.lever;
+            lift_cmd = law.lift;
+            ctol_ok = law.ctol_ok;
+        } else {
+            surfaces = flcs.update(dt, state, effective, air.dynamic_pressure, forces, mass);
+        }
         damage.apply_to_surfaces(surfaces);
 
         speedbrake.update(cmd.speedbrake_out ? input::SpeedbrakeController::SwitchPosition::EXTEND
@@ -156,14 +233,21 @@ public:
         surfaces.speedbrake = speedbrake.position;
 
         // Auto-GCAS throttle authority overrides the lever.
-        double lever = cmd.throttle;
         if (ofc.has_throttle_override()) lever = ofc.throttle_override_value();
         engine.tvc_pitch_cmd = flcs.tvc_pitch_cmd;
+
+        // Conversion sequencer and lift effectors; the engine follows the clutch.
+        if (lift.config.equipped) {
+            const double kcas = std::sqrt(2.0 * air.dynamic_pressure / environment::Atmosphere1976::RHO0) * 1.94384;
+            lift.update(dt, cmd.stovl_mode, kcas, ctol_ok, lift_cmd);
+            engine.lift_fan_clutch = lift.clutch;
+            engine.stovl_mode = lift.engaged();
+        }
         const double thrust_n = engine.update(lever, air, dt) * damage.thrust_factor();
         if (damage.fuel_leak_kgs > 0.0) {
             engine.fuel_kg = std::max(0.0, engine.fuel_kg - damage.fuel_leak_kgs * dt);
         }
-        mass = fdm::FuelSystem::compute(engine.fuel_kg, type);
+        refresh_mass();
 
         landing_gear.steer_cmd = cmd.stick.rudder_pedal;
         landing_gear.brake_left = cmd.brake_left;
@@ -174,6 +258,9 @@ public:
 
         // RK4 step with forces re-evaluated at each stage, in the air-relative frame.
         const double pitch_moment = engine.pitch_moment();
+        const bool jets_on_lift = lift.engaged();
+        const double dry_rating = engine.max_dry_rating_n();
+        const double exit_depth = lift.config.nozzle_pos_b.z;
         integrator_.step(state, time, mass,
             [&](double, const fdm::FlightState& s) noexcept -> fdm::AircraftForces {
                 const double s_agl = environment::GroundCollision::get_agl(s);
@@ -185,8 +272,16 @@ public:
                 s_aero.vel_b = v_rel;
                 fdm::AircraftForces f = aero_model.compute_forces_and_moments(
                     s_aero, surfaces, stage_air.dynamic_pressure, stage_air.mach_number);
-                f.force_b.x += thrust_n;
-                f.moment_b.y += pitch_moment;
+                if (jets_on_lift) {
+                    const math::Vector3 v_ned = s.velocity_ned();
+                    const auto jet = lift.compute(thrust_n, dry_rating, v_rel, s.q_att, s_agl - exit_depth,
+                                                  std::hypot(v_ned.x, v_ned.y));
+                    f.force_b = f.force_b + jet.force_b;
+                    f.moment_b = f.moment_b + jet.moment_b;
+                } else {
+                    f.force_b.x += thrust_n;
+                    f.moment_b.y += pitch_moment;
+                }
 
                 const auto gear_f = landing_gear.compute(s, mass);
                 f.force_b = f.force_b + gear_f.force_b;
@@ -199,8 +294,22 @@ public:
         fdm::FlightState state_aero = state;
         state_aero.vel_b = wind.compute_relative_velocity(state.vel_b, state_agl, state.q_att);
         forces = aero_model.compute_forces_and_moments(state_aero, surfaces, air.dynamic_pressure, air.mach_number);
-        forces.force_b.x += thrust_n;
-        forces.moment_b.y += engine.pitch_moment();
+        aero_force_b_ = forces.force_b;
+        if (jets_on_lift) {
+            const math::Vector3 v_ned = state.velocity_ned();
+            const double gs = std::hypot(v_ned.x, v_ned.y);
+            const auto jet = lift.compute(thrust_n, dry_rating, state_aero.vel_b, state.q_att,
+                                          state_agl - exit_depth, gs, &stovl);
+            forces.force_b = forces.force_b + jet.force_b;
+            forces.moment_b = forces.moment_b + jet.moment_b;
+        } else {
+            forces.force_b.x += thrust_n;
+            forces.moment_b.y += engine.pitch_moment();
+        }
+        if (lift.config.equipped) refresh_stovl_status(thrust_n, jets_on_lift, state_agl - exit_depth, air);
+
+        // Structural load from the air loads (the landing gear has its own limits).
+        damage.apply_load(-forces.force_b.z / (mass.mass_kg * fdm::SixDoFFDM::GRAVITY_ACCEL), dt);
 
         const auto col = environment::GroundCollision::check_collision(
             state, type, landing_gear.deployed, landing_gear.collapsed);
@@ -226,6 +335,23 @@ public:
 
 private:
     fdm::RK4Integrator integrator_{DT};
+    math::Vector3 aero_force_b_{};   ///< Aerodynamic force at the latest step (the STOVL law's estimate)
+
+    void refresh_stovl_status(double thrust_n, bool jets_on_lift, double exit_height_m,
+                              const environment::AirData& air) noexcept {
+        lift.fill_status(stovl);
+        if (!jets_on_lift) {
+            stovl.lift_fan_thrust_n = stovl.roll_post_left_n = stovl.roll_post_right_n = stovl.jet_lift_n = 0.0;
+            stovl.nozzle_thrust_n = thrust_n;
+        }
+        const math::Vector3 v_ned = state.velocity_ned();
+        stovl.hover_thrust_margin = lift.max_jet_lift_n(engine.lapse_factor(air, false), exit_height_m,
+                                                        std::hypot(v_ned.x, v_ned.y))
+                                  / (mass.mass_kg * fdm::SixDoFFDM::GRAVITY_ACCEL);
+        stovl.control_phase = jets_on_lift ? stovl_law.control_phase : 0;
+        stovl.commanded_vs_mps = jets_on_lift ? stovl_law.commanded_vs_mps : 0.0;
+        stovl.commanded_gs_mps = jets_on_lift ? stovl_law.commanded_gs_mps : 0.0;
+    }
 };
 
 } // namespace fastjet::sim

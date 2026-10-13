@@ -4,6 +4,7 @@
 #include "fastjet/graphics/shader.hpp"
 #include "fastjet/graphics/cockpit_telemetry.hpp"
 #include "fastjet/aircraft/aircraft_type.hpp"
+#include "fastjet/aircraft/aircraft_config.hpp"
 #include "fastjet/fdm/flight_state.hpp"
 #include "fastjet/flcs/imu_sensor.hpp"
 #include "fastjet/environment/atmosphere1976.hpp"
@@ -36,6 +37,10 @@ private:
     // Temporary line vertex buffer
     std::vector<HUDVertex> lines_;
     size_t masked_vertex_count_ = 0;
+    /// Helmet-mounted display (F-35): no combiner. The aircraft-referenced
+    /// "virtual HUD" is lines_[0, masked_vertex_count_); after it come the
+    /// helmet-fixed symbols, drawn wherever the pilot looks.
+    bool hmd_ = false;
 
     void add_line(float x0, float y0, float z0, float x1, float y1, float z1, const Color4& col) {
         HUDVertex v0{{x0, y0, z0}, {col.r, col.g, col.b, col.a}};
@@ -251,6 +256,11 @@ private:
     }
 
 public:
+    /// @brief Heading tape elevation above the boresight [rad] for an airframe.
+    [[nodiscard]] static constexpr float tape_elevation(aircraft::AircraftType type) noexcept {
+        return type == aircraft::AircraftType::EUROFIGHTER_TYPHOON ? 0.185f : 0.150f;
+    }
+
     HUDCollimator() = default;
 
     ~HUDCollimator() {
@@ -314,10 +324,23 @@ public:
         initialized_ = false;
     }
 
+    /// @brief Off-boresight angle beyond which the helmet repeats the
+    /// primary flight data in its own frame [rad]: by then the virtual HUD
+    /// is leaving the 40 x 30 degree display.
+    static constexpr float kHelmetDataAngle = 0.26f;
+    /// Line-of-sight elevation below which the pilot is reading the panel [rad].
+    static constexpr float kCockpitDeclutterEl = 0.21f;
+
+    /// @brief True if the jet flies with a helmet display instead of a HUD.
+    [[nodiscard]] static constexpr bool helmet_display(aircraft::AircraftType type) noexcept {
+        return type == aircraft::AircraftType::F35B_LIGHTNING_II;
+    }
+
     /// @brief Build all collimated HUD symbology
     /// Symbology points are generated as 3D direction rays projected onto a virtual sphere at optical infinity (D = 100.0m)
     void build_symbology(const fdm::FlightState& state, const flcs::IMUData& imu, bool is_crashed = false, const AvionicsTelemetry& tel = AvionicsTelemetry{}) {
         lines_.clear();
+        hmd_ = helmet_display(tel.aircraft_type);
 
         const Color4 hud_col = is_crashed ? Color4::red() : Color4::hud_green();
         const float D = 100.0f; // Virtual infinity distance [m]
@@ -326,19 +349,25 @@ public:
             peak_g_ = std::abs(static_cast<float>(imu.Nz));
         }
 
+        // Elevation of the heading tape [rad]. The Typhoon's wide-angle
+        // combiner is taller than the others, so its tape sits higher and
+        // the pitch ladder gets the room under it.
+        const float tape_el = tape_elevation(tel.aircraft_type);
+
         // =========================================================================
         // 0a. Airframe Type Legend
         // Always present, so the active aircraft is answerable at a glance
-        // rather than only at the moment it is switched.
+        // rather than only at the moment it is switched. Just under the
+        // heading tape's left end, clear of the fight status line below.
         // =========================================================================
         {
             const float type_x = -D * std::tan(0.125f);
-            const float type_y =  D * std::tan(0.120f);
+            const float type_y =  D * std::tan(tape_el) - D * 0.012f;
             const auto short_name = aircraft::to_short_string(tel.aircraft_type);
             char type_buf[16];
             std::snprintf(type_buf, sizeof(type_buf), "%.*s",
                           static_cast<int>(short_name.size()), short_name.data());
-            draw_string(type_buf, type_x, type_y, D * 0.011f, -D, hud_col);
+            draw_string(type_buf, type_x, type_y, D * 0.008f, -D, hud_col);
         }
 
         // =========================================================================
@@ -416,10 +445,11 @@ public:
                 fpm_x = static_cast<float>(D * std::tan(beta));
                 fpm_y = static_cast<float>(D * std::tan(-alpha));
 
-                // Display boundary limits (Instantaneous FOV of combiner glass)
-                const float max_fpm_x = D * std::tan(0.11f); // ~6.3 deg half-width
-                const float max_fpm_y = D * std::tan(0.11f); // ~6.3 deg up
-                const float min_fpm_y = -D * std::tan(0.08f); // ~4.6 deg down
+                // Display boundary limits (Instantaneous FOV of combiner
+                // glass; the helmet's 40 x 30 degree field is far larger)
+                const float max_fpm_x = D * std::tan(hmd_ ? 0.30f : 0.11f); // ~6.3 deg half-width
+                const float max_fpm_y = D * std::tan(hmd_ ? 0.20f : 0.11f); // ~6.3 deg up
+                const float min_fpm_y = -D * std::tan(hmd_ ? 0.22f : 0.08f); // ~4.6 deg down
 
                 if (std::abs(fpm_x) > max_fpm_x) {
                     fpm_x = std::clamp(fpm_x, -max_fpm_x, max_fpm_x);
@@ -480,8 +510,9 @@ public:
                 // Relative pitch angle in view space
                 const float d_theta = rung_theta - static_cast<float>(theta);
 
-                // Only render rungs within combiner glass vertical FOV
-                if (d_theta < -0.04f || d_theta > 0.22f) continue;
+                // Only render rungs within combiner glass vertical FOV,
+                // and below the heading tape so the two never cross.
+                if (d_theta < (hmd_ ? -0.20f : -0.04f) || d_theta > tape_el - 0.014f) continue;
 
                 const float ly = D * std::tan(d_theta);
 
@@ -526,8 +557,10 @@ public:
                     auto [x3, y3] = rotate_point(w_half, ly);
                     add_line(x2, y2, -D, x3, y3, -D, hud_col);
                 } else {
-                    // Pitch rung: left and right bars with downward pointing tails towards horizon
-                    const float w_half = D * std::tan(0.045f);
+                    // Pitch rung: left and right bars with downward pointing tails towards horizon.
+                    // Narrow enough that the rung and its tag stay inside the
+                    // airspeed / altitude boxes and the stacks beneath them.
+                    const float w_half = D * std::tan(0.038f);
                     const float gap    = D * std::tan(0.020f);
                     const float tail   = (deg > 0 ? -1.0f : 1.0f) * D * std::tan(0.008f);
 
@@ -574,7 +607,7 @@ public:
                     // Numeric tag (e.g. "10", "20")
                     char tag[8];
                     std::snprintf(tag, sizeof(tag), "%02d", std::abs(deg));
-                    auto [tx, ty] = rotate_point(-w_half - D * 0.020f, ly - D * 0.005f);
+                    auto [tx, ty] = rotate_point(-w_half - D * 0.015f, ly - D * 0.005f);
                     draw_string(tag, tx, ty, D * 0.010f, -D, hud_col);
                 }
             }
@@ -585,7 +618,7 @@ public:
         // Positioned safely within combiner glass top aperture
         // =========================================================================
         {
-            const float top_y = D * std::tan(0.150f); // ~8.6 degrees above boresight
+            const float top_y = D * std::tan(tape_el); // ~8.6 degrees above boresight (Typhoon ~10.6)
             const float tape_w = D * std::tan(0.082f); // ~4.7 degrees half-width
 
             // Baseline
@@ -675,12 +708,12 @@ public:
 
             char g_str[12];
             std::snprintf(g_str, sizeof(g_str), "%2.1fG", std::abs(static_cast<float>(imu.Nz)));
-            draw_string(g_str, g_x - D * 0.015f, g_y, D * 0.009f, -D, hud_col);
+            draw_string(g_str, g_x - D * 0.019f, g_y, D * 0.009f, -D, hud_col);
 
             // Peak G display beneath
             char max_g_str[12];
             std::snprintf(max_g_str, sizeof(max_g_str), "%2.1f", peak_g_);
-            draw_string(max_g_str, g_x - D * 0.015f, g_y - D * 0.011f, D * 0.008f, -D, Color4::amber());
+            draw_string(max_g_str, g_x - D * 0.019f, g_y - D * 0.0125f, D * 0.008f, -D, Color4::amber());
         }
 
         // =========================================================================
@@ -689,7 +722,7 @@ public:
         {
             // Speedbrake deployed annunciator
             if (tel.speedbrake_pos > 0.05) {
-                const float sb_x = -D * std::tan(0.082f) - D * 0.015f;
+                const float sb_x = -D * std::tan(0.082f) - D * 0.019f;
                 const float sb_y =  D * std::tan(0.012f);
                 draw_string("SPDBRK", sb_x, sb_y, D * 0.0085f, -D, Color4::amber());
             }
@@ -701,18 +734,36 @@ public:
                 draw_string_centered("CHECK GEAR", gear_x, gear_y, D * 0.011f, -D, Color4::amber());
             }
 
-            // Afterburner engaged flag
-            if (std::string(tel.detent_str) == "AFTERBURNER") {
-                const float ab_x = D * std::tan(0.082f);
-                const float ab_y = D * std::tan(0.082f) - (D * 0.022f * 0.5f) - D * 0.014f;
-                draw_string_centered("AB", ab_x, ab_y, D * 0.010f, -D, Color4::amber());
-            }
+        }
+
+        // =========================================================================
+        // 9. Throttle and Fuel (right side, under the altitude box)
+        // Mirrors the Mach / G stack on the left. The throttle reads the lever
+        // in percent (amber, with AB, in reheat); fuel is total internal in kg,
+        // amber at bingo. Kept here so they stay in view whatever the MFDs show.
+        // =========================================================================
+        {
+            const float x0 = D * std::tan(0.082f); // Centred under the altitude box
+            const float y0 = D * std::tan(0.082f) - (D * 0.022f * 0.5f) - D * 0.013f;
+            const float line = D * 0.011f;
+            char buf[16];
+
+            const bool reheat = std::string(tel.detent_str) == "AFTERBURNER";
+            const int thr_pct = static_cast<int>(std::lround(std::clamp(tel.throttle_input, 0.0, 1.0) * 100.0));
+            std::snprintf(buf, sizeof(buf), reheat ? "AB  %3d" : "THR %3d", thr_pct);
+            draw_string_centered(buf, x0, y0, D * 0.009f, -D, reheat ? Color4::amber() : hud_col);
+
+            const int fuel_kg = static_cast<int>(std::lround(std::clamp(tel.fuel_remaining_kg, 0.0, 99999.0)));
+            std::snprintf(buf, sizeof(buf), "FUEL %d", fuel_kg);
+            draw_string_centered(buf, x0, y0 - line, D * 0.008f, -D, tel.bingo_fuel_alert ? Color4::amber() : hud_col);
         }
 
         if (tel.combat.active) build_combat_symbology(tel.combat, hud_col, D);
+        if (hmd_ && tel.stovl.equipped) build_stovl_symbology(state, tel, hud_col, D);
 
         // All symbology is masked cleanly within the combiner glass aperture
         masked_vertex_count_ = lines_.size();
+        if (hmd_ && !is_crashed) build_helmet_fixed(state, imu, tel, hud_col, D);
 
         // Upload buffer to GPU
         glBindBuffer(GL_ARRAY_BUFFER, vbo_);
@@ -781,9 +832,11 @@ public:
             }
         }
 
-        // Target readouts, lower right: range (nm), closure (kt), aspect, angle off.
+        // Target readouts, right, under the fuel line: range (nm), closure
+        // (kt), aspect, weapon status, chaff, and flares. High enough that the whole stack stays
+        // on the glass above the combiner's foot.
         const float rx = D * std::tan(0.070f);
-        float ry = -D * std::tan(0.010f);
+        float ry = D * std::tan(0.031f);
         const float line = D * 0.011f;
         char buf[32];
         if (c.target_valid) {
@@ -797,18 +850,90 @@ public:
             draw_string(buf, rx, ry, D * 0.008f, -D, hud_col);
             ry -= line;
         }
-        std::snprintf(buf, sizeof(buf), "%s %d", c.gun_name, c.ammo);
-        draw_string(buf, rx, ry, D * 0.008f, -D, c.ammo > 0 ? hud_col : amber);
-        if (c.gun_firing) draw_string("FIRE", rx + D * 0.045f, ry, D * 0.008f, -D, hud_col);
+
+        // Armament selection: Gun vs Missile (AIM-9X / AIM-120C)
+        if (c.selected_weapon == 0) {
+            std::snprintf(buf, sizeof(buf), "%s %d", c.gun_name, c.ammo);
+            draw_string(buf, rx, ry, D * 0.008f, -D, c.ammo > 0 ? hud_col : amber);
+            if (c.gun_firing) draw_string("FIRE", rx + D * 0.045f, ry, D * 0.008f, -D, hud_col);
+        } else {
+            std::snprintf(buf, sizeof(buf), "%s %d", c.weapon_name, c.missiles_remaining);
+            draw_string(buf, rx, ry, D * 0.008f, -D, c.missiles_remaining > 0 ? hud_col : amber);
+            if (c.missile_locked) draw_string("LOCK", rx + D * 0.052f, ry, D * 0.008f, -D, hud_col);
+        }
+
         if (c.chaff >= 0) {
             ry -= line;
             std::snprintf(buf, sizeof(buf), "CHF %d", c.chaff);
             draw_string(buf, rx, ry, D * 0.008f, -D, c.chaff > 0 ? hud_col : amber);
         }
+        if (c.flares >= 0) {
+            ry -= line;
+            std::snprintf(buf, sizeof(buf), "FLR %d", c.flares);
+            draw_string(buf, rx, ry, D * 0.008f, -D, c.flares > 0 ? hud_col : amber);
+        }
+
+        // Dynamic Launch Zone (DLZ) range bracket for missile employment
+        if (c.selected_weapon > 0 && c.target_valid && c.dlz_rmax_m > 500.0) {
+            const float dlz_x = rx + D * 0.048f;
+            const float dlz_top_y = D * std::tan(0.025f);
+            const float dlz_h = D * 0.055f;
+            const float dlz_bot_y = dlz_top_y - dlz_h;
+            const float scale = dlz_h / static_cast<float>(c.dlz_rmax_m * 1.15);
+
+            // Vertical range scale line
+            add_line(dlz_x, dlz_bot_y, -D, dlz_x, dlz_top_y, -D, hud_col);
+
+            // Rmax tick (top)
+            const float rmax_y = dlz_bot_y + static_cast<float>(c.dlz_rmax_m) * scale;
+            add_line(dlz_x, rmax_y, -D, dlz_x + D * 0.006f, rmax_y, -D, hud_col);
+
+            // Rne bracket (no-escape range)
+            const float rne_y = dlz_bot_y + static_cast<float>(c.dlz_rne_m) * scale;
+            add_line(dlz_x, rne_y, -D, dlz_x + D * 0.005f, rne_y, -D, hud_col);
+            add_line(dlz_x + D * 0.005f, rne_y, -D, dlz_x + D * 0.005f, rmax_y, -D, hud_col);
+
+            // Rmin tick (bottom)
+            const float rmin_y = dlz_bot_y + static_cast<float>(c.dlz_rmin_m) * scale;
+            add_line(dlz_x, rmin_y, -D, dlz_x + D * 0.006f, rmin_y, -D, hud_col);
+
+            // Target range carrot (triangle pointing at current range)
+            const float tgt_y = std::clamp(dlz_bot_y + static_cast<float>(c.target_range_m) * scale, dlz_bot_y, dlz_top_y);
+            add_line(dlz_x - D * 0.004f, tgt_y + D * 0.002f, -D, dlz_x, tgt_y, -D, hud_col);
+            add_line(dlz_x - D * 0.004f, tgt_y - D * 0.002f, -D, dlz_x, tgt_y, -D, hud_col);
+            add_line(dlz_x - D * 0.004f, tgt_y - D * 0.002f, -D, dlz_x - D * 0.004f, tgt_y + D * 0.002f, -D, hud_col);
+        }
+
+        // Flashing SHOOT cue when target is within parameters
+        if (c.shoot_cue && c.blink) {
+            draw_string_centered("SHOOT", 0.0f, -D * std::tan(0.015f), D * 0.012f, -D, hud_col);
+        }
+
+        // Heat seeker reticle (AIM-9X / ASRAAM / AIM-9M)
+        if (c.ir_seeker_active) {
+            float sx = 0.0f, sy = 0.0f;
+            if (to_hud(c.ir_seeker_dir_b, sx, sy) && std::hypot(sx, sy) < hud_r * 1.4f) {
+                const float sr = D * 0.012f;
+                if (c.ir_seeker_locked) {
+                    // Solid locked diamond
+                    add_line(sx, sy + sr, -D, sx + sr, sy, -D, hud_col);
+                    add_line(sx + sr, sy, -D, sx, sy - sr, -D, hud_col);
+                    add_line(sx, sy - sr, -D, sx - sr, sy, -D, hud_col);
+                    add_line(sx - sr, sy, -D, sx, sy + sr, -D, hud_col);
+                } else {
+                    // Uncaged heat-seeker circle with 4 crosshair ticks
+                    circle(sx, sy, sr, 1.0f, hud_col);
+                    add_line(sx, sy + sr, -D, sx, sy + sr + D * 0.004f, -D, hud_col);
+                    add_line(sx, sy - sr, -D, sx, sy - sr - D * 0.004f, -D, hud_col);
+                    add_line(sx + sr, sy, -D, sx + sr + D * 0.004f, sy, -D, hud_col);
+                    add_line(sx - sr, sy, -D, sx - sr - D * 0.004f, sy, -D, hud_col);
+                }
+            }
+        }
         if (c.rwr_active) build_rwr(c, hud_col, D);
 
         // Energy readouts under the G-meter: turn rate [deg/s] and Ps [ft/s].
-        const float lx = -D * std::tan(0.082f) - D * 0.015f;
+        const float lx = -D * std::tan(0.082f) - D * 0.019f;
         float ly = -D * std::tan(0.004f);
         std::snprintf(buf, sizeof(buf), "TR %.1f", c.turn_rate_dps);
         draw_string(buf, lx, ly, D * 0.008f, -D, hud_col);
@@ -854,6 +979,215 @@ public:
         draw_string_centered(buf, 0.0f, D * 0.084f, D * 0.009f, -D, launch ? Color4::red() : Color4::amber());
     }
 
+    /// @brief Height of the F-35B's wheels below its CG [m]: the radar
+    /// altimeter reads zero on the ground.
+    static double wheel_height_m() noexcept {
+        static const double h = [] {
+            const auto g = aircraft::AircraftConfig::get(aircraft::AircraftType::F35B_LIGHTNING_II).gear;
+            return g.main_l_pos_b.z + g.rest_length;
+        }();
+        return h;
+    }
+
+    /// @brief Calibrated airspeed [kt], taken as equivalent airspeed.
+    static double kcas(const fdm::FlightState& state) noexcept {
+        const auto air = environment::Atmosphere1976::compute(std::max(state.altitude(), 0.0), state.airspeed());
+        return state.airspeed() * std::sqrt(air.density / 1.225) * 1.94384;
+    }
+
+    /// @brief Radar altitude [ft], or a negative value above its 5,000 ft range.
+    static int radar_altitude_ft(const fdm::FlightState& state) noexcept {
+        const double ft = std::max(0.0, environment::GroundCollision::get_agl(state) - wheel_height_m()) * 3.28084;
+        if (ft > 5000.0) return -1;
+        // Nearest 5 ft below 500 ft (the hover and landing), 10 ft above.
+        const double step = ft < 500.0 ? 5.0 : 10.0;
+        return static_cast<int>(std::lround(ft / step) * step);
+    }
+
+    /// @brief F-35B STOVL symbology on the virtual HUD, from the start of a
+    /// conversion until the jet is back in CTOL: the lift system's mode and
+    /// control-law phase, nozzle angle and hover thrust margin (left); the
+    /// vertical speed scale with the law's commanded rate (right); the
+    /// hover pad with the ground-speed and drift vector and the commanded
+    /// ground speed (low centre, semi- and fully jet-borne); radar altitude
+    /// over the altitude box; and the conversion-speed caution.
+    void build_stovl_symbology(const fdm::FlightState& state, const AvionicsTelemetry& tel, const Color4& col, float D) {
+        using propulsion::StovlMode;
+        const propulsion::StovlStatus& st = tel.stovl;
+        if (st.mode == StovlMode::CTOL && st.conversion < 0.01) return;
+        const Color4 amber = Color4::amber();
+        const Color4 red = Color4::red();
+        auto T = [D](float a) { return D * std::tan(a); };
+        const float line = D * 0.011f;
+        char buf[32];
+
+        // Mode block, outboard of the speed column.
+        {
+            const float x = -T(0.175f);
+            float y = T(0.055f);
+            if (st.mode == StovlMode::STOVL) {
+                draw_string("STOVL", x, y, D * 0.009f, -D, col);
+            } else {
+                std::snprintf(buf, sizeof(buf), "CONV %d", static_cast<int>(std::lround(std::clamp(st.conversion, 0.0, 1.0) * 100.0)));
+                draw_string(buf, x, y, D * 0.009f, -D, amber);
+            }
+            y -= line;
+            static constexpr const char* kPhase[3] = {"WB", "SJB", "JB"}; // wing-, semi-jet-, jet-borne
+            draw_string(kPhase[std::min<int>(st.control_phase, 2)], x, y, D * 0.008f, -D, col);
+            y -= line;
+            std::snprintf(buf, sizeof(buf), "NOZ %d", static_cast<int>(std::lround(st.nozzle_pitch_deg)));
+            draw_string(buf, x, y, D * 0.008f, -D, col);
+            y -= line;
+            // Hover margin: maximum jet lift over weight, as a percentage
+            // above (+) or below (-) what holds the jet up.
+            const double margin = (st.hover_thrust_margin - 1.0) * 100.0;
+            std::snprintf(buf, sizeof(buf), "HM %+d", static_cast<int>(std::lround(std::clamp(margin, -99.0, 99.0))));
+            draw_string(buf, x, y, D * 0.008f, -D, margin < 0.0 ? red : margin < 2.0 ? amber : col);
+        }
+
+        // Vertical speed scale, +-1000 fpm, outboard right of the ladder:
+        // the filled caret is the climb rate, the open one the commanded.
+        {
+            constexpr double kFullFpm = 1000.0;
+            const float x = T(0.150f), yc = -T(0.010f), H = T(0.050f);
+            add_line(x, yc - H, -D, x, yc + H, -D, col);
+            for (int k = -2; k <= 2; ++k) {
+                const float y = yc + H * 0.5f * static_cast<float>(k);
+                const float len = k == 0 ? D * 0.008f : D * 0.004f;
+                add_line(x, y, -D, x + len, y, -D, col);
+            }
+            const double vs_fpm = -state.velocity_ned().z * 196.8504;
+            const float yv = yc + H * static_cast<float>(std::clamp(vs_fpm / kFullFpm, -1.0, 1.0));
+            const float c = D * 0.004f;
+            add_line(x - 0.4f * c, yv, -D, x - 2.4f * c, yv + c, -D, col);
+            add_line(x - 2.4f * c, yv + c, -D, x - 2.4f * c, yv - c, -D, col);
+            add_line(x - 2.4f * c, yv - c, -D, x - 0.4f * c, yv, -D, col);
+            add_line(x - 2.2f * c, yv, -D, x - 0.6f * c, yv, -D, col);
+            const float yk = yc + H * static_cast<float>(std::clamp(st.commanded_vs_mps * 196.8504 / kFullFpm, -1.0, 1.0));
+            add_line(x + 2.6f * c, yk + c, -D, x + 0.6f * c, yk, -D, col);
+            add_line(x + 0.6f * c, yk, -D, x + 2.6f * c, yk - c, -D, col);
+            std::snprintf(buf, sizeof(buf), "%+d", static_cast<int>(std::lround(std::clamp(vs_fpm, -9990.0, 9990.0) / 10.0) * 10));
+            draw_string_centered(buf, x, yc - H - D * 0.010f, D * 0.008f, -D, col);
+        }
+
+        // Hover pad: a plan view, heading up. The ring is 30 kt; the vector
+        // from the pad is the jet's ground velocity, the chevron on the
+        // fore-aft axis the ground speed the control law is flying to.
+        if (st.control_phase >= 1) {
+            constexpr double kRingKt = 30.0;
+            const float cx = 0.0f, cy = -T(0.105f), R = T(0.040f);
+            constexpr int kSeg = 32;
+            for (int i = 0; i < kSeg; i += 2) {
+                const float a0 = 6.2831853f * static_cast<float>(i) / kSeg, a1 = 6.2831853f * static_cast<float>(i + 1) / kSeg;
+                add_line(cx + R * std::cos(a0), cy + R * std::sin(a0), -D, cx + R * std::cos(a1), cy + R * std::sin(a1), -D, col);
+            }
+            const float p = R * 0.16f;
+            add_rect(cx, cy, 2.0f * p, 2.0f * p, -D, col);
+            const double kt = 1.94384;
+            const float gx = static_cast<float>(std::clamp(tel.ground_right_mps * kt / kRingKt, -1.2, 1.2)) * R;
+            const float gy = static_cast<float>(std::clamp(tel.ground_fwd_mps * kt / kRingKt, -1.2, 1.2)) * R;
+            if (std::hypot(gx, gy) > p) add_line(cx, cy, -D, cx + gx, cy + gy, -D, col);
+            // The vector's head: a small diamond (the hover cue: hold it in the pad).
+            const float h = R * 0.10f;
+            add_line(cx + gx, cy + gy + h, -D, cx + gx + h, cy + gy, -D, col);
+            add_line(cx + gx + h, cy + gy, -D, cx + gx, cy + gy - h, -D, col);
+            add_line(cx + gx, cy + gy - h, -D, cx + gx - h, cy + gy, -D, col);
+            add_line(cx + gx - h, cy + gy, -D, cx + gx, cy + gy + h, -D, col);
+            const float yk = cy + static_cast<float>(std::clamp(st.commanded_gs_mps * kt / kRingKt, -1.2, 1.2)) * R;
+            add_line(cx - R - D * 0.006f, yk + D * 0.003f, -D, cx - R - D * 0.002f, yk, -D, col);
+            add_line(cx - R - D * 0.002f, yk, -D, cx - R - D * 0.006f, yk - D * 0.003f, -D, col);
+            const double gs = tel.ground_fwd_mps * kt, drift = tel.ground_right_mps * kt;
+            std::snprintf(buf, sizeof(buf), "GS %d", static_cast<int>(std::lround(std::clamp(gs, -99.0, 999.0))));
+            draw_string(buf, cx + R + D * 0.008f, cy + D * 0.004f, D * 0.008f, -D, col);
+            std::snprintf(buf, sizeof(buf), "DR %d%c", static_cast<int>(std::lround(std::min(std::abs(drift), 99.0))),
+                          drift >= 0.0 ? 'R' : 'L');
+            draw_string(buf, cx + R + D * 0.008f, cy - D * 0.008f, D * 0.008f, -D, col);
+        }
+
+        // Radar altitude over the altitude box.
+        {
+            const int ralt = radar_altitude_ft(state);
+            if (ralt >= 0) {
+                std::snprintf(buf, sizeof(buf), "R %d", ralt);
+                draw_string_centered(buf, T(0.082f), T(0.082f) + D * 0.021f, D * 0.009f, -D, col);
+            }
+        }
+
+        // Conversion speed window: above the LiftFan's limit with the doors
+        // open (or opening) the fan and its doors are being over-sped.
+        {
+            static constexpr double kLimit =
+                aircraft::AircraftConfig::get(aircraft::AircraftType::F35B_LIGHTNING_II).stovl.max_conversion_kcas;
+            const double cas = kcas(state);
+            if (st.mode != StovlMode::CTOL && cas > kLimit) {
+                std::snprintf(buf, sizeof(buf), "CONV SPEED %d", static_cast<int>(std::lround(cas)));
+                draw_string_centered(buf, 0.0f, T(0.052f), D * 0.010f, -D, cas > kLimit * 1.1 ? red : amber);
+            }
+        }
+    }
+
+    /// @brief Helmet-fixed primary flight data (F-35 HMD): airspeed and
+    /// altitude boxes low in the display, heading at its top, G under the
+    /// airspeed and, in STOVL, the radar altitude and lift-system mode. Shown
+    /// only while the pilot looks away from the nose (render_hmd()).
+    void build_helmet_fixed(const fdm::FlightState& state, const flcs::IMUData& imu, const AvionicsTelemetry& tel,
+                            const Color4& col, float D) {
+        auto T = [D](float a) { return D * std::tan(a); };
+        char buf[16];
+        const float xl = -T(0.25f), xr = T(0.25f), y = -T(0.17f);
+        const float box_h = D * 0.022f;
+        add_rect(xl, y, D * 0.046f, box_h, -D, col);
+        std::snprintf(buf, sizeof(buf), "%03d", std::clamp(static_cast<int>(std::lround(kcas(state))), 0, 999));
+        draw_string_centered(buf, xl, y, D * 0.011f, -D, col);
+        add_rect(xr, y, D * 0.052f, box_h, -D, col);
+        std::snprintf(buf, sizeof(buf), "%05d", std::clamp(static_cast<int>(std::lround(state.altitude() * 3.28084)), 0, 99999));
+        draw_string_centered(buf, xr, y, D * 0.011f, -D, col);
+        std::snprintf(buf, sizeof(buf), "%2.1fG", std::abs(static_cast<float>(imu.Nz)));
+        draw_string_centered(buf, xl, y - box_h - D * 0.004f, D * 0.009f, -D, col);
+        const int hdg = static_cast<int>(std::lround(std::fmod(state.yaw() * (180.0 / 3.14159265) + 360.0, 360.0))) % 360;
+        std::snprintf(buf, sizeof(buf), "%03d", hdg);
+        add_rect(0.0f, T(0.22f), D * 0.040f, box_h, -D, col);
+        draw_string_centered(buf, 0.0f, T(0.22f), D * 0.011f, -D, col);
+        const propulsion::StovlStatus& st = tel.stovl;
+        if (st.equipped && (st.mode != propulsion::StovlMode::CTOL || st.conversion > 0.01)) {
+            const int ralt = radar_altitude_ft(state);
+            if (ralt >= 0) {
+                std::snprintf(buf, sizeof(buf), "R %d", ralt);
+                draw_string_centered(buf, xr, y - box_h - D * 0.004f, D * 0.009f, -D, col);
+            }
+            draw_string_centered(propulsion::to_string(st.mode), 0.0f, y, D * 0.009f, -D, col);
+        }
+    }
+
+    /// @brief Helmet display (F-35): the virtual HUD and STOVL symbols stay
+    /// fixed to the jet (@p head_view turns them with the pilot's head), and
+    /// once the head is turned off the nose the helmet's own flight data
+    /// appear in the display's frame. The caller limits the drawing to the
+    /// display's field (scissor); there is no combiner to mask it.
+    void render_hmd(const Mat4& projection, const Mat4& head_view) {
+        if (!initialized_ || lines_.empty()) return;
+        shader_.use();
+        shader_.set_mat4("uProjection", projection);
+        shader_.set_mat4("uView", head_view);
+        glLineWidth(2.0f);
+        glBindVertexArray(vao_);
+        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(masked_vertex_count_));
+        // Boresight (0, 0, -1) seen from the head: its angle off the line of
+        // sight. Looking down into the cockpit (at the PCD) the helmet's own
+        // data declutter.
+        const float off_boresight = std::acos(std::clamp(head_view(2, 2), -1.0f, 1.0f));
+        const float los_el = std::asin(std::clamp(-head_view(2, 1), -1.0f, 1.0f));
+        const float los_az = std::atan2(-head_view(2, 0), head_view(2, 2));
+        const bool in_cockpit = los_el < -kCockpitDeclutterEl && std::abs(los_az) < 0.8f;
+        if (off_boresight > kHelmetDataAngle && !in_cockpit && lines_.size() > masked_vertex_count_) {
+            shader_.set_mat4("uView", Mat4::identity());
+            glDrawArrays(GL_LINES, static_cast<GLint>(masked_vertex_count_),
+                         static_cast<GLsizei>(lines_.size() - masked_vertex_count_));
+        }
+        glBindVertexArray(0);
+        glLineWidth(1.0f);
+    }
+
     /// @brief Render collimated symbology that is masked to the physical combiner glass
     void render_masked(const Mat4& projection, const Mat4& view = Mat4::identity()) {
         if (!initialized_ || masked_vertex_count_ == 0) return;
@@ -869,7 +1203,8 @@ public:
         glLineWidth(1.0f);
     }
 
-    /// @brief Render all HUD symbology without aperture clipping (for external / chase view)
+    /// @brief Render all HUD symbology without aperture clipping (for
+    /// external / chase view). A helmet's own helmet-fixed data stay in it.
     void render_unmasked(const Mat4& projection, const Mat4& view = Mat4::identity()) {
         if (!initialized_ || lines_.empty()) return;
 
@@ -879,7 +1214,7 @@ public:
 
         glLineWidth(2.0f);
         glBindVertexArray(vao_);
-        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(lines_.size()));
+        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(masked_vertex_count_));
         glBindVertexArray(0);
         glLineWidth(1.0f);
     }
@@ -901,6 +1236,7 @@ public:
 
     size_t vertex_count() const noexcept { return lines_.size(); }
     size_t masked_vertex_count() const noexcept { return masked_vertex_count_; }
+    bool helmet_mounted() const noexcept { return hmd_; }
     bool is_initialized() const noexcept { return initialized_; }
 };
 

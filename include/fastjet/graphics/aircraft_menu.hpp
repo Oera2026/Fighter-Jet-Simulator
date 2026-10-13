@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <chrono>
 
 namespace fastjet::graphics {
 
@@ -25,6 +26,16 @@ struct MenuVertex {
     float pos[3];
     float uv[2];
     float color[4];
+};
+
+/// @brief A screen rectangle (aspect-corrected NDC) in which the renderer draws a real
+/// airframe model on top of the menu.
+struct PreviewSlot {
+    aircraft::AircraftType type;
+    float x0, y0, x1, y1;
+    float heading;  ///< Yaw of the jet seen from the camera [rad]; pi/2 = nose to the right
+    float fill;     ///< Fraction of the rectangle the jet's bounding sphere spans
+    float pitch;    ///< Camera elevation above the jet [rad]
 };
 
 /// @brief High-utility military tactical avionics menu system
@@ -41,7 +52,7 @@ private:
     bool initialized_ = false;
 
     /// Number of selectable airframes
-    static constexpr int kAircraftCount = 5;
+    static constexpr int kAircraftCount = 6;
 
     bool is_open_ = false;
     ui::MenuContext context_ = ui::MenuContext::BOOT_DISPATCH;
@@ -52,6 +63,9 @@ private:
     float mouse_ndc_x_ = -999.0f;
     float mouse_ndc_y_ = -999.0f;
     int hovered_aircraft_idx_ = -1;
+    int shown_index_ = -1;        // selection the preview last animated to
+    double switch_time_ = 0.0;    // when that animation began
+    std::vector<PreviewSlot> preview_slots_;
     int hovered_tab_idx_ = -1;
     bool hovered_launch_btn_ = false;
 
@@ -305,6 +319,7 @@ public:
         context_ = ui::MenuContext::BOOT_DISPATCH;
         active_tab_ = ui::MenuTab::AIRFRAME_SELECT;
         selected_index_ = static_cast<int>(current);
+        shown_index_ = -1;
         if (selected_index_ < 0 || selected_index_ >= kAircraftCount) selected_index_ = 0;
     }
 
@@ -313,6 +328,7 @@ public:
         context_ = ui::MenuContext::IN_FLIGHT_RECONFIG;
         active_tab_ = ui::MenuTab::AIRFRAME_SELECT;
         selected_index_ = static_cast<int>(current);
+        shown_index_ = -1;
         if (selected_index_ < 0 || selected_index_ >= kAircraftCount) selected_index_ = 0;
     }
 
@@ -352,6 +368,9 @@ public:
             selected_index_ = idx;
         }
     }
+
+    /// Where the renderer should draw real airframe models this frame (filled by render()).
+    [[nodiscard]] const std::vector<PreviewSlot>& preview_slots() const noexcept { return preview_slots_; }
 
     int selected_index() const noexcept { return selected_index_; }
 
@@ -403,6 +422,7 @@ public:
 
         triangle_verts_.clear();
         line_verts_.clear();
+        preview_slots_.clear();
 
         // Modal Frame Coordinates: full-density tactical HUD canvas
         const float modal_w = std::min(1.84f, aspect * 1.76f);
@@ -479,7 +499,7 @@ public:
         add_line(x0, footer_y + 0.003f, x1, footer_y + 0.003f, col_border_dim);
 
         // Persistent Hotkey Navigation Guide
-        draw_string("1-5/ARROWS: SELECT  |  TAB: SWITCH PAGE  |  ESC/M: DISMISS",
+        draw_string("1-6/ARROWS: SELECT  |  TAB: SWITCH PAGE  |  ESC/M: DISMISS",
                     x0 + 0.035f, y0 + 0.055f, 0.016f, col_text_dim);
 
         // Launch / Commit Flight Action Button
@@ -531,184 +551,205 @@ public:
     }
 
 private:
+    struct AirframeCard {
+        const char* name;       ///< Stage headline
+        const char* role;       ///< Two-word mission tag
+        float       mach;
+        float       g_limit;
+        int         engines;
+        float       agility, thrust, payload, stealth; ///< Relative 0..1 ratings
+        const char* tags[3];    ///< Feature chips, nullptr terminated
+    };
+
+    [[nodiscard]] static const AirframeCard& airframe_card(int i) noexcept {
+        static const AirframeCard cards[kAircraftCount] = {
+            {"F-16C FIGHTING FALCON",  "MULTIROLE",        2.05f, 9.0f,  1, 0.90f, 0.80f, 0.60f, 0.15f, {"FBW", nullptr, nullptr}},
+            {"F-15EX EAGLE II",        "AIR SUPERIORITY",  2.50f, 9.0f,  2, 0.72f, 0.90f, 1.00f, 0.15f, {"TWIN FIN", "12 AAM", nullptr}},
+            {"EUROFIGHTER TYPHOON",    "SWING ROLE",       2.00f, 9.0f,  2, 0.95f, 0.90f, 0.70f, 0.30f, {"CANARD", "SUPERCRUISE", nullptr}},
+            {"F-22A RAPTOR",           "STEALTH DOMINANCE",2.25f, 9.0f,  2, 1.00f, 1.00f, 0.50f, 1.00f, {"TVC", "SUPERCRUISE", "VLO"}},
+            {"A-10C THUNDERBOLT II",   "GROUND ATTACK",    0.56f, 7.33f, 2, 0.50f, 0.35f, 0.90f, 0.05f, {"30MM GAU-8", "NO AB", nullptr}},
+            {"F-35B LIGHTNING II",     "STOVL STRIKE",     1.60f, 7.0f,  1, 0.60f, 0.65f, 0.55f, 0.90f, {"STOVL", "LIFT FAN", nullptr}},
+        };
+        return cards[std::clamp(i, 0, kAircraftCount - 1)];
+    }
+
+    static constexpr float kHalfPi = 1.57079633f;
+
+    [[nodiscard]] static double now_seconds() noexcept {
+        using clock = std::chrono::steady_clock;
+        return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+    }
+
+    void draw_stage_floor(float cx, float cy, float radius, float yaw, float pitch, float alpha) {
+        const float sp = std::sin(pitch), cp = std::cos(pitch);
+        const float floor_z = -0.45f * radius;
+        const Color4 ring{col_border_bright.r, col_border_bright.g, col_border_bright.b, 0.55f * alpha};
+        const Color4 tick{col_text_bright.r, col_text_bright.g, col_text_bright.b, 0.70f * alpha};
+        constexpr float kTwoPi = 6.28318530718f;
+        constexpr int kSegs = 64;
+        auto at = [&](float r, float a, float& px, float& py) {
+            px = cx + r * std::cos(a);
+            py = cy + floor_z * cp - r * std::sin(a) * sp;
+        };
+        float px0, py0, px1, py1;
+        for (int i = 0; i < kSegs; ++i) {
+            at(radius * 1.12f, kTwoPi * i / kSegs, px0, py0);
+            at(radius * 1.12f, kTwoPi * (i + 1) / kSegs, px1, py1);
+            add_thick_line(px0, py0, px1, py1, 0.004f, ring);
+        }
+        constexpr int kTicks = 36;
+        for (int i = 0; i < kTicks; ++i) {
+            const float a = yaw + kTwoPi * i / kTicks;
+            const float len = (i % 9 == 0) ? 0.10f : 0.04f;
+            at(radius * 1.12f, a, px0, py0);
+            at(radius * (1.12f + len), a, px1, py1);
+            add_thick_line(px0, py0, px1, py1, 0.004f, (i % 9 == 0) ? tick : ring);
+        }
+    }
+
     void render_airframe_tab(float x0, float x1, float top, float bot, aircraft::AircraftType active_aircraft) {
-        // Split-screen: Left Column (32% airframe selector) and Right Column (68% specs & loadout)
+        const double now = now_seconds();
+        if (shown_index_ != selected_index_) {
+            shown_index_ = selected_index_;
+            switch_time_ = now;
+        }
+        const float a = std::clamp(static_cast<float>((now - switch_time_) / 0.55), 0.0f, 1.0f);
+        const float ease = 1.0f - (1.0f - a) * (1.0f - a) * (1.0f - a);
+
+        const float pad = 0.020f;
         const float total_w = x1 - x0;
-        const float split_x = x0 + total_w * 0.32f;
+        const float strip_h = 0.37f;
+        const float strip_top = bot + strip_h;
 
-        add_line(split_x, top + 0.015f, split_x, bot - 0.015f, col_border_dim);
-
-        // --- LEFT COLUMN: AIRCRAFT SELECTOR ---
-        const char* aircraft_names[kAircraftCount] = {
-            "F-16C FIGHTING FALCON",
-            "F-15EX EAGLE II",
-            "EUROFIGHTER TYPHOON",
-            "F-22A RAPTOR",
-            "A-10C THUNDERBOLT II"
-        };
-        const char* aircraft_subtitles[kAircraftCount] = {
-            "BLOCK 50 MULTIROLE / F110-GE-129",
-            "HEAVY AIR SUPERIORITY / TWIN F110",
-            "DELTA-CANARD CAREFREE FBW / EJ200",
-            "5TH-GEN VLO AIR DOMINANCE / 2D TVC",
-            "CLOSE AIR SUPPORT TANK BUSTER / TF34"
-        };
-
-        const float pad_x = 0.020f;
-        const float list_x0 = x0 + pad_x;
-        const float list_x1 = split_x - pad_x;
-        const float list_h  = top - bot;
-        const float item_h  = list_h / static_cast<float>(kAircraftCount);
-
+        // ---- Selector strip: one card per airframe -------------------------------------------
+        const float gap = 0.012f;
+        const float card_w = (total_w - 2.0f * pad - gap * (kAircraftCount - 1)) / kAircraftCount;
         for (int i = 0; i < kAircraftCount; ++i) {
-            const float item_y1 = top - static_cast<float>(i) * item_h;
-            const float item_y0 = item_y1 - item_h;
-            const float item_cy = (item_y0 + item_y1) * 0.5f;
+            const float cx0 = x0 + pad + static_cast<float>(i) * (card_w + gap);
+            const float cx1 = cx0 + card_w;
+            const bool sel = (i == selected_index_);
+            const bool hov = (mouse_ndc_x_ >= cx0 && mouse_ndc_x_ <= cx1 &&
+                              mouse_ndc_y_ >= bot && mouse_ndc_y_ <= strip_top);
+            if (hov) hovered_aircraft_idx_ = i;
 
-            const bool is_selected = (i == selected_index_);
-            const bool is_active   = (i == static_cast<int>(active_aircraft));
+            add_quad(cx0, bot, cx1, strip_top, sel ? col_highlight_bg : (hov ? col_row_alt : col_panel_bg));
+            add_rect_outline(cx0, bot, cx1, strip_top, sel ? col_border_bright : (hov ? col_text_bright : col_border_dim));
+            if (sel) add_quad(cx0, bot, cx1, bot + 0.010f, col_text_bright);
 
-            // Mouse hover check
-            const bool is_hovered = (mouse_ndc_x_ >= list_x0 && mouse_ndc_x_ <= list_x1 &&
-                                     mouse_ndc_y_ >= item_y0 + 0.008f && mouse_ndc_y_ <= item_y1 - 0.008f);
-            if (is_hovered) hovered_aircraft_idx_ = i;
+            const float yaw = sel ? kHalfPi + static_cast<float>(now * 0.6) : kHalfPi + 0.6f;
+            preview_slots_.push_back({static_cast<aircraft::AircraftType>(i), cx0 + 0.008f, bot + 0.080f,
+                                      cx1 - 0.008f, strip_top - 0.008f, yaw, sel || hov ? 0.95f : 0.85f, 0.45f});
 
-            if (is_selected) {
-                add_quad(list_x0, item_y0 + 0.008f, list_x1, item_y1 - 0.008f, col_highlight_bg);
-                add_rect_outline(list_x0, item_y0 + 0.008f, list_x1, item_y1 - 0.008f, col_border_bright);
-                // Vibrant indicator bar on active selection
-                add_quad(list_x0, item_y0 + 0.008f, list_x0 + 0.008f, item_y1 - 0.008f, col_text_bright);
-            } else if (is_hovered) {
-                add_quad(list_x0, item_y0 + 0.008f, list_x1, item_y1 - 0.008f, col_panel_bg);
-                add_rect_outline(list_x0, item_y0 + 0.008f, list_x1, item_y1 - 0.008f, col_border_bright);
-            }
-
-            const Color4 title_col = is_selected ? col_title : (is_hovered ? col_accent_gold : col_text_normal);
-            const Color4 sub_col   = is_selected ? col_spec_label : col_text_dim;
-
-            char title_str[64];
-            std::snprintf(title_str, sizeof(title_str), "[%d]  %s", i + 1, aircraft_names[i]);
-            draw_string(title_str, list_x0 + 0.020f, item_cy + 0.024f, 0.020f, title_col);
-            draw_string(aircraft_subtitles[i], list_x0 + 0.025f, item_cy - 0.022f, 0.014f, sub_col);
-
-            if (is_active) {
-                draw_string_right("[ACTIVE]", list_x1 - 0.015f, item_cy + 0.024f, 0.015f, col_active_badge);
+            char num[4];
+            std::snprintf(num, sizeof(num), "%d", i + 1);
+            draw_string(num, cx0 + 0.014f, strip_top - 0.026f, 0.018f, sel ? col_text_bright : col_text_dim);
+            draw_string_centered(to_short_string(static_cast<aircraft::AircraftType>(i)).data(),
+                                 (cx0 + cx1) * 0.5f, bot + 0.048f, 0.020f,
+                                 sel ? col_title : (hov ? col_accent_gold : col_text_normal));
+            if (i == static_cast<int>(active_aircraft)) {
+                add_quad(cx1 - 0.030f, strip_top - 0.030f, cx1 - 0.014f, strip_top - 0.014f, col_active_badge);
             }
         }
 
-        // --- RIGHT COLUMN: SPECIFICATION CARD & STORES PREVIEW ---
-        const float spec_x0 = split_x + 0.025f;
-        const float spec_x1 = x1 - 0.025f;
+        // ---- Stage: rotating 3D preview of the selected airframe -----------------------------
+        const AirframeCard& card = airframe_card(selected_index_);
+        const float stage_x0 = x0 + pad;
+        const float stage_x1 = x0 + total_w * 0.64f;
+        const float stage_y0 = strip_top + 0.020f;
+        const float stage_y1 = top;
+        add_quad(stage_x0, stage_y0, stage_x1, stage_y1, col_panel_bg);
+        add_rect_outline(stage_x0, stage_y0, stage_x1, stage_y1, col_border_dim);
+        add_corner_brackets(stage_x0, stage_y0, stage_x1, stage_y1, 0.04f, col_border_bright);
 
-        // Card backdrop
-        add_quad(spec_x0, bot, spec_x1, top, col_panel_bg);
-        add_rect_outline(spec_x0, bot, spec_x1, top, col_border_dim);
+        draw_string(card.name, stage_x0 + 0.030f, stage_y1 - 0.050f, 0.036f, col_title);
+        draw_string(card.role, stage_x0 + 0.032f, stage_y1 - 0.098f, 0.020f, col_text_bright);
 
-        char header_card[96];
-        std::snprintf(header_card, sizeof(header_card), "AIRFRAME SPECIFICATION : %s", aircraft_names[selected_index_]);
-        draw_string(header_card, spec_x0 + 0.025f, top - 0.038f, 0.020f, col_title);
-        add_line(spec_x0 + 0.020f, top - 0.060f, spec_x1 - 0.020f, top - 0.060f, col_border_dim);
+        const float view_x0 = stage_x0 + 0.010f, view_x1 = stage_x1 - 0.010f;
+        const float view_y0 = stage_y0 + 0.010f, view_y1 = stage_y1 - 0.120f;
+        const float stage_cx = (view_x0 + view_x1) * 0.5f;
+        const float stage_cy = (view_y0 + view_y1) * 0.5f;
+        const float fill = 0.86f + 0.14f * ease;
+        const float radius = std::min((view_x1 - view_x0) * 0.5f, (view_y1 - view_y0) * 0.5f) * fill;
+        // Spins fast on a change of selection, then settles into a slow turntable.
+        const float yaw = kHalfPi + static_cast<float>(now * 0.45) + (1.0f - ease) * (1.0f - ease) * 3.2f;
+        const float pitch = 0.42f;
+        draw_stage_floor(stage_cx, stage_cy, radius * 0.9f, yaw, pitch, ease);
+        preview_slots_.push_back({get_selected_type(), view_x0, view_y0, view_x1, view_y1, yaw, fill, pitch});
 
-        struct SpecEntry { const char* label; const char* val; };
-        std::vector<SpecEntry> specs;
-        switch (selected_index_) {
-            case 0:
-                specs = {
-                    {"ROLE & MISSION",    "TACTICAL MULTIROLE FIGHTER"},
-                    {"POWERPLANT",        "1X GENERAL ELECTRIC F110-GE-129 AFTERBURNING TURBOFAN"},
-                    {"THRUST RATINGS",    "DRY: 75.6 KN (17,000 LBF)  |  AB: 129.0 KN (29,000 LBF)"},
-                    {"SUPERCRUISE",       "NO : SUBSONIC INTERCEPT / TRANSONIC AFTERBURNING ACCELERATION"},
-                    {"MAX AIRSPEED",      "MACH 2.05 @ 36,000 FT (1,176 KIAS)"},
-                    {"MASS PROPERTIES",   "EMPTY: 20,500 LB | INTERNAL FUEL: 7,000 LB | MTOW: 42,300 LB"},
-                    {"FLCS ARCHITECTURE", "QUAD-REDUNDANT DIGITAL FLY-BY-WIRE (+9.0G / 25.2 AOA LIMIT)"},
-                    {"AERODYNAMICS",      "NASA TP-1538 EMPIRICAL WIND TUNNEL TABLES (CL_MAX 1.40)"},
-                    {"STORES / HARDPOINTS","STA 1/9: AIM-120D | STA 2/8: AIM-9X | CTR: 300 GAL TANK"},
-                    {"TACTICAL SUITE",    "AN/APG-68 PULSE DOPPLER + CAT I / CAT III FLCS SELECTOR"}
-                };
-                break;
-            case 1:
-                specs = {
-                    {"ROLE & MISSION",    "HEAVY ALL-WEATHER AIR SUPERIORITY"},
-                    {"POWERPLANT",        "2X GENERAL ELECTRIC F110-GE-129 (TWIN ENGINE INSTALLATION)"},
-                    {"THRUST RATINGS",    "DRY: 151.2 KN (34,000 LBF)  |  AB: 262.4 KN (59,000 LBF)"},
-                    {"SUPERCRUISE",       "NO : EXTREME AFTERBURNING CLIMB / PERSISTENT COMBAT AIR PATROL"},
-                    {"MAX AIRSPEED",      "MACH 2.50 @ 40,000 FT (1,433 KIAS)"},
-                    {"MASS PROPERTIES",   "EMPTY: 31,700 LB | INTERNAL FUEL: 13,550 LB | MTOW: 81,000 LB"},
-                    {"FLCS ARCHITECTURE", "DIGITAL FLY-BY-WIRE (DFBW) (+9.0G / 29.5 DEG AOA LIMIT)"},
-                    {"AERODYNAMICS",      "TWIN-TAIL AIR SUPERIORITY POLAR + HIGH COMPRESSIBILITY MARGIN"},
-                    {"STORES / HARDPOINTS","STA 1-12: UP TO 12X AIM-120D AMRAAM / 2X CONFORMAL FUEL TANKS"},
-                    {"TACTICAL SUITE",    "AN/APG-82(V)1 AESA + EPAWSS EW SUITE + ADCP-II COMPUTER"}
-                };
-                break;
-            case 2:
-                specs = {
-                    {"ROLE & MISSION",    "HIGH-AGILITY CANARD-DELTA MULTIROLE AIR DEFENSE"},
-                    {"POWERPLANT",        "2X EUROJET EJ200 ADVANCED AFTERBURNING TURBOFANS"},
-                    {"THRUST RATINGS",    "DRY: 120.0 KN (26,980 LBF)  |  AB: 180.0 KN (40,460 LBF)"},
-                    {"SUPERCRUISE",       "YES : SUSTAINED MACH 1.50 DRY CRUISE (NO REHEAT REQUIRED)"},
-                    {"MAX AIRSPEED",      "MACH 2.00+ @ 36,000 FT (1,150 KIAS)"},
-                    {"MASS PROPERTIES",   "EMPTY: 24,250 LB | INTERNAL FUEL: 11,020 LB | MTOW: 51,800 LB"},
-                    {"FLCS ARCHITECTURE", "QUAD CAREFREE HANDLING FBW + CLOSE-COUPLED ALL-MOVING CANARDS"},
-                    {"AERODYNAMICS",      "RELAXED PITCH STABILITY (+9.0G / 35.0 DEG UNLIMITED CAREFREE)"},
-                    {"STORES / HARDPOINTS","4X SEMI-RECESSED METEOR BVRAAM + 2X ASRAAM + WING TANKS"},
-                    {"TACTICAL SUITE",    "CAPTOR-M / E-SCAN AESA + PIRATE FLIR/IRST OPTRONICS"}
-                };
-                break;
-            case 3:
-                specs = {
-                    {"ROLE & MISSION",    "5TH-GEN VERY LOW OBSERVABLE AIR DOMINANCE"},
-                    {"POWERPLANT",        "2X PRATT & WHITNEY F119-PW-100 (2D PITCH THRUST VECTORING)"},
-                    {"THRUST RATINGS",    "DRY: 232.0 KN (52,150 LBF)  |  AB: 312.0 KN (70,140 LBF)"},
-                    {"SUPERCRUISE",       "YES : SUSTAINED MACH 1.82 DRY CRUISE (MILITARY POWER)"},
-                    {"MAX AIRSPEED",      "MACH 2.25+ @ 45,000 FT (1,290 KIAS)"},
-                    {"MASS PROPERTIES",   "EMPTY: 43,340 LB | INTERNAL FUEL: 18,000 LB | MTOW: 83,500 LB"},
-                    {"FLCS ARCHITECTURE", "5TH-GEN FBW UNIFIED WITH +/-20 DEG 2D PITCH VECTOR NOZZLES"},
-                    {"AERODYNAMICS",      "SUPERMANEUVERABILITY ENVELOPE (+9G / 60+ DEG POST-STALL AOA)"},
-                    {"STORES / HARDPOINTS","INTERNAL MAIN WEAPONS BAY: 6X AIM-120D | SIDE BAYS: 2X AIM-9X"},
-                    {"TACTICAL SUITE",    "AN/APG-77 AESA RADAR + LOW PROBABILITY OF INTERCEPT (LPI)"}
-                };
-                break;
-            case 4:
-                specs = {
-                    {"ROLE & MISSION",    "CLOSE AIR SUPPORT (CAS) & FORWARD AIR CONTROL (FAC-A)"},
-                    {"POWERPLANT",        "2X GENERAL ELECTRIC TF34-GE-100A HIGH-BYPASS TURBOFANS"},
-                    {"THRUST RATINGS",    "DRY ONLY: 80.6 KN (18,130 LBF) TOTAL (NON-AFTERBURNING)"},
-                    {"SUPERCRUISE",       "NO : SUBSONIC HEAVY PAYLOAD / TANK LOITER ARCHITECTURE"},
-                    {"MAX AIRSPEED",      "MACH 0.56 (380 KIAS DECK LEVEL / NEVER EXCEED 450 KIAS)"},
-                    {"MASS PROPERTIES",   "EMPTY: 24,959 LB | INTERNAL FUEL: 10,700 LB | MTOW: 50,000 LB"},
-                    {"FLCS ARCHITECTURE", "DUAL HYDRAULIC REVERSIBLE LINKAGE + PITCH/YAW SAS AUGMENTED"},
-                    {"AERODYNAMICS",      "HIGH-LIFT UNSWEPT WING (AR 6.54) + NACELLE PITCH MOMENT"},
-                    {"STORES / HARDPOINTS","GAU-8/A 30MM GATLING CANNON + 11X PYLONS (AGM-65, GBU-12)"},
-                    {"TACTICAL SUITE",    "SADL TACTICAL DATALINK + SPLIT-DECELERON AIRBRAKES"}
-                };
-                break;
+        // ---- Stats: big numbers and segmented bars -------------------------------------------
+        const float p_x0 = stage_x1 + 0.015f;
+        const float p_x1 = x1 - pad;
+        add_quad(p_x0, stage_y0, p_x1, stage_y1, col_panel_bg);
+        add_rect_outline(p_x0, stage_y0, p_x1, stage_y1, col_border_dim);
+
+        const float tile_gap = 0.010f;
+        const float tile_w = (p_x1 - p_x0 - 0.040f - 2.0f * tile_gap) / 3.0f;
+        const float tile_y1 = stage_y1 - 0.025f;
+        const float tile_y0 = tile_y1 - 0.170f;
+        char buf[24];
+        for (int t = 0; t < 3; ++t) {
+            const float tx0 = p_x0 + 0.020f + static_cast<float>(t) * (tile_w + tile_gap);
+            const float tx1 = tx0 + tile_w;
+            add_quad(tx0, tile_y0, tx1, tile_y1, col_bg_void);
+            add_rect_outline(tx0, tile_y0, tx1, tile_y1, col_border_dim);
+            const float tcx = (tx0 + tx1) * 0.5f;
+            if (t == 0) {
+                std::snprintf(buf, sizeof(buf), "%.2f", card.mach * ease);
+                draw_string_centered(buf, tcx, tile_y1 - 0.062f, 0.032f, col_title);
+                draw_string_centered("MACH", tcx, tile_y0 + 0.028f, 0.014f, col_spec_label);
+            } else if (t == 1) {
+                std::snprintf(buf, sizeof(buf), "%.1f", card.g_limit * ease);
+                draw_string_centered(buf, tcx, tile_y1 - 0.062f, 0.032f, col_title);
+                draw_string_centered("G LIMIT", tcx, tile_y0 + 0.028f, 0.014f, col_spec_label);
+            } else {
+                const float pip = 0.026f;
+                const float pips_w = static_cast<float>(card.engines) * pip + static_cast<float>(card.engines - 1) * 0.012f;
+                float px = tcx - pips_w * 0.5f;
+                for (int e = 0; e < card.engines; ++e) {
+                    add_quad(px, tile_y1 - 0.075f, px + pip, tile_y1 - 0.075f + pip * 1.6f, col_text_bright);
+                    px += pip + 0.012f;
+                }
+                draw_string_centered(card.engines == 1 ? "ENGINE" : "ENGINES", tcx, tile_y0 + 0.028f, 0.014f, col_spec_label);
+            }
         }
 
-        const float spec_content_top = top - 0.068f;
-        const float row_h = (spec_content_top - bot - 0.015f) / static_cast<float>(specs.size());
-        const float spec_text_x = spec_x0 + 0.030f;
-        const float spec_avail  = (spec_x1 - 0.030f) - spec_text_x;
-
-        for (size_t idx = 0; idx < specs.size(); ++idx) {
-            const auto& sp = specs[idx];
-            const float ry1 = spec_content_top - static_cast<float>(idx) * row_h;
-            const float ry0 = ry1 - row_h;
-
-            // Subtle alternating row background for crisp readability
-            if (idx % 2 == 1) {
-                add_quad(spec_x0 + 0.005f, ry0 + 0.004f, spec_x1 - 0.005f, ry1 - 0.004f, col_row_alt);
+        struct Bar { const char* label; float value; };
+        const Bar bars[] = {
+            {"SPEED",   card.mach / 2.5f},
+            {"AGILITY", card.agility},
+            {"THRUST",  card.thrust},
+            {"PAYLOAD", card.payload},
+            {"STEALTH", card.stealth},
+        };
+        constexpr int kSegments = 10;
+        const float bar_x0 = p_x0 + 0.030f;
+        const float bar_x1 = p_x1 - 0.030f;
+        const float seg_gap = 0.006f;
+        const float seg_w = (bar_x1 - bar_x0 - seg_gap * (kSegments - 1)) / kSegments;
+        float by = tile_y0 - 0.060f;
+        for (const Bar& bar : bars) {
+            draw_string(bar.label, bar_x0, by, 0.016f, col_spec_label);
+            const float seg_y1 = by - 0.020f;
+            const float seg_y0 = seg_y1 - 0.034f;
+            for (int sgm = 0; sgm < kSegments; ++sgm) {
+                const float sx0 = bar_x0 + static_cast<float>(sgm) * (seg_w + seg_gap);
+                const bool lit = (static_cast<float>(sgm) + 0.5f) / kSegments <= bar.value * ease;
+                add_quad(sx0, seg_y0, sx0 + seg_w, seg_y1, lit ? col_text_bright : col_row_alt);
             }
+            by -= 0.108f;
+        }
 
-            // Label on top line of row
-            draw_string(sp.label, spec_text_x, ry1 - 0.030f, 0.015f, col_spec_label);
-
-            // Value on bottom line of row
-            float val_scale = 0.018f;
-            const float val_w = measure_string(sp.val, val_scale);
-            if (val_w > spec_avail && val_w > 0.0f) {
-                val_scale *= spec_avail / val_w;
-            }
-            draw_string(sp.val, spec_text_x, ry0 + 0.032f, val_scale, col_spec_val);
+        // ---- Feature chips ---------------------------------------------------------------------
+        float chip_x = bar_x0;
+        const float chip_y1 = stage_y0 + 0.060f;
+        for (const char* tag : card.tags) {
+            if (!tag) break;
+            const float w = measure_string(tag, 0.015f) + 0.030f;
+            if (chip_x + w > bar_x1) break;
+            add_quad(chip_x, chip_y1 - 0.034f, chip_x + w, chip_y1, col_highlight_bg);
+            add_rect_outline(chip_x, chip_y1 - 0.034f, chip_x + w, chip_y1, col_border_bright);
+            draw_string(tag, chip_x + 0.015f, chip_y1 - 0.017f, 0.015f, col_spec_val);
+            chip_x += w + 0.010f;
         }
     }
 

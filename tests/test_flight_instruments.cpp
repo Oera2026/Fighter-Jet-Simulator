@@ -57,6 +57,35 @@ void test_fbo_and_instruments_gl() {
     inst.bind_texture(GL_TEXTURE0);
     assert(glGetError() == GL_NO_ERROR);
 
+    // 5. F-35B: the PCD's STOVL portal colours the LiftFan door on its plan
+    // view grey while shut and green once open.
+    {
+        AvionicsTelemetry tel;
+        tel.aircraft_type = fastjet::aircraft::AircraftType::F35B_LIGHTNING_II;
+        tel.stovl.equipped = true;
+        auto door_pixel = [&]() {
+            inst.update_and_render(state, tel);
+            // Portal centre (0.75, 0.5) in atlas NDC at 0.25 per portal
+            // unit; the door symbol at portal (-0.35, 0.77).
+            const int x = static_cast<int>((0.75f - 0.35f * 0.25f + 1.0f) * 0.5f * FlightInstruments::TEX_WIDTH);
+            const int y = static_cast<int>((0.5f + 0.77f * 0.25f + 1.0f) * 0.5f * FlightInstruments::TEX_HEIGHT);
+            unsigned char px[4] = {0, 0, 0, 0};
+            glBindFramebuffer(GL_FRAMEBUFFER, inst.fbo_id());
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            return std::array<int, 4>{px[0], px[1], px[2], px[3]};
+        };
+        const auto shut = door_pixel();
+        tel.stovl.mode = fastjet::propulsion::StovlMode::STOVL;
+        tel.stovl.conversion = 1.0;
+        tel.stovl.lift_fan_door = 1.0;
+        const auto open = door_pixel();
+        assert(glGetError() == GL_NO_ERROR);
+        assert(shut[1] > 60 && std::abs(shut[0] - shut[1]) < 40);  // grey
+        assert(open[1] > 150 && open[1] > open[0] + 60);           // green
+    }
+
     inst.destroy();
     std::cout << "PASSED (FBO complete, off-screen rendering and texture binding verified)\n";
 

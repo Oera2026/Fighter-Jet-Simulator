@@ -67,6 +67,7 @@ struct GLBSubmesh {
     float roughness_factor = 1.0f;
     std::array<float, 3> emissive{0.0f, 0.0f, 0.0f};
     bool is_transparent = false;
+    int joint = -1;             ///< Articulated part: index of its joint transform (-1: rigid)
 
     /// Bounds in body axes, model units (before scale and placement).
     std::array<float, 3> bounds_min{0.0f, 0.0f, 0.0f};
@@ -78,6 +79,42 @@ struct BodyBounds {
     math::Vector3 min{0.0, 0.0, 0.0};
     math::Vector3 max{0.0, 0.0, 0.0};
     bool valid = false;
+};
+
+/// @brief Where a model's own axes sit in the body frame, per alignment.
+/// The defaults are the F-16C asset's (model units of 0.1 m).
+struct ModelPlacement {
+    float scale = 0.1f;          ///< Model units to metres
+    float world_x = -3.50f;      ///< WORLD: X of the model origin [m]
+    float world_z = -0.33f;      ///< WORLD: Z of the model origin [m]
+    float cockpit_x = -4.035f;   ///< COCKPIT: X of the model origin [m]
+    float cockpit_z = 0.175f;    ///< COCKPIT: Z of the model origin [m]
+};
+
+/// @brief One part of a procedurally built airframe: a triangle soup of
+/// positions and normals (6 floats per vertex, body axes, metres) and its
+/// glTF metallic-roughness material.
+struct ProceduralPart {
+    F16PartType part_type = F16PartType::AIRFRAME;
+    std::vector<float> vertices;   ///< px py pz nx ny nz per vertex
+    Color4 base{0.5f, 0.5f, 0.5f, 1.0f};
+    float metallic = 0.0f;
+    float roughness = 0.6f;
+    bool transparent = false;
+    std::array<float, 3> emissive{0.0f, 0.0f, 0.0f};
+    /// Moving part (door, swivelling nozzle segment): drawn through joint
+    /// transform `joint` of the model, set each frame (ModelGLB::set_joints).
+    /// -1 for the rigid airframe.
+    int joint = -1;
+};
+
+/// @brief Per-frame transforms of an airframe's moving parts, in the
+/// airframe's own axes (each maps the part from where it was built to where
+/// it is now). Unused entries are identity.
+struct JointPose {
+    static constexpr int kMax = 12;
+    std::array<Mat4, kMax> m{};
+    int count = 0;
 };
 
 /// @brief glTF/GLB airframe loader and physically based renderer.
@@ -100,6 +137,14 @@ private:
     bool initialized_ = false;
     bool loaded_ = false;
     bool cockpit_interior_ = true;
+    /// Moving parts' transforms this draw, and the uniforms they are
+    /// composed with (the model and normal matrices of the whole airframe).
+    JointPose joints_{};
+    Mat4 base_model_ = Mat4::identity();
+    Mat4 base_rot_ = Mat4::identity();
+    bool depth_pass_ = false;          ///< Drawing with the depth-only shader (uLightMVP)
+    int posed_ = -1;                   ///< Joint the bound model matrix carries (-1: rigid)
+    ModelPlacement placement_{};  ///< F-16C asset unless load_procedural() says otherwise
     std::future<std::unique_ptr<Prepared>> prefetch_;  ///< Background prepare()
     std::string prefetch_path_;
 
@@ -390,7 +435,84 @@ public:
         return upload(*prepared);
     }
 
+    /// @brief Builds the model from procedural parts instead of a file.
+    /// The parts are authored in metres in their own axes; @p placement
+    /// puts those axes in the body frame for each alignment.
+    bool load_procedural(const std::vector<ProceduralPart>& parts, const ModelPlacement& placement) {
+        placement_ = placement;
+        for (const ProceduralPart& part : parts) {
+            const size_t n = part.vertices.size() / 6;
+            if (n < 3) continue;
+            std::array<float, 3> bmin{1e30f, 1e30f, 1e30f};
+            std::array<float, 3> bmax{-1e30f, -1e30f, -1e30f};
+            std::vector<float> vertex_data;
+            vertex_data.reserve(n * kFloatsPerVertex);
+            std::vector<uint32_t> indices(n);
+            for (size_t v = 0; v < n; ++v) {
+                const float* src = &part.vertices[v * 6];
+                for (size_t k = 0; k < 3; ++k) {
+                    bmin[k] = (std::min)(bmin[k], src[k]);
+                    bmax[k] = (std::max)(bmax[k], src[k]);
+                }
+                const float vert[kFloatsPerVertex] = {src[0], src[1], src[2], src[3], src[4], src[5],
+                                                      0.0f,   0.0f,   0.0f,   0.0f,   0.0f,   1.0f};
+                vertex_data.insert(vertex_data.end(), vert, vert + kFloatsPerVertex);
+                indices[v] = static_cast<uint32_t>(v);
+            }
+            GLBSubmesh sm = make_submesh(vertex_data, indices);
+            sm.name = "procedural";
+            sm.part_type = part.part_type;
+            sm.bounds_min = bmin;
+            sm.bounds_max = bmax;
+            sm.base_color_factor = part.base;
+            sm.metallic_factor = part.metallic;
+            sm.roughness_factor = part.roughness;
+            sm.emissive = part.emissive;
+            sm.is_transparent = part.transparent;
+            sm.joint = part.joint < JointPose::kMax ? part.joint : -1;
+            submeshes_.push_back(sm);
+        }
+        loaded_ = true;
+        return true;
+    }
+
 private:
+    /// @brief Vertex array, vertex and index buffers for one submesh
+    /// (kFloatsPerVertex floats per vertex).
+    static GLBSubmesh make_submesh(const std::vector<float>& vertex_data, const std::vector<uint32_t>& indices) {
+        GLuint vao = 0, vbo = 0, ebo = 0;
+        glGenVertexArrays(1, &vao);
+        glGenBuffers(1, &vbo);
+        glGenBuffers(1, &ebo);
+
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertex_data.size() * sizeof(float)),
+                     vertex_data.data(), GL_STATIC_DRAW);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(indices.size() * sizeof(uint32_t)),
+                     indices.data(), GL_STATIC_DRAW);
+
+        constexpr GLsizei stride = kFloatsPerVertex * sizeof(float);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(3 * sizeof(float)));
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(6 * sizeof(float)));
+        glEnableVertexAttribArray(3);
+        glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(8 * sizeof(float)));
+        glBindVertexArray(0);
+
+        GLBSubmesh sm;
+        sm.vao = vao;
+        sm.vbo = vbo;
+        sm.ebo = ebo;
+        sm.index_count = static_cast<GLsizei>(indices.size());
+        sm.index_type = GL_UNSIGNED_INT;
+        return sm;
+    }
+
     /// @brief The GL half of a load: textures, buffers and submeshes.
     bool upload(const Prepared& prepared) {
         cgltf_data* data = prepared.data;
@@ -544,38 +666,9 @@ private:
                     for (uint32_t vi = 0; vi < num_verts; ++vi) indices[vi] = vi;
                 }
 
-                GLuint vao = 0, vbo = 0, ebo = 0;
-                glGenVertexArrays(1, &vao);
-                glGenBuffers(1, &vbo);
-                glGenBuffers(1, &ebo);
-
-                glBindVertexArray(vao);
-                glBindBuffer(GL_ARRAY_BUFFER, vbo);
-                glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertex_data.size() * sizeof(float)),
-                             vertex_data.data(), GL_STATIC_DRAW);
-                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
-                glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(indices.size() * sizeof(uint32_t)),
-                             indices.data(), GL_STATIC_DRAW);
-
-                constexpr GLsizei stride = kFloatsPerVertex * sizeof(float);
-                glEnableVertexAttribArray(0);
-                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(0));
-                glEnableVertexAttribArray(1);
-                glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(3 * sizeof(float)));
-                glEnableVertexAttribArray(2);
-                glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(6 * sizeof(float)));
-                glEnableVertexAttribArray(3);
-                glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(8 * sizeof(float)));
-                glBindVertexArray(0);
-
-                GLBSubmesh sm;
+                GLBSubmesh sm = make_submesh(vertex_data, indices);
                 sm.name = part_name;
                 sm.part_type = ptype;
-                sm.vao = vao;
-                sm.vbo = vbo;
-                sm.ebo = ebo;
-                sm.index_count = static_cast<GLsizei>(indices.size());
-                sm.index_type = GL_UNSIGNED_INT;
                 sm.bounds_min = bmin;
                 sm.bounds_max = bmax;
 
@@ -636,6 +729,13 @@ public:
     }
 
     bool is_loaded() const noexcept { return loaded_; }
+
+    /// @brief Poses the moving parts for the next draws (doors, nozzle). The
+    /// model is shared by every jet of its type: set before each one.
+    void set_joints(const JointPose& pose) noexcept {
+        joints_ = pose;
+        for (int i = pose.count; i < JointPose::kMax; ++i) joints_.m[static_cast<size_t>(i)] = Mat4::identity();
+    }
     [[nodiscard]] size_t submesh_count() const noexcept { return submeshes_.size(); }
 
     /// @brief Body-frame model matrix (model units -> metres, placed on the CG).
@@ -644,6 +744,15 @@ public:
         return Mat4::translate(world ? WORLD_OFFSET_X : COCKPIT_OFFSET_X, 0.0f,
                                world ? WORLD_OFFSET_Z : COCKPIT_OFFSET_Z) *
                Mat4::scale(MODEL_SCALE, MODEL_SCALE, MODEL_SCALE);
+    }
+
+    /// @brief This model's body-frame matrix (its own placement; the F-16C
+    /// asset's is body_matrix()).
+    [[nodiscard]] Mat4 placed_matrix(ModelAlignment align) const noexcept {
+        const bool world = align == ModelAlignment::WORLD;
+        const ModelPlacement& p = placement_;
+        return Mat4::translate(world ? p.world_x : p.cockpit_x, 0.0f, world ? p.world_z : p.cockpit_z) *
+               Mat4::scale(p.scale, p.scale, p.scale);
     }
 
     /// @brief Body-to-NED rotation of the aircraft as a Mat4.
@@ -787,13 +896,15 @@ public:
     [[nodiscard]] BodyBounds part_bounds(F16PartType type, ModelAlignment align) const noexcept {
         BodyBounds b;
         const bool world = align == ModelAlignment::WORLD;
-        const double off[3] = {world ? WORLD_OFFSET_X : COCKPIT_OFFSET_X, 0.0, world ? WORLD_OFFSET_Z : COCKPIT_OFFSET_Z};
+        const ModelPlacement& p = placement_;
+        const double off[3] = {world ? p.world_x : p.cockpit_x, 0.0, world ? p.world_z : p.cockpit_z};
+        const double k = p.scale;
         for (const auto& sm : submeshes_) {
             if (sm.part_type != type) continue;
-            math::Vector3 lo(sm.bounds_min[0] * MODEL_SCALE + off[0], sm.bounds_min[1] * MODEL_SCALE + off[1],
-                             sm.bounds_min[2] * MODEL_SCALE + off[2]);
-            math::Vector3 hi(sm.bounds_max[0] * MODEL_SCALE + off[0], sm.bounds_max[1] * MODEL_SCALE + off[1],
-                             sm.bounds_max[2] * MODEL_SCALE + off[2]);
+            math::Vector3 lo(sm.bounds_min[0] * k + off[0], sm.bounds_min[1] * k + off[1],
+                             sm.bounds_min[2] * k + off[2]);
+            math::Vector3 hi(sm.bounds_max[0] * k + off[0], sm.bounds_max[1] * k + off[1],
+                             sm.bounds_max[2] * k + off[2]);
             if (!b.valid) {
                 b.min = lo;
                 b.max = hi;
@@ -824,14 +935,19 @@ public:
     }
 
     /// @brief Draws the airframe into the bound shadow map.
+    /// @param with_interior False leaves out the cockpit interior (a separate
+    ///        cockpit shell casts its own shadow).
     void render_shadow(const ShadowMap& shadow, const fdm::FlightState& state, bool gear_down,
-                       ModelAlignment align) {
+                       ModelAlignment align, bool with_interior = true) {
         if (!loaded_ || !initialized_) return;
         depth_shader_.use();
-        const Mat4 mvp = shadow.caster_matrix(state.pos_ned) * attitude_matrix(state) * body_matrix(align);
+        const Mat4 mvp = shadow.caster_matrix(state.pos_ned) * attitude_matrix(state) * placed_matrix(align);
         depth_shader_.set_mat4("uLightMVP", mvp);
+        begin_joints(mvp, Mat4::identity(), true);
         for (const auto& sm : submeshes_) {
             if (sm.is_transparent || !visible(sm, gear_down)) continue;
+            if (!with_interior && sm.part_type == F16PartType::COCKPIT) continue;
+            pose(sm);
             glBindVertexArray(sm.vao);
             glDrawElements(GL_TRIANGLES, sm.index_count, sm.index_type, nullptr);
         }
@@ -849,8 +965,10 @@ public:
         shader_.use();
         ctx.upload(shader_);
         shader_.set_mat4("uViewProj", view_proj_rot);
-        shader_.set_mat4("uModel", relative_matrix(state, ctx.eye_ned, ModelAlignment::WORLD));
+        const Mat4 model = relative_matrix_body(state, ctx.eye_ned) * placed_matrix(ModelAlignment::WORLD);
+        shader_.set_mat4("uModel", model);
         set_normal_matrix(attitude_matrix(state));
+        begin_joints(model, attitude_matrix(state), false);
         shader_.set_vec3("uFrameOrigin", static_cast<float>(ctx.eye_ned.x), static_cast<float>(ctx.eye_ned.y),
                          static_cast<float>(ctx.eye_ned.z));
         shader_.set_float("uEyeAltitude", static_cast<float>(-ctx.eye_ned.z));
@@ -890,8 +1008,9 @@ public:
         shader_.set_mat3("uBodyToNed", body_to_ned);
 
         shader_.set_mat4("uViewProj", projection * view_cockpit);
-        shader_.set_mat4("uModel", body_matrix(ModelAlignment::COCKPIT));
+        shader_.set_mat4("uModel", placed_matrix(ModelAlignment::COCKPIT));
         set_normal_matrix(Mat4::identity());
+        begin_joints(placed_matrix(ModelAlignment::COCKPIT), Mat4::identity(), false);
         shader_.set_vec3("uFrameOrigin", static_cast<float>(eye_body.x), static_cast<float>(eye_body.y),
                          static_cast<float>(eye_body.z));
         shader_.set_float("uEyeAltitude", static_cast<float>(-state.pos_ned.z));
@@ -930,6 +1049,28 @@ private:
             case F16PartType::HUD: return cockpit_interior_;
             default: return false;
         }
+    }
+
+    /// Moving parts: the matrices their joint transforms compose with.
+    void begin_joints(const Mat4& model, const Mat4& rot, bool depth) noexcept {
+        base_model_ = model;
+        base_rot_ = rot;
+        depth_pass_ = depth;
+        posed_ = -1;
+    }
+
+    /// Sets the model (and normal) matrix for submesh @p sm if its joint
+    /// differs from the last one drawn: rigid parts cost nothing extra.
+    void pose(const GLBSubmesh& sm) {
+        if (sm.joint == posed_) return;
+        posed_ = sm.joint;
+        const Mat4 j = sm.joint >= 0 ? joints_.m[static_cast<size_t>(sm.joint)] : Mat4::identity();
+        if (depth_pass_) {
+            depth_shader_.set_mat4("uLightMVP", base_model_ * j);
+            return;
+        }
+        shader_.set_mat4("uModel", base_model_ * j);
+        set_normal_matrix(base_rot_ * j);
     }
 
     void set_normal_matrix(const Mat4& rot) {
@@ -984,6 +1125,7 @@ private:
     }
 
     void draw_submesh(const GLBSubmesh& sm, bool gear_down) {
+        pose(sm);
         bind_map(0, sm.base_texture, "uHasBase");
         bind_map(1, sm.mr_texture, "uHasMr");
         bind_map(2, sm.normal_texture, "uHasNormal");

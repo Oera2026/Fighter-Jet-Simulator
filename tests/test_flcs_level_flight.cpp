@@ -22,8 +22,9 @@ void test_hands_off_level_flight() {
     F16FLCS flcs;
     // Initial trim elevator ~ +0.67 deg to balance natural pitching moment
     flcs.reset(0.67, 0.0, 0.0);
-    // Initialize integrator near trim to avoid initial transient
-    flcs.pitch_ctrl.integrator = -0.67 / flcs.pitch_ctrl.Ki;
+    // The pitch law's trim feed-forward (PitchTrimModel) carries the 1 G trim,
+    // so the integrator starts empty: pre-loading it with the trim as well
+    // doubled it and knocked the jet 0.2 G off at the start.
 
     constexpr double ALTITUDE = 5000.0;
     constexpr double AIRSPEED = 200.0;

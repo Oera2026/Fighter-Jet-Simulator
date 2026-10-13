@@ -44,6 +44,10 @@ enum class Gauge : int {
     WARN_5,     ///< CANOPY / OXY LOW
     GEAR_LAMP,  ///< Gear-down lamp (shared by all three)
     RWR,        ///< Radar warning receiver azimuth indicator
+    MDEF,       ///< Typhoon manual data entry facility: subsystem keys, display, keypad
+    DWP,        ///< Typhoon dedicated warnings panel and attention getter
+    GUH,        ///< Typhoon get-u-home (reversionary) flight display
+    ISFD,       ///< F-35 integrated standby flight display
     COUNT
 };
 
@@ -105,6 +109,12 @@ public:
             {1792, 512, 192, 192, true},   // WARN_5
             {0, 768, 128, 128, true},      // GEAR_LAMP
             {256, 768, 256, 256, true},    // RWR
+            // Typhoon glareshield faces, each with a 16 px gutter round it so
+            // mipmaps never bleed into the cells above.
+            {544, 784, 480, 240, true},    // MDEF (22 x 11 cm)
+            {1040, 784, 480, 240, true},   // DWP  (22 x 11 cm)
+            {1536, 784, 240, 240, true},   // GUH  (8 x 8 cm)
+            {1792, 784, 240, 240, true},   // ISFD (7 x 7 cm)
         }};
         return kCells[static_cast<size_t>(g)];
     }
@@ -149,6 +159,16 @@ public:
         bool flcs = false;
         bool config = false;
         bool gear_green = false;
+        // Typhoon warnings panel captions
+        bool bingo = false;
+        bool over_g = false;
+        bool high_aoa = false;
+        bool low_alt = false;
+        bool gcas = false;
+        bool structure = false;
+        bool caution = false;
+        bool gear_down = false;
+        double speedbrake = 0.0;
         // RWR: bearings clockwise from the nose [deg]
         bool rwr_on = false;
         int rwr_level = 0;
@@ -176,6 +196,7 @@ public:
                            const AvionicsTelemetry& tel = AvionicsTelemetry{}) {
         if (!initialized_) return;
         update_readings(dt, state, tel);
+        flash_t_ = std::fmod(flash_t_ + std::max(dt, 0.0), 60.0);
 
         begin_canvas();
         in_cell(Gauge::ASI);       draw_asi();
@@ -202,6 +223,10 @@ public:
         in_cell(Gauge::WARN_5);    draw_lamp("CANOPY", false, "OXY LOW", false);
         in_cell(Gauge::GEAR_LAMP); draw_gear_lamp();
         in_cell(Gauge::RWR);       draw_rwr();
+        in_cell(Gauge::MDEF);      draw_mdef();
+        in_cell(Gauge::DWP);       draw_dwp();
+        in_cell(Gauge::GUH);       draw_guh(state, "GUH");
+        in_cell(Gauge::ISFD);      draw_guh(state, "ISFD");
         // Cells are cleared to transparent: the cockpit shows through
         // wherever a face does not paint (round dials' corners, bezels).
         render_canvas(Color4{0.0f, 0.0f, 0.0f, 0.0f});
@@ -311,6 +336,15 @@ private:
         r_.config = tel.gear_collapsed ||
                     (!tel.gear_deployed && !tel.on_ground && t.alt_ft < 10000.0 && kcas < 190.0 && fpm < -250.0);
         r_.gear_green = tel.gear_deployed && !tel.gear_collapsed && tel.gear_transit_pos >= 0.98;
+        r_.bingo = tel.bingo_fuel_alert;
+        r_.over_g = tel.over_g_alert || tel.airframe_yielded;
+        r_.high_aoa = tel.high_aoa_alert;
+        r_.low_alt = tel.low_altitude_alert;
+        r_.gcas = tel.ofc_gcas_active;
+        r_.structure = tel.structure_failed;
+        r_.caution = tel.master_caution;
+        r_.gear_down = tel.gear_deployed;
+        r_.speedbrake = tel.speedbrake_pos;
 
         const CombatTelemetry& c = tel.combat;
         r_.rwr_on = c.active && c.rwr_active;
@@ -999,6 +1033,223 @@ private:
             add_circle(0.0f, 0.0f, 0.62f, Color4{0.10f, 0.13f, 0.11f, 1.0f}, 24);
         }
     }
+
+    // ---- Typhoon glareshield -----------------------------------------------
+    // Key and caption legends are lit in NVG-compatible pale green; the
+    // keys themselves are matt black with a lighter rim.
+    static constexpr Color4 kKeyBody{0.018f, 0.019f, 0.020f, 1.0f};
+    static constexpr Color4 kKeyRim{0.060f, 0.062f, 0.066f, 1.0f};
+    static constexpr Color4 kKeyInk{0.70f, 0.92f, 0.70f, 1.0f};
+    static constexpr Color4 kPlate{0.010f, 0.010f, 0.011f, 1.0f};
+
+    /// A push key: rim, body and a legend shrunk to fit.
+    void key(float x, float y, float w, float h, const char* legend, const Color4& ink = kKeyInk) {
+        add_rect(x, y, w, h, kKeyRim);
+        add_rect(x, y, w - 0.035f, h - 0.035f, kKeyBody);
+        if (legend && *legend) {
+            const float size = std::min(h * 0.50f, (w - 0.07f) / std::max(0.1f, text_width(legend, 1.0f)));
+            text_at(legend, x, y, size, ink);
+        }
+    }
+
+    /// Fixed-pitch line in a display window from x0 to x1.
+    void mono_line(const char* s, float x0, float x1, int cols, float y, float size, const Color4& ink) {
+        const float pitch = (x1 - x0) / static_cast<float>(cols);
+        for (int i = 0; i < cols && s[i]; ++i) {
+            if (s[i] == ' ') continue;
+            const char c[2] = {s[i], '\0'};
+            text_at(c, x0 + pitch * (static_cast<float>(i) + 0.5f), y, size, ink);
+        }
+    }
+
+    /// An attention getter: a large push-to-cancel lamp that flashes while
+    /// its warning or caution is new.
+    void attention_getter(float x, float y, float w, float h, const char* legend, bool on, const Color4& lit) {
+        add_rect(x, y, w, h, kKeyRim);
+        const bool show = on && std::fmod(flash_t_, 0.5) < 0.30;
+        const Color4 lens = show ? Color4{lit.r * 0.55f, lit.g * 0.55f, lit.b * 0.55f, 1.0f}
+                                 : Color4{0.030f, 0.022f, 0.020f, 1.0f};
+        add_rect(x, y, w - 0.05f, h - 0.05f, lens);
+        const Color4 ink = show ? Color4{1.0f, 0.95f, 0.85f, 1.0f} : Color4{0.16f, 0.12f, 0.10f, 1.0f};
+        const float size = std::min(h * 0.42f, (w - 0.12f) / std::max(0.1f, text_width(legend, 1.0f)));
+        text_at(legend, x, y, size, ink);
+    }
+
+    /// Manual Data Entry Facility, left glareshield. Outboard, the
+    /// subsystem keys that call up a subsystem's page on the MDEF display
+    /// (SWP set apart); in the middle the display with its line keys; inboard
+    /// the data entry keypad, under the master caution attention getter.
+    void draw_mdef() {
+        const float a = aspect(Gauge::MDEF);
+        add_rect(0.0f, 0.0f, a * 2.0f, 2.0f, kPlate);
+
+        // Subsystem keys, two columns of six, then SWP on its own.
+        static constexpr const char* kSub[12] = {"AP",  "NAV",  "AIDS", "INT", "XPDR", "XMIT",
+                                                 "RAD1", "RAD2", "DAS", "MISC", "MIDS", "NIS"};
+        for (int i = 0; i < 12; ++i) {
+            const float x = -a + 0.22f + 0.40f * static_cast<float>(i / 6);
+            const float y = 0.80f - 0.27f * static_cast<float>(i % 6);
+            key(x, y, 0.36f, 0.22f, kSub[i]);
+        }
+        key(-a + 0.42f, -0.84f, 0.46f, 0.22f, "SWP", Color4{0.95f, 0.80f, 0.40f, 1.0f});
+
+        // MDEF display with four line keys under it.
+        const float dx0 = -a + 0.92f, dx1 = 0.66f;
+        add_rect(0.5f * (dx0 + dx1), 0.30f, dx1 - dx0 + 0.06f, 1.20f, kKeyRim);
+        add_rect(0.5f * (dx0 + dx1), 0.30f, dx1 - dx0, 1.14f, Color4{0.004f, 0.020f, 0.008f, 1.0f});
+        const Color4 ink{0.35f, 1.0f, 0.45f, 1.0f};
+        const auto [hh, mm, ss] = local_hms();
+        char l4[32];
+        std::snprintf(l4, sizeof(l4), "XPDR 3400  %02d:%02d:%02d", hh, mm, static_cast<int>(ss));
+        mono_line("RAD1 251.300  PRE 04", dx0 + 0.05f, dx1 - 0.05f, 20, 0.73f, 0.15f, ink);
+        mono_line("RAD2 243.000  GRD   ", dx0 + 0.05f, dx1 - 0.05f, 20, 0.45f, 0.15f, ink);
+        mono_line("NAV  WP 01  TCN 075X", dx0 + 0.05f, dx1 - 0.05f, 20, 0.17f, 0.15f, ink);
+        mono_line(l4, dx0 + 0.05f, dx1 - 0.05f, 20, -0.11f, 0.15f, ink);
+        for (int i = 0; i < 4; ++i) key(dx0 + 0.20f + 0.36f * static_cast<float>(i) * (dx1 - dx0 - 0.40f) / 1.08f,
+                                        -0.55f, 0.30f, 0.20f, "");
+        key(0.5f * (dx0 + dx1), -0.84f, dx1 - dx0, 0.20f, "SCRATCH", Color4{0.55f, 0.65f, 0.55f, 1.0f});
+
+        // Data entry keypad, under the master caution.
+        attention_getter(1.32f, 0.78f, 1.18f, 0.36f, "CAUTION", r_.caution, Color4{1.0f, 0.62f, 0.05f, 1.0f});
+        static constexpr const char* kPad[12] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "CLR", "0", "ENT"};
+        for (int i = 0; i < 12; ++i) {
+            const float x = 0.94f + 0.38f * static_cast<float>(i % 3);
+            const float y = 0.38f - 0.37f * static_cast<float>(i / 3);
+            key(x, y, 0.34f, 0.31f, kPad[i]);
+        }
+    }
+
+    /// Dedicated Warnings Panel, right glareshield: the master warning
+    /// attention getter inboard, then the caption block, red warnings on
+    /// top, amber cautions below, green advisories at the bottom. The
+    /// captions are representative; the jet's full list is longer.
+    void draw_dwp() {
+        const float a = aspect(Gauge::DWP);
+        add_rect(0.0f, 0.0f, a * 2.0f, 2.0f, kPlate);
+
+        const bool red_any = r_.eng_fire || r_.engine || r_.flcs || r_.structure || r_.hyd_oil || r_.gcas;
+        attention_getter(-a + 0.50f, 0.66f, 0.86f, 0.60f, "WARNING", red_any, Color4{1.0f, 0.10f, 0.06f, 1.0f});
+        key(-a + 0.50f, 0.04f, 0.86f, 0.36f, "RESET");
+        key(-a + 0.50f, -0.40f, 0.86f, 0.36f, "LAMP TEST");
+        key(-a + 0.50f, -0.82f, 0.86f, 0.30f, "DIM");
+
+        struct Caption {
+            const char* text;
+            bool on;
+            int level; // 0 red, 1 amber, 2 green
+        };
+        const Caption cap[24] = {
+            {"L FIRE", r_.eng_fire, 0}, {"R FIRE", r_.eng_fire, 0}, {"FCS", r_.flcs || r_.structure, 0}, {"HYD", r_.hyd_oil, 0},
+            {"L ENG", r_.engine, 0},    {"R ENG", r_.engine, 0},    {"GCAS", r_.gcas, 0},             {"OXY", false, 0},
+            {"BINGO", r_.bingo, 1},     {"GEAR", r_.config, 1},     {"OVER G", r_.over_g, 1},         {"AOA", r_.high_aoa, 1},
+            {"L GEN", false, 1},        {"R GEN", false, 1},        {"ECS", false, 1},                {"LOW ALT", r_.low_alt, 1},
+            {"L PUMP", false, 1},       {"R PUMP", false, 1},       {"PITOT", false, 1},              {"CANOPY", false, 1},
+            {"AIRBRK", r_.speedbrake > 0.02, 2}, {"A/P", false, 2}, {"MIDS", false, 2},               {"DASS", false, 2},
+        };
+        const Color4 lit_ink[3] = {{1.0f, 0.22f, 0.15f, 1.0f}, {1.0f, 0.70f, 0.12f, 1.0f}, {0.35f, 1.0f, 0.42f, 1.0f}};
+        const Color4 lit_lens[3] = {{0.20f, 0.025f, 0.015f, 1.0f}, {0.20f, 0.12f, 0.010f, 1.0f}, {0.02f, 0.14f, 0.04f, 1.0f}};
+        const float x0 = -a + 1.06f, cw = (a - 0.04f - x0) / 4.0f, ch = 1.92f / 6.0f;
+        for (int i = 0; i < 24; ++i) {
+            const float x = x0 + cw * (static_cast<float>(i % 4) + 0.5f);
+            const float y = 0.96f - ch * (static_cast<float>(i / 4) + 0.5f);
+            const Caption& c = cap[i];
+            add_rect(x, y, cw - 0.03f, ch - 0.03f, kKeyRim);
+            add_rect(x, y, cw - 0.07f, ch - 0.07f, c.on ? lit_lens[c.level] : Color4{0.016f, 0.016f, 0.017f, 1.0f});
+            const float size = std::min(0.15f, (cw - 0.14f) / std::max(0.1f, text_width(c.text, 1.0f)));
+            text_at(c.text, x, y, size, c.on ? lit_ink[c.level] : Color4{0.13f, 0.13f, 0.12f, 1.0f});
+        }
+    }
+
+    /// Get-U-Home display, under the right glareshield: the reversionary
+    /// flight instrument. A small attitude sphere, airspeed left, altitude
+    /// right, Mach and AoA along the top, heading and climb rate below. The
+    /// F-35's integrated standby flight display, under its PCD, shows the
+    /// same; @p label names which it is.
+    void draw_guh(const fdm::FlightState& state, const char* label) {
+        add_rect(0.0f, 0.0f, 2.0f, 2.0f, Color4{0.012f, 0.012f, 0.013f, 1.0f});
+        add_rect(0.0f, 0.0f, 1.92f, 1.92f, Color4{0.0f, 0.0f, 0.0f, 1.0f});
+        const Color4 ink{0.92f, 0.94f, 0.92f, 1.0f};
+        const Color4 dim{0.55f, 0.58f, 0.55f, 1.0f};
+
+        // Attitude sphere, clipped to a circle.
+        constexpr float R = 0.48f, CY = 0.04f;
+        const float pitch = static_cast<float>(state.pitch() * 180.0 / 3.14159265358979);
+        const float roll = static_cast<float>(state.roll() * 180.0 / 3.14159265358979);
+        const float k = R / 40.0f;
+        auto P = [&](float x, float y) {
+            const auto [rx, ry] = rot(x, y, -roll);
+            return std::pair<float, float>{rx, ry + CY};
+        };
+        add_circle(0.0f, CY, R, Color4{0.36f, 0.24f, 0.13f, 1.0f}, 48);
+        const float yh = -pitch * k;
+        if (yh < R) {
+            std::vector<float> poly;
+            constexpr int N = 64;
+            for (int i = 0; i < N; ++i) {
+                const float a0 = 2.0f * kPi * static_cast<float>(i) / N, a1 = 2.0f * kPi * static_cast<float>(i + 1) / N;
+                const float x0 = R * std::cos(a0), y0 = R * std::sin(a0), x1 = R * std::cos(a1), y1 = R * std::sin(a1);
+                const bool in0 = y0 > yh, in1 = y1 > yh;
+                if (in0) {
+                    const auto [px, py] = P(x0, y0);
+                    poly.push_back(px); poly.push_back(py);
+                }
+                if (in0 != in1) {
+                    const float t = (yh - y0) / (y1 - y0);
+                    const auto [px, py] = P(x0 + t * (x1 - x0), yh);
+                    poly.push_back(px); poly.push_back(py);
+                }
+            }
+            if (poly.size() >= 6) add_convex(poly, Color4{0.18f, 0.45f, 0.80f, 1.0f});
+        }
+        if (std::abs(yh) < R) {
+            const float hx = std::sqrt(R * R - yh * yh);
+            const auto [ax, ay] = P(-hx, yh);
+            const auto [bx, by] = P(hx, yh);
+            add_bar(ax, ay, bx, by, 0.022f, ink);
+        }
+        for (int p = -30; p <= 30; p += 10) {
+            if (p == 0) continue;
+            const float y = (static_cast<float>(p) - pitch) * k;
+            if (std::abs(y) > R * 0.85f) continue;
+            const auto [ax, ay] = P(-0.12f, y);
+            const auto [bx, by] = P(0.12f, y);
+            add_bar(ax, ay, bx, by, 0.014f, ink);
+        }
+        add_ring(0.0f, CY, R, R + 0.03f, dim, 48);
+        // Fixed aircraft symbol.
+        const Color4 sym{1.0f, 0.85f, 0.10f, 1.0f};
+        add_bar(-0.30f, CY, -0.10f, CY, 0.035f, sym);
+        add_bar(0.10f, CY, 0.30f, CY, 0.035f, sym);
+        add_rect(0.0f, CY, 0.05f, 0.05f, sym);
+
+        // Airspeed and altitude windows.
+        char buf[24];
+        auto window = [&](float x, const char* label, const char* value) {
+            add_rect(x, CY, 0.40f, 0.22f, dim);
+            add_rect(x, CY, 0.37f, 0.19f, Color4{0.0f, 0.0f, 0.0f, 1.0f});
+            text_at(value, x, CY, std::min(0.15f, 0.34f / std::max(0.1f, text_width(value, 1.0f))), ink);
+            text_at(label, x, CY + 0.21f, 0.13f, dim);
+        };
+        std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(std::lround(std::clamp(r_.kcas, 0.0, 999.0))));
+        window(-0.75f, "IAS", buf);
+        std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(std::lround(std::clamp(r_.alt_ft, -999.0, 99999.0) / 10.0) * 10));
+        window(0.75f, "ALT", buf);
+
+        std::snprintf(buf, sizeof(buf), "M%.2f", std::clamp(r_.mach, 0.0, 9.99));
+        text_at(buf, -0.55f, 0.82f, 0.13f, ink);
+        std::snprintf(buf, sizeof(buf), "AOA %.0f", std::clamp(r_.aoa_deg, -9.0, 99.0));
+        text_at(buf, 0.55f, 0.82f, 0.13f, ink);
+        std::snprintf(buf, sizeof(buf), "%03d", static_cast<int>(std::lround(r_.heading_deg)) % 360);
+        add_rect(0.0f, -0.72f, 0.34f, 0.20f, dim);
+        add_rect(0.0f, -0.72f, 0.31f, 0.17f, Color4{0.0f, 0.0f, 0.0f, 1.0f});
+        text_at(buf, 0.0f, -0.72f, 0.14f, ink);
+        std::snprintf(buf, sizeof(buf), "%+.1f", std::clamp(r_.vvi_fpm / 1000.0, -99.0, 99.0));
+        text_at("VS", -0.70f, -0.60f, 0.12f, dim);
+        text_at(buf, -0.70f, -0.80f, 0.13f, ink);
+        text_at(label, 0.70f, -0.72f, 0.12f, dim);
+    }
+
+    double flash_t_ = 0.0; ///< Attention getter flash clock [s]
 };
 
 } // namespace fastjet::graphics

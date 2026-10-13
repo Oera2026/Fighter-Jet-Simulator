@@ -115,7 +115,10 @@ if(FASTJET_BUILD_TESTS)
         test_bfm_ai
         test_missiles
         test_evade_mode
-        test_radar_scope)
+        test_radar_scope
+        test_flight_realism
+        test_ejection
+        test_stovl)
 
     # Tests that need SDL3 and/or an OpenGL context.
     set(FASTJET_GRAPHICS_TESTS
@@ -126,7 +129,8 @@ if(FASTJET_BUILD_TESTS)
         test_flight_instruments
         test_render_pipeline
         test_terrain_render
-        test_render_fidelity)
+        test_render_fidelity
+        test_jet_cockpits)
 
     foreach(test_name IN LISTS FASTJET_CORE_TESTS)
         add_executable(${test_name} tests/${test_name}.cpp)

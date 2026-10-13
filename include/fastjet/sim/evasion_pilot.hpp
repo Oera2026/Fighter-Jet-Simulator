@@ -152,7 +152,7 @@ public:
         out.stick.pitch_stick = pitch_for(dt, self, cfg, n_cmd);
 
         // Hold high subsonic: a beaming jet needs turn performance in the
-        // endgame, not Mach 1.4 on the deck where the FLCS is at its worst.
+        // endgame, and turn rate peaks near corner speed, far below Mach 1.4.
         const double v_target = 0.85 * environment::Atmosphere1976::compute(self.state.altitude()).speed_of_sound;
         out.throttle = V < v_target ? 1.0 : 0.7;
         return out;

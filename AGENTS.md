@@ -1,31 +1,16 @@
 # Agent Guidelines & Rules
 
-## Mandatory Graphify First Step
+## Graphify Knowledge Graph
 
-This project maintains an AST-based knowledge graph in `graphify-out/`.
+This project keeps an AST-based knowledge graph in `graphify-out/`. It is generated locally and not committed.
 
-**CRITICAL RULE FOR ALL AI AGENTS:**
-Any time any agent works on, explores, or modifies this project, the agent **MUST ALWAYS** query the graphify knowledge graph **FIRST** before performing ad-hoc searches, reading raw files, or generating plans.
+When you are exploring code you don't know yet, prefer the graph over blind file searches:
 
-1. **Always Query the Graph First**:
-   When `graphify-out/graph.json` exists, execute:
-   ```bash
-   graphify query "<question or task keywords>"
-   ```
-   (or use `query_graph` if MCP is enabled).
+1. **Find relevant code**: `graphify query "<question or task keywords>"` (or `query_graph` if MCP is enabled).
+2. **Trace dependencies**: `graphify path "<nodeA>" "<nodeB>"` (or `shortest_path`) for call graphs and couplings.
+3. **Inspect a symbol**: `graphify explain "<concept>"` (or `get_node`) for a class, struct or function and its direct connections.
+4. **Wiki**: if `graphify-out/wiki/index.md` exists, it is a navigable overview of the codebase.
 
-2. **Relationships & Path Tracing**:
-   Use `graphify path "<nodeA>" "<nodeB>"` (or `shortest_path`) to inspect dependencies, call graphs, and architectural couplings.
+Skip the graph when you already know which file to open, or when the task isn't about the code (docs, config, git, agent settings). If `graphify` isn't installed or `graphify-out/graph.json` doesn't exist, carry on without it.
 
-3. **Symbol & Concept Deep Dives**:
-   Use `graphify explain "<concept>"` (or `get_node`) to inspect specific classes, structs, or functions with their direct connections.
-
-4. **Wiki Navigation**:
-   If `graphify-out/wiki/index.md` exists, navigate the generated knowledge wiki rather than inspecting raw source files blindly.
-
-5. **Graph Synchronization**:
-   After creating, modifying, or deleting any code files in the session, always run:
-   ```bash
-   graphify update .
-   ```
-   to keep the knowledge graph current (AST-only, instant, zero API cost).
+**Keeping it current**: after a session that changes code, run `graphify update .` once at the end (AST-only, fast, no API cost).

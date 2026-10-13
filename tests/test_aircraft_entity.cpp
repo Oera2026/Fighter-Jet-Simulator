@@ -5,7 +5,8 @@
  *
  * ReferenceLoop below is the viewer's physics step as it stood before the
  * extraction (IMU -> OFC -> FLCS -> speedbrake -> engine -> fuel -> gear ->
- * turbulence -> RK4 -> collision), kept verbatim apart from the input source.
+ * turbulence -> RK4 -> collision), kept verbatim apart from the input source
+ * and the combat payload now carried in the mass.
  * Both are driven with the same scripted inputs for 60 s and every state
  * component must match exactly, not within a tolerance.
  */
@@ -44,7 +45,7 @@ struct ReferenceLoop {
 
     explicit ReferenceLoop(AircraftType t)
         : type(t), engine(t), landing_gear(t), aero_model(t), flight_control_system(t), ofc(t) {
-        mass = fdm::FuelSystem::compute(engine.fuel_kg, t);
+        mass = fdm::FuelSystem::compute(engine.fuel_kg, t, aircraft::AircraftConfig::get(t).mass.combat_payload_kg);
         wind_model.base_wind_speed_mps = 5.0;
         current_imu.Nz = 1.0;
     }
@@ -66,7 +67,7 @@ struct ReferenceLoop {
         if (ofc.has_throttle_override()) active_throttle = ofc.throttle_override_value();
         engine.tvc_pitch_cmd = flight_control_system.tvc_pitch_cmd;
         const double thrust_n = engine.update(active_throttle, air, DT);
-        mass = fdm::FuelSystem::compute(engine.fuel_kg, type);
+        mass = fdm::FuelSystem::compute(engine.fuel_kg, type, aircraft::AircraftConfig::get(type).mass.combat_payload_kg);
         landing_gear.steer_cmd = pilot_cmd.rudder_pedal;
         landing_gear.brake_left = in.brake_left;
         landing_gear.brake_right = in.brake_right;
@@ -167,8 +168,9 @@ void test_airborne_manoeuvring_is_bit_identical() {
         c.speedbrake_out = t > 42.0 && t < 50.0;
         return c;
     };
+    // The F-35B in CTOL mode (STOVL never selected) is on the same pipeline.
     for (AircraftType t : {AircraftType::F16_FIGHTING_FALCON, AircraftType::F22_RAPTOR,
-                           AircraftType::A10_THUNDERBOLT}) {
+                           AircraftType::A10_THUNDERBOLT, AircraftType::F35B_LIGHTNING_II}) {
         compare(t, s, /*gear_down=*/false, script, "air work");
     }
     std::cout << "  -> PASSED\n";

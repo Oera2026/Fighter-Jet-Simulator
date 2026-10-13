@@ -4,6 +4,7 @@
 #include "pilot_commands.hpp"
 #include "imu_sensor.hpp"
 #include "pitch_controller.hpp"
+#include "pitch_trim_model.hpp"
 #include "lateral_directional_controller.hpp"
 #include "../aero/control_surfaces.hpp"
 #include "../fdm/flight_state.hpp"
@@ -28,8 +29,9 @@ public:
     // Axis Controllers
     PitchController pitch_ctrl{};
     LateralDirectionalController lat_dir_ctrl{};
+    PitchTrimModel trim_model{aircraft::AircraftType::F16_FIGHTING_FALCON};
 
-    constexpr F16FLCS() noexcept = default;
+    F16FLCS() noexcept = default;
 
     void reset(double init_de = 0.0, double init_da = 0.0, double init_dr = 0.0) noexcept {
         stabilator.reset(init_de);
@@ -37,6 +39,7 @@ public:
         rudder.reset(init_dr);
         pitch_ctrl.reset();
         lat_dir_ctrl.reset();
+        trim_model.reset();
     }
 
     /**
@@ -74,7 +77,8 @@ public:
 
         // 2. Pitch Axis Control Law
         const bool is_sat = stabilator.is_pos_limited || stabilator.is_rate_limited;
-        const double de_cmd = pitch_ctrl.update(dt, pilot, imu, is_sat);
+        const double de_cmd = pitch_ctrl.update(dt, pilot, imu, is_sat, &trim_model, mass.mass_kg,
+                                                &compute_lef_schedule);
 
         // 3. Roll & Yaw Axes Control Laws
         double da_cmd{0.0};

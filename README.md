@@ -52,7 +52,7 @@ Defined in [`include/fastjet/aero/`](include/fastjet/aero/):
   High-performance 1D linear, 2D bilinear, and 3D trilinear interpolation with boundary clamping and zero heap allocation.
 - **Lookup Tables** ([`tp1538_tables.hpp`](include/fastjet/aero/tp1538_tables.hpp)):
   NASA TP-1538 wind-tunnel lookup tables in contiguous cache-aligned memory:
-  - Longitudinal: $C_L(\alpha, \delta_e, \delta_{lef})$, $C_D(\alpha, \delta_e, \delta_{lef})$, $C_m(\alpha, \delta_e, \delta_{lef})$ ($\alpha \in [-20^\circ, 45^\circ]$, $\delta_e \in [-25^\circ, 25^\circ]$, $\delta_{lef} \in [0^\circ, 25^\circ]$).
+  - Longitudinal: $C_L(\alpha, \delta_e, \delta_{lef})$, $C_D(\alpha, \delta_e, \delta_{lef})$, $C_m(\alpha, \delta_e, \delta_{lef})$ ($\alpha \in [-90^\circ, 90^\circ]$, $\delta_e \in [-25^\circ, 25^\circ]$, $\delta_{lef} \in [0^\circ, 25^\circ]$). The wind-tunnel data covers $-20^\circ$ to $45^\circ$; the rows beyond carry the jet through the post-stall region to a flat plate at $\pm 90^\circ$ (no lift, $C_D \approx 1.8$, a growing nose-down moment, and a stabilator losing authority in the wing's wake). Past $90^\circ$ the jet is flying tail first: the force stays normal to the wing and the tail-first flow swaps the jet's ends.
   - Lateral-Directional: $C_Y(\beta, \delta_r)$, $C_l(\beta, \delta_a, \delta_r)$, $C_n(\beta, \delta_a, \delta_r)$ ($\beta \in [-30^\circ, 30^\circ]$, $\delta_a \in [-20^\circ, 20^\circ]$, $\delta_r \in [-30^\circ, 30^\circ]$).
   - Dynamic Damping: $C_{m_q}, C_{L_q}, C_{D_q}, C_{l_p}, C_{l_r}, C_{n_p}, C_{n_r}, C_{Y_p}, C_{Y_r}$ as functions of $\alpha$.
 - **Force & Moment Synthesizer** ([`f16_aero_model.hpp`](include/fastjet/aero/f16_aero_model.hpp)):
@@ -63,7 +63,13 @@ Defined in [`include/fastjet/aero/`](include/fastjet/aero/):
 
 #### Compressibility & Speedbrake Corrections
 The TP-1538 tables are low-speed wind-tunnel data carrying no Mach dependence. These are extended across the transonic and supersonic range the airframe can actually reach:
-- **Prandtl-Glauert scaling** $1/\sqrt{|1 - M^2|}$ applied to lift, sideforce and moments, capped below $M = 1$ to avoid the singularity and switching to the Ackeret form supersonically.
+- **Prandtl-Glauert scaling** $1/\sqrt{|1 - M^2|}$ applied to sideforce and moments, capped below $M = 1$ to avoid the singularity and switching to the Ackeret form supersonically. Lift goes through [`compressible_lift.hpp`](include/fastjet/aero/compressible_lift.hpp), shared with the other four airframes:
+  - the Prandtl-Glauert gain applies only where the flow is attached, fading out between $12^\circ$ and $30^\circ$ of alpha;
+  - the maximum usable lift coefficient falls with Mach (shock-induced separation): about 3/4 of its low-speed value at M0.9 and 3/5 at M1.2;
+  - drag due to lift follows the lift actually made, $\propto C_L^2$, and grows through the transonic region as leading-edge suction is lost (about 1.8 times the low-speed value by M1.05).
+
+  Scaling lift alone made every jet more efficient as it neared Mach 1 (L/D at a fixed alpha rose from about 7 at M0.3 to 11 at M0.85), and fighters sustained 8–9 G at 30,000 ft.
+- **Supersonic stability**: the aerodynamic centre moves aft through the transonic region, adding $\Delta C_m = -0.12\,C_L$ by M1.2. The table's relaxed stability is a subsonic property.
 - **Wave drag** rising from a critical Mach of 0.86 through a transonic peak of $\Delta C_D = 0.026$ at $M = 1.05$, decaying to a supersonic plateau of 0.017.
 - **Mach tuck**: the aft aerodynamic-centre shift contributes $\Delta C_m = -0.030$ nose-down through the transonic region.
 - **Speedbrake**: $\Delta C_D = +0.025$ at full extension, linear in position, with a small nose-up pitch increment.
@@ -81,15 +87,26 @@ The TP-1538 tables are low-speed wind-tunnel data carrying no Mach dependence. T
 
 | Condition | Simulated | Real F-16C |
 |---|---|---|
-| Max level speed, 11,000 m | Mach 2.06 | Mach 2.05 |
-| Max level speed, sea level | Mach 1.14 ($q$ = 92 kPa) | Mach ~1.05, $q$ limit 102 kPa |
-| Max dry (MIL) speed, 11,000 m | Mach 1.23 | subsonic–low supersonic |
+| Max level speed, 11,000 m | Mach 1.93 | Mach 2.05 |
+| Max level speed, sea level | Mach 1.13 ($q$ = 90 kPa) | Mach ~1.05, $q$ limit 102 kPa |
+| Max dry (MIL) speed, 11,000 m | Mach 1.0 | subsonic–low supersonic |
 | Military thrust, SLS | 75.6 kN | 76.3 kN (17,155 lbf) |
 | Max afterburner, SLS | 129.0 kN | 131.6 kN (29,588 lbf) |
 | Thrust-to-weight, combat | 1.17 | ~1.10 |
 
 These are pinned by `test_performance_envelope.cpp`, which flies the full 6-DoF model with an
 altitude-hold autopilot rather than asserting on constants.
+
+Turn performance, with half fuel and the combat payload (pinned by `test_flight_realism.cpp`):
+
+| F-16C | Simulated | Published |
+|---|---|---|
+| Sustained turn, sea level, M0.6 | 8.5 G, 23°/s | ~20–21°/s |
+| Sustained turn, 15,000 ft, M0.8 | 7.6 G, 16.5°/s | ~15°/s |
+| Sustained turn, 30,000 ft, M0.9 | 3.6 G, 7.2°/s | 3.5–4.5 G |
+| Maximum lift coefficient, M0.3 → M0.9 | 1.51 → 1.18 | falls with Mach |
+
+The other four airframes use synthesised polars ([`aircraft_aero_model.hpp`](include/fastjet/aero/aircraft_aero_model.hpp)) with the same compressibility treatment and a per-airframe stall: lift rounds off to $C_{L,max}$, holds, then falls away to a flat plate. Drag due to lift is $K\,C_{L_\alpha}\,C_L \tan\alpha$, which equals the polar's $K C_L^2$ on the lift line but keeps climbing with alpha once the lift is capped. The straight-winged A-10 stalls more sharply than the delta and chined wings of the Typhoon and F-22, whose vortex lift holds to higher alpha.
 
 All corrections default to `mach = 0`, which reproduces the original incompressible table data bit-for-bit.
 
@@ -103,9 +120,11 @@ Defined in [`include/fastjet/flcs/`](include/fastjet/flcs/):
   - Automatic Leading-Edge Flap (LEF) schedule vs $\alpha$ and $\bar{q}$.
 - **Pitch Axis Control Law** ([`pitch_controller.hpp`](include/fastjet/flcs/pitch_controller.hpp)):
   - Blends pitch rate ($q_{cmd}$) at low dynamic pressure ($\bar{q} \le 2000$ Pa) and normal acceleration ($N_{z,cmd}$) at high dynamic pressure ($\bar{q} \ge 8000$ Pa).
-  - Hard G-limiter strictly clamped to $[-3.0\text{ G}, +9.0\text{ G}]$.
-  - Hard Angle-of-Attack limiter actively overrides pitch-up command to cap $\alpha \le 25.5^\circ$.
-  - Closed-loop PI controller with pitch rate damping and integrator anti-windup.
+  - Hard G-limiter strictly clamped to $[-3.0\text{ G}, +9.0\text{ G}]$. Full aft stick settles at the limit wherever the wing can make it, and anything past it is pushed back.
+  - Hard Angle-of-Attack limiter actively overrides pitch-up command to cap $\alpha \le 25.5^\circ$, and a negative limit at $-12^\circ$.
+  - Closed-loop PI controller with pitch rate damping and integrator anti-windup, gain-scheduled down above 30 kPa of dynamic pressure. Unscheduled, a full pull at Mach 1.2 on the deck diverged to about 50 G.
+  - Rolling-pull G relief: the limit drops by 1.8 G at full roll rate and the integrator holds while rolling, as on the real jet. Integrating through a full-rate roll wound up trim that fired the jet past 11 G when the roll stopped.
+  - The F-15EX, Typhoon and F-22 share one G-command law ([`aircraft_flcs.hpp`](include/fastjet/flcs/aircraft_flcs.hpp)) with per-airframe gains and the same protections; the A-10's feel system limits a push to about $-3$ G.
 - **Roll & Yaw Axes Control Laws** ([`lateral_directional_controller.hpp`](include/fastjet/flcs/lateral_directional_controller.hpp)):
   - Roll-rate command up to $300^\circ/\text{s}$ with automatic roll attenuation at high AoA ($\alpha \in [15^\circ, 25.5^\circ]$).
   - Aileron-Rudder Interconnect (ARI) providing turn coordination and eliminating adverse yaw.
@@ -116,10 +135,11 @@ Defined in [`include/fastjet/propulsion/`](include/fastjet/propulsion/), [`inclu
 - **F110-GE-129 Engine Model** ([`f110_engine.hpp`](include/fastjet/propulsion/f110_engine.hpp)):
   - Detent schedule (Cutoff / Idle / Military / Afterburner) driving sea-level static ratings of 4.45 kN idle, 75.6 kN military, and 129 kN full reheat.
   - **Installed thrust lapse** with density ratio and Mach: $F = F_{SL} \cdot \sigma^{n} (1 + k_{ram} M^2)$, where $n = 0.85$ dry and $1.00$ in reheat. Thrust falls from 75.5 kN at sea level to 23.6 kN at 12 km.
-  - **Spool dynamics** as a first-order lag with direction-dependent time constants ($\tau_{up} = 3.2$ s, $\tau_{down} = 1.6$ s, $\tau_{AB} = 0.6$ s), integrated by the exact discrete solution so the response is stable at any timestep.
+  - **Spool dynamics** as a first-order lag with direction-dependent time constants ($\tau_{up} = 3.2$ s, $\tau_{down} = 1.6$ s, $\tau_{AB} = 0.6$ s), integrated by the exact discrete solution so the response is stable at any timestep. In the flyable jets ([`multi_engine.hpp`](include/fastjet/propulsion/multi_engine.hpp)) the core and the afterburner are separate: the afterburner lights only once the core reaches 80% of military thrust, so idle to full reheat takes about 6 s in the F-16 (4 s in the F-22), not 0.6 s.
   - **Fuel burn** via thrust-specific fuel consumption (0.75 lb/lbf/hr dry, 2.00 wet) with flame-out when the tanks run dry.
 - **Variable Mass & Inertia** ([`fuel_system.hpp`](include/fastjet/fdm/fuel_system.hpp)):
   - Gross mass and the full inertia tensor are rebuilt every timestep from the fuel remaining. A full internal load of 3,175 kg raises $I_{yy}$ by 34%, measurably reducing pitch agility.
+  - Every jet also carries a fixed combat payload: pilot, full gun ammunition and a typical air-to-air loadout with its launchers (F-16 800 kg, F-15EX 1,300, Typhoon 1,100, F-22 1,500, A-10 1,500, F-35B 1,050 with its 220-round gun pod).
 - **Three-Point Landing Gear** ([`landing_gear.hpp`](include/fastjet/gear/landing_gear.hpp)):
   - Oleo-pneumatic struts modelled as spring-dampers, sized so the static stance carries **12% on the nose and 88% on the mains** — matching the real aircraft's CG position — with the reaction balancing weight to within 0.01%.
   - **Tyre cornering-stiffness** side-force model (force proportional to slip angle, saturating at the friction limit) rather than pure Coulomb friction, which is what makes ground handling stable and self-centring.
@@ -209,12 +229,12 @@ The frame itself is GPU-bound: physics costs about 3 µs per 200 Hz step and the
 
 ### 12. Evade Mode: Surviving a Missile Shot
 
-From the main menu (**EVADE**) or `--evade [easy|medium|hard|expert]`: a bandit starts in your six and hunts you with radar missiles and his gun. You win by outlasting his fuel, by leaving him with nothing to shoot, by getting away, or by shooting him down. Every level flies the same physics. Difficulty changes the pilot, his missile load, his launch discipline and his head start ([`engagement.hpp`](include/fastjet/sim/engagement.hpp)):
+From the main menu (**EVADE**) or `--evade [easy|medium|hard|expert]`. The menu takes two steps: pick the threat level (each shows the bandit, his weapons, his head start and how long you must survive), then your jet (it opens on the one you're flying; the bandit flies the same type), then **START EVADE**. A bandit starts in your six and hunts you with radar missiles and his gun. You win by outlasting his fuel, by leaving him with nothing to shoot, by getting away, or by shooting him down. Every level flies the same physics. Difficulty changes the pilot, his missile load, his launch discipline and his head start ([`engagement.hpp`](include/fastjet/sim/engagement.hpp)):
 
 | Level | Bandit | Weapons | Start | Shoots when |
 |---|---|---|---|---|
 | EASY | Novice | Gun | 3 nm astern, co-speed | In gun range |
-| MEDIUM | Veteran | 2 × AIM-120 + gun | 10 nm, +300 m, +20 m/s | The missile can reach you if you hold course (Rmax) |
+| MEDIUM | Veteran | 2 × AIM-120 + gun | 10 nm, +300 m, +20 m/s | The missile can reach you if you hold course (Rmax), never from inside 3 km |
 | HARD | Ace | 4 × AIM-120 + gun | 6.5 nm, +600 m, +40 m/s | You can't outrun it even turning cold in reheat (no-escape zone) |
 | EXPERT | Ace | 4 × AIM-120, two per shot | 6 nm, +900 m, +60 m/s | No-escape, two-missile salvo |
 
@@ -222,15 +242,24 @@ From the main menu (**EVADE**) or `--evade [easy|medium|hard|expert]`: a bandit 
 - **Radar and RWR** ([`radar.hpp`](include/fastjet/sim/radar.hpp)): the bandit's radar searches, locks after the operator's acquisition time, coasts on memory through dropouts and loses lock outside its gimbal or range. Radars and seekers are pulse-doppler, so a target flying 90° to the line of sight with ground behind it sits in the clutter **notch** and disappears. Chaff blooms into the tracker's range, angle and doppler gates, so it only works when you are beaming. Your RWR hears the search, the lock and the launch. The A-10 has no air-to-air radar.
 - **Launch decisions** ([`missile_shooter.hpp`](include/fastjet/sim/missile_shooter.hpp)) fly the missile's own dynamics and guidance forward from the radar track, so a shot is only taken when the missile can get there. The test requires the prediction to match the live missile exactly.
 - **Cockpit**: the RWR azimuth scope on the upper-left panel shows the emitter ("16"), a lock diamond and a flashing "M" for an inbound missile. The HUD shows `LOCK 6` / `LAUNCH 6` (clock bearing) and the chaff count. The headset carries the RWR tones: three chirps for a new emitter, a steady beep-beep while you are locked, and a fast warble while a missile is guided at you.
-- **What works is what works in the jet**: fly straight and you die at every level. Running in reheat drags a max-range shot out of energy but not a no-escape shot. Against those, beam the missile (put it at 3 or 9 o'clock), get low so there's ground behind you, chaff while beaming, and break hard across its line of sight in the last second or two. [`evasion_pilot.hpp`](include/fastjet/sim/evasion_pilot.hpp) flies exactly that from the RWR alone (`--evade hard --watch`). Across 24 seeds it survives the EASY/MEDIUM/HARD/EXPERT bandit 24/15/6/2 times.
+- **What works is what works in the jet**: fly straight and you die at every level. Running in reheat drags a max-range shot out of energy but not a no-escape shot. Against those, beam the missile (put it at 3 or 9 o'clock), get low so there's ground behind you, chaff while beaming, and break hard across its line of sight in the last second or two. [`evasion_pilot.hpp`](include/fastjet/sim/evasion_pilot.hpp) flies exactly that from the RWR alone (`--evade hard --watch`). Across 24 seeds it survives the EASY/MEDIUM/HARD/EXPERT bandit 24/16/1/0 times.
 
 ### 13. Fire-Control Radar (FCR Page)
 
 The left MFD shows the F-16's APG-68-class radar page ([`radar_scope.hpp`](include/fastjet/sim/radar_scope.hpp), drawn in [`flight_instruments.hpp`](include/fastjet/graphics/flight_instruments.hpp)), in every mode and for every jet except the A-10, which has no air-to-air radar. It is a B-scope: azimuth across (±60°), range up from your jet at the bottom edge.
 
-- **RWS search** sweeps a beam stabilised against roll and pitch through a 4-bar, ±60° pattern at 65°/s, so one full scan takes about 7.4 s. A jet shows as a brick only when the beam crosses it and the radar can actually see it. It has to be inside the scan volume and detection range, and outside the doppler notch: a jet beaming you with ground behind it vanishes, as it does from the bandit's radar. Bricks stay where the jet was painted and fade over three frames. RWS tells you nothing about heading, speed or height.
+- **RWS search** sweeps a beam stabilised against roll and pitch through a 4-bar pattern at 65°/s. `O` picks the azimuth width, centred on the nose: `A6` (±60°, one full scan in about 7.4 s), `A3` (±30°, 3.7 s) or `A1` (±10°, 1.2 s). Narrow scans show their edges as dashed lines. A jet shows as a brick only when the beam crosses it and the radar can actually see it. It has to be inside the scan volume and detection range, and outside the doppler notch: a jet beaming you with ground behind it vanishes, as it does from the bandit's radar. Bricks stay where the jet was painted and fade over three frames. RWS tells you nothing about heading, speed or height.
 - **Around the scope**: the OSB labels (`CRM`/`RWS`, range scale with its arrows, `A6`, `4B`), an artificial horizon, and the antenna azimuth and elevation carets. The acquisition cursor sits on the nearest newest brick, and the two numbers beside it are the top and bottom of the altitude block the scan covers at that range, in thousands of feet. A jet above or below that block is invisible until you move the antenna with `=` / `-`.
-- **STT**: `L` locks the brick under the cursor through the jet's own radar, so the other jet's RWR hears the lock. The target gets a filled square with a velocity vector and its altitude. The top line shows aspect (`15L`: 150° off the target's tail, you on its left), its track, its ground speed and the closure in knots. The range scale follows the target. Through a notch the lock coasts on memory and the symbol flashes. If the lock breaks, the radar goes back to RWS and waits for you to lock again.
+- **STT**: `L` locks the brick under the cursor through the jet's own radar, so the other jet's RWR hears the lock. The target gets a filled square with a velocity vector and its altitude. The top line shows aspect (`15L`: 150° off the target's tail, you on its left), its track, its ground speed and the closure in knots. The range scale follows the target. Through a notch the lock coasts on memory and the symbol flashes. If the lock breaks, the radar goes back to RWS and waits for you to lock again. If the jet has left the radar's view by the time you designate its brick, the lock fails and the console says so.
+- **ACM (dogfight)**: RWS is a long-range tool. Its 4 bars cover only about 10° of elevation, so a bandit a mile away, above or below the nose in a turning fight, is never painted. `K` switches to air combat mode. It uses fast scans referenced to the nose and locks the first jet it finds inside 10 nm, with no designation: `20` (20×30°, the HUD field of view), `60` (10×60°, a vertical slice from 10° below the nose to 50° above it, for a bandit up in your lift vector) and `BORE` (a fixed beam down the nose). `O` cycles the three patterns. The scope shows the scan's azimuth corridor and its elevation band on the elevation scale. `L` drops a lock and the scan starts again; `K` returns to CRM and your RWS range scale.
+- **Datalink picture**: the radar sees only what is inside its ±60° cone and its current scan, which in a turning fight is rarely the bandit. Over every mode the page also draws the Link 16 picture: each other jet is a red hollow diamond at its bearing and range, with a line along its track and its altitude in thousands of feet. When the radar locks it, the green radar symbol sits inside the diamond. A jet off the side of the scope (abeam or behind you) is a red arrowhead pinned to that side at its range. One beyond the range scale is an arrowhead on the top edge.
+- **Sweep display** (right MFD during a dogfight or evade, [`sweep_scope.hpp`](include/fastjet/sim/sweep_scope.hpp)): a heading-up 360° scope with you in the middle. A beam turns once every 2.4 s. Each jet it crosses lights up as a red blip, with its track and altitude, and fades until the next pass paints it again. Blips hold where the jet was when painted. The scale (1, 2, 5, 10, 20 or 40 nm) fits the nearest jet. Dashed lines mark the FCR's ±60° cone, and the bottom line calls the nearest jet by clock position, range and altitude. A fighter's own radar only scans the sector ahead, so this is the all-round picture an AWACS would send over the datalink, drawn the way a search radar draws it.
+
+### 14. Limits of the Airframe
+
+- **Over-G** ([`damage_model.hpp`](include/fastjet/sim/damage_model.hpp)): each jet's structure is rated for its G limit (+9/−3 for the fighters, +7.33/−3 for the A-10). Past 1.03 times the limit the jet is logged as overstressed. Past 1.2 times the wings take a permanent set: less roll authority, a weaker structure and a red `WING OVERSTRESS` caution. At 1.5 times the airframe fails (`STRUCTURE FAILED`, a loss marked `(OVER-G)` in the debrief). The load is filtered over 50 ms, so a single integration step's spike does not count, and it is the air load only, not the landing gear. The fly-by-wire jets stay inside their limits by themselves; the mechanically controlled A-10 does not.
+- **Pulling G takes effort**: from the keyboard a press of the pull key is a firm ~6 G pull. Hold it and the stick walks on to the stop over about a second, reaching the full 9 G. A hardware stick has the same shape through its force curve (80% deflection is about 6 G). The cockpit `OVER-G WARNING` lights within 3% of the limit, and G-LOC waits for anyone who holds 8–9 G too long.
+- **Stall**: every jet can stall. Past the stall, lift falls away and drag climbs towards a flat plate's; the flight control system's AoA limiter keeps a fly-by-wire jet out of it, and the A-10 needs the pilot to.
 
 ---
 
@@ -246,6 +275,7 @@ The left MFD shows the F-16's APG-68-class radar page ([`radar_scope.hpp`](inclu
 │   └── fastjet/
 │       ├── aero/
 │       │   ├── control_surfaces.hpp  # F-16 control surface deflections and limits
+│       │   ├── compressible_lift.hpp # Mach effects on lift, CLmax and drag due to lift
 │       │   ├── f16_aero_model.hpp    # Total force & moment synthesizer
 │       │   ├── interpolator.hpp      # Zero-allocation 1D/2D/3D interpolators
 │       │   └── tp1538_tables.hpp     # NASA TP-1538 wind-tunnel lookup tables
@@ -320,6 +350,7 @@ The left MFD shows the F-16's APG-68-class radar page ([`radar_scope.hpp`](inclu
     ├── test_flcs_level_flight.cpp    # 60-second hands-off level flight stabilization
     ├── test_flcs_pullup.cpp          # Full aft stick +9G and 25.5 AoA limiter test
     ├── test_flight_instruments.cpp   # FBO render-to-texture and instrument logic
+    ├── test_flight_realism.cpp       # Turn performance, stall, Mach lift, G limits, spool, over-G
     ├── test_force_curves.cpp         # F-16 force-sensing polynomial response curves
     ├── test_gyroscopic.cpp           # Rotational dynamics & momentum conservation
     ├── test_hud_collimation.cpp      # Collimated optical infinity math & FPM projection
@@ -369,7 +400,7 @@ make viewer
 
 | Key | Function |
 |-----|----------|
-| Arrow Keys | Pitch and roll stick commands |
+| Arrow Keys | Pitch and roll stick commands (hold the pull to walk the stick on to the stop: ~6 G on the press, 9 G after about a second) |
 | A / D | Rudder pedals (also nosewheel steering on the ground) |
 | Shift / Ctrl | Throttle increase / decrease (1.5 s idle to full reheat) |
 | PageUp / PageDown | Alternative throttle bindings |
@@ -384,13 +415,34 @@ make viewer
 | F | Fire gun |
 | C | Dispense chaff (two bundles per press) |
 | L | Radar: lock the contact under the cursor (STT) / drop the lock |
-| `[` / `]` | Radar range scale down / up (10, 20, 40, 80 nm) |
+| K | Radar mode: CRM (RWS search) / ACM (dogfight auto-lock) |
+| O | Radar scan: A6 / A3 / A1 azimuth (CRM), 20×30 / 10×60 / BORE (ACM) |
+| `[` / `]` | Radar range scale down / up (5, 10, 20, 40, 80 nm) |
 | `=` / `-` | Radar antenna elevation up / down (hold) |
 | P | Left MFD page: FCR radar / FLCS |
+| F3 / F4 / F5 / F6 / F7 / F12 | Select the F-16C / F-15EX / Typhoon / F-22A / A-10C / F-35B (F8 cycles; M opens the airframe menu, keys 1–6) |
+| S | F-35B STOVL/HOOK button: convert to STOVL (~15 s) / reconvert to CTOL. HOTAS: throttle button 7 (`btn_stovl_mode`) |
 | F9 / F10 / F11 | New fight / cycle set-up (merge, perch, range, evade) / cycle bandit skill or evade difficulty |
 | Esc | Exit |
 
 Run with `--profile` to print frame timing and the GPU cost of each render pass every two seconds.
+
+#### F-35B STOVL
+
+The F-35B (`--aircraft f35b`, or F12) flies conventionally until the STOVL/HOOK button (S) converts it: the LiftFan and roll-post doors open, the clutch engages and the swivelling nozzle comes down. Conversion needs less than 250 kt. Once converted, the unified control laws change what the inceptors do:
+
+- **Throttle** commands acceleration, not thrust. Its hold detent at 50% holds speed, and below 25 kt it holds zero ground speed (a hover). Fore or aft of the detent the jet accelerates or decelerates. When the jet converts, the keyboard lever snaps to the detent. Shift/Ctrl stop on the detent with a click: release and press again to go through it.
+- **Stick** fore/aft commands climb or sink rate in the hover (aft = up, at most 7 ft/s down). Lateral stick banks the jet to translate sideways.
+- **Pedals** command yaw rate.
+
+Start scenarios:
+
+| Flag | Start |
+|------|-------|
+| `--hover` | Converted, hovering with the wheels 50 ft above the runway at vertical-landing weight (17,200 kg / 37,900 lb, about 3,300 lb of fuel) |
+| `--stovl-approach` | Converted, 120 kt at 1,000 ft, 3 nm short of the runway |
+
+Both flags select the F-35B if another jet was asked for. A runway start works too: select STOVL before the roll for a short takeoff.
 
 ### CMake
 
@@ -421,7 +473,8 @@ make test_gyroscopic         # Validates torque-free angular momentum conservati
 make test_performance        # Validates zero heap allocation and measures throughput
 make test_missiles           # Validates missile kinematics, PN, launch zones, notch, chaff, radar lock and RWR
 make test_evade_mode         # Validates evade set-ups, lock warning, end rules and what defeats each difficulty
-make test_radar_scope        # Validates the FCR scan, what it can see, STT lock and range scales
+make test_radar_scope        # Validates the FCR scans, what they can see, STT lock, ACM auto-acquisition and range scales
+make test_flight_realism     # Validates turn performance, stall, Mach effects on lift, G limits, spool-up and over-G damage
 ```
 
 ---

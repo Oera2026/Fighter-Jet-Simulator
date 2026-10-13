@@ -91,6 +91,16 @@ void test_virtual_hotas_to_flcs_pipeline() {
     // Trim hat added nose-up offset
     assert(input_mgr.trim_hat.trim_pitch > 0.002);
 
+    // STOVL/HOOK button: one press is one edge, however long it is held.
+    v_driver->set_button(input_mgr.config.btn_stovl_mode, true);
+    input_mgr.update(DT);
+    assert(input_mgr.stovl_button_pressed);
+    input_mgr.update(DT);
+    assert(!input_mgr.stovl_button_pressed);
+    v_driver->set_button(input_mgr.config.btn_stovl_mode, false);
+    input_mgr.update(DT);
+    assert(!input_mgr.stovl_button_pressed);
+
     // 4. Drive FLCS with conditioned PilotCommands
     const AirData ad = Atmosphere1976::compute(state.altitude(), state.airspeed());
     ControlSurfaces cur_surf(flcs.stabilator.position, flcs.flaperon.position, flcs.rudder.position);

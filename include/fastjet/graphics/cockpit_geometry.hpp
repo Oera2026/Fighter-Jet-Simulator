@@ -46,6 +46,20 @@ private:
 
     bool initialized_ = false;
 
+    // The built-in shell, displays and combiner, kept so they can be
+    // restored after another airframe's cockpit has been loaded.
+    std::vector<Vertex3D> default_shell_;
+    std::vector<Vertex3D> default_mfd_;
+    std::vector<Vertex3D> default_glass_;
+
+    /// @brief Replaces a buffer's vertices (its vertex array keeps its layout).
+    static GLsizei upload_vertices(GLuint vbo, const std::vector<Vertex3D>& v) {
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(v.size() * sizeof(Vertex3D)), v.data(), GL_STATIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        return static_cast<GLsizei>(v.size());
+    }
+
     void build_cockpit_shell() {
         std::vector<Vertex3D> vertices;
 
@@ -451,6 +465,7 @@ private:
              -0.4f, 0.0f, -0.9f, rail_grey);
 
         shell_vertex_count_ = static_cast<GLsizei>(vertices.size());
+        default_shell_ = vertices;
 
         glGenVertexArrays(1, &shell_vao_);
         glGenBuffers(1, &shell_vbo_);
@@ -524,6 +539,7 @@ private:
         add_screen( 0.000f, -0.470f, 0.070f, 0.040f,  0.25f, 0.75f, 0.00f, 0.50f);
 
         mfd_vertex_count_ = static_cast<GLsizei>(vertices.size());
+        default_mfd_ = vertices;
 
         glGenVertexArrays(1, &mfd_vao_);
         glGenBuffers(1, &mfd_vbo_);
@@ -617,6 +633,7 @@ private:
         vertices.push_back(v0); vertices.push_back(v2); vertices.push_back(v3);
 
         glass_vertex_count_ = static_cast<GLsizei>(vertices.size());
+        default_glass_ = vertices;
 
         glGenVertexArrays(1, &glass_vao_);
         glGenBuffers(1, &glass_vbo_);
@@ -688,6 +705,25 @@ public:
     }
 
     [[nodiscard]] bool has_gauges() const noexcept { return gauge_vertex_count_ > 0; }
+
+    /// @brief Replaces the cockpit shell (another airframe's interior).
+    void use_shell(const std::vector<Vertex3D>& vertices) {
+        if (initialized_) shell_vertex_count_ = upload_vertices(shell_vbo_, vertices);
+    }
+
+    /// @brief Replaces the HUD combiner glass (the HUD's stencil aperture).
+    void use_combiner(const std::vector<Vertex3D>& vertices) {
+        if (initialized_) glass_vertex_count_ = upload_vertices(glass_vbo_, vertices);
+    }
+
+    /// @brief Back to the built-in shell, displays and combiner, with no gauges.
+    void restore_default() {
+        if (!initialized_) return;
+        shell_vertex_count_ = upload_vertices(shell_vbo_, default_shell_);
+        mfd_vertex_count_ = upload_vertices(mfd_vbo_, default_mfd_);
+        glass_vertex_count_ = upload_vertices(glass_vbo_, default_glass_);
+        gauge_vertex_count_ = 0;
+    }
 
     /// @brief Render MFD display quads
     void draw_mfd() const noexcept {

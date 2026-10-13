@@ -2,8 +2,36 @@
 
 #include "fastjet/aircraft/aircraft_type.hpp"
 #include "fastjet/math/vector3.hpp"
+#include "fastjet/sim/missile.hpp"
 
 namespace fastjet::sim {
+
+/// @brief Missile configuration carried by an airframe.
+struct AirframeMissileLoadout {
+    MissileSpec mrm_spec{};
+    int mrm_count{0};
+    MissileSpec srm_spec{};
+    int srm_count{0};
+};
+
+[[nodiscard]] inline AirframeMissileLoadout airframe_missile_loadout(aircraft::AircraftType type) noexcept {
+    using T = aircraft::AircraftType;
+    switch (type) {
+        case T::F16_FIGHTING_FALCON:
+            return {missile_specs::aim120c(), 2, missile_specs::aim9x(), 2};
+        case T::F15EX_EAGLE_II:
+            return {missile_specs::aim120c(), 4, missile_specs::aim9x(), 2};
+        case T::EUROFIGHTER_TYPHOON:
+            return {missile_specs::aim120c(), 4, missile_specs::asraam(), 2};
+        case T::F22_RAPTOR:
+            return {missile_specs::aim120c(), 6, missile_specs::aim9x(), 2};
+        case T::A10_THUNDERBOLT:
+            return {MissileSpec{}, 0, missile_specs::aim9m(), 2};
+        case T::F35B_LIGHTNING_II:
+            return {missile_specs::aim120c(), 4, missile_specs::aim9x(), 2};
+    }
+    return {};
+}
 
 /// @brief Internal gun installation.
 ///
@@ -57,6 +85,11 @@ struct AirframeCombatSpec {
             // Firing barrel on the centreline under the nose.
             g = {"GAU-8/A", 3900.0, 1010.0, 1174, 0.55, 2.5, 0.425, 0.030, 0.26, 2.4, {6.5, 0.0, 0.6}, 0.0};
             break;
+        case T::F35B_LIGHTNING_II:
+            // Four-barrel GAU-22/A in the centreline pod (GD-OTS: 3,300 rds/min,
+            // 1,085 m/s), 220 rounds: four seconds of fire.
+            g = {"GAU-22/A", 3300.0, 1085.0, 220, 0.25, 2.5, 0.180, 0.025, 0.29, 1.5, {2.5, 0.0, 1.1}, 0.0};
+            break;
     }
     return g;
 }
@@ -70,6 +103,7 @@ struct AirframeCombatSpec {
         case T::F22_RAPTOR:          return {18.92, 1.15, 13.56, 0.40, 9.5};
         // Titanium tub, redundant structure and manual reversion: built to absorb hits.
         case T::A10_THUNDERBOLT:     return {16.26, 1.00, 17.53, 0.45, 16.0};
+        case T::F35B_LIGHTNING_II:   return {15.60, 1.05, 10.70, 0.40, 9.0};
     }
     return {};
 }

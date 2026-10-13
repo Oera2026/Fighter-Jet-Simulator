@@ -7,6 +7,7 @@
 #include "fastjet/graphics/terrain_field.hpp"
 #include "fastjet/graphics/terrain_mesh.hpp"
 #include "fastjet/graphics/terrain_textures.hpp"
+#include "fastjet/graphics/canyon_glsl.hpp"
 #include "fastjet/fdm/flight_state.hpp"
 #include <algorithm>
 #include <cmath>
@@ -541,11 +542,14 @@ public:
             out float vHeight;
             out float vDist;
             out vec3  vWorld;
-        )") + haze_vert_common + R"(
+            out vec2  vCanyon;
+        )") + haze_vert_common + canyon_glsl(/*material=*/false) + R"(
             void main() {
                 vNormal = aNormal;
                 vHeight = aHeight;
                 vWorld  = aPos;
+                // Canyon coordinates vary smoothly: per vertex is enough.
+                vCanyon = canyon_sd(aPos.xy);
                 vDist   = length(aPos - uEyeNed);
                 compute_haze(aPos, uEyeNed);
                 gl_Position = uViewProj * vec4(aPos, 1.0);
@@ -605,12 +609,17 @@ public:
             in float vHeight;
             in float vDist;
             in vec3  vWorld;
+            in vec2  vCanyon;
             out vec4 FragColor;
-        )") + ground_common + R"(
+        )") + ground_common + canyon_glsl() + R"(
             void main() {
                 vec3 n = normalize(vNormal);
                 float level = clamp(-n.z, 0.0, 1.0);
                 GroundSample g = ground_baked(vWorld, vDist);
+                // Canyon rock bands and the river are finer than the bake's
+                // texels: repaint them per pixel while they can be resolved.
+                float crisp = 1.0 - smoothstep(5000.0, 14000.0, vDist);
+                if (crisp > 0.0) canyon_shade(g, vCanyon, vWorld, vHeight, level, crisp);
                 n = detail_normal(n, vWorld.xy, vDist, 1.0 - g.water);
                 float sky_occ = 0.55 + 0.45 * level;
                 FragColor = scene_output(shade_ground(g, vWorld, n, sky_occ), 1.0);

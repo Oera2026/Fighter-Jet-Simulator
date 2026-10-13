@@ -218,7 +218,9 @@ void test_cockpit_gauges() {
         assert(std::abs(w / h - cell_aspect) / cell_aspect < 0.12);
     }
     for (int i = 0; i < static_cast<int>(Gauge::COUNT); ++i) {
-        assert(seen[static_cast<size_t>(i)] == (static_cast<Gauge>(i) == Gauge::GEAR_LAMP ? 3 : 1));
+        // The Typhoon glareshield faces (MDEF onward) are not on the F-16C.
+        const int want = static_cast<Gauge>(i) >= Gauge::MDEF ? 0 : (static_cast<Gauge>(i) == Gauge::GEAR_LAMP ? 3 : 1);
+        assert(seen[static_cast<size_t>(i)] == want);
     }
     std::cout << "PASS (" << quads.size() << " faces)\n";
 }

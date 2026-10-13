@@ -11,17 +11,25 @@
 
 namespace fastjet::sim {
 
+/// @brief How a missile finds its target.
+enum class SeekerType : uint8_t {
+    ACTIVE_RADAR, ///< Datalink midcourse, then its own radar (AIM-120, Meteor): heard by the RWR
+    INFRARED,     ///< Heat seeker locked before launch (AIM-9, IRIS-T): silent on the RWR
+};
+
 /**
- * @brief An active-radar, medium-range air-to-air missile.
+ * @brief An air-to-air missile.
  *
- * Figures are representative of the AIM-120C from open sources: a 157 kg
+ * The defaults are representative of the AIM-120C from open sources: a 157 kg
  * round on a 178 mm body with a ~5 s boost motor, Mach 3+ burnout
- * speed and a 40 G airframe. They are not exact.
+ * speed and a 40 G airframe. They are not exact. The other rounds are the
+ * named specs below (missile_specs::).
  *
  * Aerodynamic parameters are referenced to the body cross-section. The
  * missile's lift (its turn capability) comes from dynamic pressure, so a missile
  * that has coasted slow cannot turn hard. That is how a missile is defeated
- * kinematically.
+ * kinematically. A thrust-vectored missile can also turn on its motor while
+ * it burns, which is what lets an AIM-9X come off the rail 90 deg off the nose.
  */
 struct MissileSpec {
     const char* name{"AIM-120C"};
@@ -53,8 +61,21 @@ struct MissileSpec {
     // Launch envelope limits (the aircraft's launch constraints, not the flyout)
     double min_launch_range_m{900.0};
     double max_launch_ata_deg{45.0};
+    // Seeker type, sustainer and thrust vectoring (all off for the AIM-120C)
+    SeekerType seeker{SeekerType::ACTIVE_RADAR};
+    const char* short_name{"120C"}; ///< HUD weapon legend
+    double sustain_thrust_n{0.0};   ///< Sustainer (or ramjet) thrust after the boost
+    double sustain_time_s{0.0};
+    double tvc_deg{0.0};            ///< Thrust-vector deflection while the motor burns
+    // Infrared seeker (SeekerType::INFRARED)
+    double ir_lock_range_m{0.0};    ///< Lock range against a fighter's tail at military power (signature 1)
+    double ir_fov_deg{0.0};         ///< Track gate: a flare igniting inside it competes for the track
+    double flare_susceptibility{0.0}; ///< Share of a flare's relative brightness that steals the track
+    double flare_reject_s{0.0};     ///< Time a decoyed seeker takes to reject the flare (counter-countermeasures)
 
     [[nodiscard]] double ref_area() const noexcept { return 0.25 * M_PI * diameter_m * diameter_m; }
+    [[nodiscard]] double motor_time_s() const noexcept { return burn_time_s + sustain_time_s; }
+    [[nodiscard]] bool infrared() const noexcept { return seeker == SeekerType::INFRARED; }
 
     /// @brief Zero-lift drag coefficient against Mach: a transonic rise, then a slow supersonic decay.
     [[nodiscard]] static double cd0(double mach) noexcept {
@@ -164,6 +185,39 @@ struct ChaffCloud {
     return std::abs((tgt_vel - c.vel).dot(u)) < DOPPLER_GATE_MPS;
 }
 
+/// @brief A pyrotechnic flare: burns incandescently and slows rapidly in the airflow.
+struct FlareDecoy {
+    static constexpr double LIFE_S = 4.0;
+    static constexpr double DECEL_TAU_S = 0.18;
+
+    math::Vector3 pos{};
+    math::Vector3 vel{};
+    double age{0.0};
+    int owner{-1};
+    bool active{false};
+    bool bloomed{false}; ///< Evaluated against trackers
+
+    void step(double dt) noexcept {
+        age += dt;
+        vel = vel * std::exp(-dt / DECEL_TAU_S) + math::Vector3(0.0, 0.0, 3.5) * (1.0 - std::exp(-dt / DECEL_TAU_S));
+        pos += vel * dt;
+        if (age > LIFE_S) active = false;
+    }
+
+    [[nodiscard]] double intensity() const noexcept {
+        return std::clamp(2.5 * (1.0 - age / LIFE_S), 0.0, 2.5);
+    }
+};
+
+/// @brief Is a flare inside an infrared seeker's tracking gate?
+[[nodiscard]] inline bool flare_in_gates(const math::Vector3& seeker_pos, const math::Vector3& tgt_pos,
+                                         const FlareDecoy& f, double fov_rad) noexcept {
+    const math::Vector3 rt = tgt_pos - seeker_pos;
+    const math::Vector3 rf = f.pos - seeker_pos;
+    if (rt.norm() < 1.0) return false;
+    return AirCombatGeometry::angle_between(rt, rf) <= fov_rad;
+}
+
 /**
  * @brief Point-mass missile flight: thrust, Mach-dependent drag, induced drag
  * from the lift it is pulling, gravity, and a first-order autopilot on the
@@ -179,16 +233,30 @@ struct MissileBody {
     double tof{0.0};
 
     [[nodiscard]] double mass(const MissileSpec& s) const noexcept {
-        const double f = std::clamp(tof / s.burn_time_s, 0.0, 1.0);
+        const double f = std::clamp(tof / s.motor_time_s(), 0.0, 1.0);
         return s.launch_mass_kg - (s.launch_mass_kg - s.burnout_mass_kg) * f;
     }
-    [[nodiscard]] bool motor_burning(const MissileSpec& s) const noexcept { return tof < s.burn_time_s; }
+    [[nodiscard]] bool motor_burning(const MissileSpec& s) const noexcept { return tof < s.motor_time_s(); }
     [[nodiscard]] double speed() const noexcept { return vel.norm(); }
+
+    /// @brief Motor thrust now: boost, then the sustainer (if any) [N].
+    [[nodiscard]] double thrust(const MissileSpec& s) const noexcept {
+        if (tof < s.burn_time_s) return s.thrust_n;
+        return tof < s.motor_time_s() ? s.sustain_thrust_n : 0.0;
+    }
+
+    /// @brief Side force the vectored motor adds, as an acceleration [m/s^2].
+    [[nodiscard]] double tvc_accel(const MissileSpec& s, double m) const noexcept {
+        if (s.tvc_deg <= 0.0) return 0.0;
+        return thrust(s) * std::sin(s.tvc_deg * M_PI / 180.0) / m;
+    }
 
     /// @brief Lateral acceleration the airframe can make right now [m/s^2].
     [[nodiscard]] double max_lateral_accel(const MissileSpec& s) const noexcept {
         const auto air = environment::Atmosphere1976::compute(-pos.z, speed());
-        const double lift_limit = s.cl_max * air.dynamic_pressure * s.ref_area() / mass(s);
+        const double m = mass(s);
+        double lift_limit = s.cl_max * air.dynamic_pressure * s.ref_area() / m;
+        if (s.tvc_deg > 0.0) lift_limit += tvc_accel(s, m);
         return std::min(s.g_limit * fdm::SixDoFFDM::GRAVITY_ACCEL, lift_limit);
     }
 
@@ -201,7 +269,9 @@ struct MissileBody {
         const auto air = environment::Atmosphere1976::compute(-pos.z, V);
         const double qs = std::max(1.0, air.dynamic_pressure * s.ref_area());
         const double m = mass(s);
-        const double a_max = std::min(s.g_limit * G0, s.cl_max * qs / m);
+        const double a_tvc = s.tvc_deg > 0.0 ? tvc_accel(s, m) : 0.0;
+        const double a_max = s.tvc_deg > 0.0 ? std::min(s.g_limit * G0, s.cl_max * qs / m + a_tvc)
+                                             : std::min(s.g_limit * G0, s.cl_max * qs / m);
 
         auto lateral = [&](math::Vector3 a) {
             a = a - u * a.dot(u);
@@ -211,8 +281,15 @@ struct MissileBody {
         const math::Vector3 cmd = lateral(a_cmd);
         a_lat = lateral(a_lat + (cmd - a_lat) * (1.0 - std::exp(-dt / s.autopilot_tau_s)));
 
-        const double thrust = motor_burning(s) ? s.thrust_n : 0.0;
-        const double lift = m * a_lat.norm();
+        // A vectored motor turns part of its thrust sideways: that share is
+        // not lift (no induced drag) and no longer pushes the missile along.
+        double thrust = motor_burning(s) ? this->thrust(s) : 0.0;
+        double lift = m * a_lat.norm();
+        if (a_tvc > 0.0) {
+            const double side = std::min(lift, m * a_tvc);
+            lift -= side;
+            thrust = std::sqrt(std::max(0.0, thrust * thrust - side * side));
+        }
         const double drag = qs * MissileSpec::cd0(air.mach_number) + s.k_induced * lift * lift / qs;
         const math::Vector3 acc = u * ((thrust - drag) / m) + a_lat + math::Vector3(0.0, 0.0, G0);
         vel += acc * dt;
@@ -345,6 +422,43 @@ inline constexpr double RUN_DASH_MACH = 1.5;         ///< ...and no faster than 
 }
 
 /**
+ * @brief Dynamic Launch Zone (DLZ) range bracket for cockpit HUD and avionics.
+ */
+struct DynamicLaunchZone {
+    double rmax_m = 0.0;
+    double rne_m = 0.0;
+    double rmin_m = 0.0;
+
+    [[nodiscard]] bool in_envelope(double range_m) const noexcept {
+        return range_m >= rmin_m && range_m <= rmax_m;
+    }
+
+    [[nodiscard]] static DynamicLaunchZone compute(const fdm::FlightState& launcher,
+                                                   const fdm::FlightState& target,
+                                                   const MissileSpec& spec) noexcept {
+        DynamicLaunchZone dlz;
+        dlz.rmin_m = spec.min_launch_range_m;
+        const math::Vector3 los = target.pos_ned - launcher.pos_ned;
+        const double r = los.norm();
+        if (r < 1.0) {
+            dlz.rmax_m = spec.seeker_range_m;
+            dlz.rne_m = dlz.rmax_m * 0.55;
+            return dlz;
+        }
+        const math::Vector3 u = los / r;
+        const double v_launch = launcher.vel_b.x;
+        const math::Vector3 tgt_v = target.velocity_ned();
+        const double tgt_speed = tgt_v.norm();
+        const double aspect_cos = tgt_speed > 1.0 ? -tgt_v.dot(u) / tgt_speed : 0.0;
+        const double alt_scale = std::clamp(1.0 - target.pos_ned.z / 15000.0, 0.6, 2.0);
+        const double base_range = spec.seeker_range_m * alt_scale;
+        dlz.rmax_m = std::max(dlz.rmin_m * 1.5, base_range * (0.8 + 0.35 * aspect_cos + 0.15 * (v_launch / 300.0)));
+        dlz.rne_m = std::max(dlz.rmin_m * 1.2, dlz.rmax_m * 0.45);
+        return dlz;
+    }
+};
+
+/**
  * @brief One missile in flight: body, guidance phase and fuze.
  *
  * Guidance phases, as flown by an active-radar missile:
@@ -390,6 +504,30 @@ struct Missile {
      * @param tgt_pos  True target state (used only through the phase's sensor).
      */
     void update(double dt, bool uplink, const math::Vector3& tgt_pos, const math::Vector3& tgt_vel) noexcept {
+        // Infrared seekers track target thermal emission directly without radar datalink
+        if (spec.infrared()) {
+            const math::Vector3 boresight = body.vel.normalized();
+            const SensorLimits lim = seeker_limits();
+            if (decoy_timer > 0.0) {
+                decoy_timer -= dt;
+            } else {
+                const double tgt_dist = (tgt_pos - body.pos).norm();
+                const double ata = AirCombatGeometry::angle_between(boresight, tgt_pos - body.pos);
+                if (ata <= lim.gimbal_rad && tgt_dist <= spec.seeker_range_m) {
+                    phase = Phase::ACTIVE_TRACK;
+                    est_pos = tgt_pos;
+                    est_vel = tgt_vel;
+                    memory_timer = 0.0;
+                } else {
+                    memory_timer += dt;
+                    if (memory_timer > spec.memory_s) phase = Phase::LOST;
+                }
+            }
+            const math::Vector3 a_cmd = phase == Phase::LOST ? hold_weight() : pro_nav(body, est_pos, est_vel, spec.nav_gain);
+            body.step(spec, dt, body.tof < RAIL_CLEAR_S ? hold_weight() : a_cmd);
+            return;
+        }
+
         // Predicted target: extrapolate the last estimate.
         est_pos += est_vel * dt;
 
@@ -470,6 +608,15 @@ struct Missile {
         decoy_timer = DECOY_TRACK_S;
     }
 
+    /// @brief A flare stole the IR seeker track.
+    void seduce(const FlareDecoy& f) noexcept {
+        est_pos = f.pos;
+        est_vel = f.vel;
+        phase = Phase::ACTIVE_TRACK;
+        memory_timer = 0.0;
+        decoy_timer = spec.flare_reject_s > 0.0 ? spec.flare_reject_s : 1.2;
+    }
+
     static constexpr double DECOY_TRACK_S = 1.5;
 
     /// @brief Out of energy, time or sky.
@@ -490,5 +637,108 @@ struct Missile {
     }
     return "?";
 }
+
+namespace missile_specs {
+
+/// @brief AIM-120C AMRAAM: Active radar BVR missile (40 G airframe, Mach 4 class)
+[[nodiscard]] inline constexpr MissileSpec aim120c() noexcept {
+    MissileSpec s{};
+    s.name = "AIM-120C";
+    s.short_name = "120C";
+    s.launch_mass_kg = 157.0;
+    s.burnout_mass_kg = 111.0;
+    s.thrust_n = 22000.0;
+    s.burn_time_s = 5.0;
+    s.diameter_m = 0.178;
+    s.k_induced = 0.02;
+    s.cl_max = 12.0;
+    s.g_limit = 40.0;
+    s.autopilot_tau_s = 0.20;
+    s.nav_gain = 4.0;
+    s.seeker = SeekerType::ACTIVE_RADAR;
+    s.seeker_range_m = 14000.0;
+    s.seeker_gimbal_deg = 50.0;
+    s.pitbull_range_m = 11000.0;
+    s.seeker_basket_deg = 8.0;
+    s.seeker_beam_deg = 6.0;
+    s.notch_mps = 28.0;
+    s.memory_s = 1.2;
+    s.chaff_seduction = 0.45;
+    s.arm_time_s = 1.0;
+    s.fuze_radius_m = 15.0;
+    s.lethal_radius_m = 16.0;
+    s.max_tof_s = 75.0;
+    s.min_speed_mps = 180.0;
+    s.min_launch_range_m = 900.0;
+    s.max_launch_ata_deg = 45.0;
+    return s;
+}
+
+/// @brief AIM-9X Sidewinder: High-off-boresight thrust-vectored imaging IR dogfight missile (60 G)
+[[nodiscard]] inline constexpr MissileSpec aim9x() noexcept {
+    MissileSpec s{};
+    s.name = "AIM-9X";
+    s.short_name = "9X";
+    s.launch_mass_kg = 85.0;
+    s.burnout_mass_kg = 57.0;
+    s.thrust_n = 15500.0;
+    s.burn_time_s = 3.2;
+    s.diameter_m = 0.127;
+    s.k_induced = 0.018;
+    s.cl_max = 14.0;
+    s.g_limit = 60.0;
+    s.tvc_deg = 15.0; // Thrust-vectoring jet vanes
+    s.autopilot_tau_s = 0.10;
+    s.nav_gain = 4.5;
+    s.seeker = SeekerType::INFRARED;
+    s.seeker_range_m = 18520.0;
+    s.seeker_gimbal_deg = 90.0; // High Off-Boresight (HOBS)
+    s.seeker_basket_deg = 12.0;
+    s.memory_s = 0.8;
+    s.ir_lock_range_m = 15000.0;
+    s.ir_fov_deg = 4.5;
+    s.flare_susceptibility = 0.20;
+    s.flare_reject_s = 0.6;
+    s.arm_time_s = 0.5;
+    s.fuze_radius_m = 10.0;
+    s.lethal_radius_m = 11.0;
+    s.max_tof_s = 35.0;
+    s.min_speed_mps = 150.0;
+    s.min_launch_range_m = 350.0;
+    s.max_launch_ata_deg = 90.0;
+    return s;
+}
+
+/// @brief ASRAAM (for Eurofighter Typhoon): Mach 3+ sprint dogfight missile
+[[nodiscard]] inline constexpr MissileSpec asraam() noexcept {
+    MissileSpec s = aim9x();
+    s.name = "ASRAAM";
+    s.short_name = "ASRAAM";
+    s.launch_mass_kg = 88.0;
+    s.burnout_mass_kg = 60.0;
+    s.thrust_n = 18000.0;
+    s.burn_time_s = 3.5;
+    s.diameter_m = 0.166;
+    s.tvc_deg = 0.0;
+    s.g_limit = 50.0;
+    s.k_induced = 0.015;
+    s.flare_susceptibility = 0.18;
+    return s;
+}
+
+/// @brief AIM-9M Sidewinder (for A-10C): Classic analog IR seeker, 35 G
+[[nodiscard]] inline constexpr MissileSpec aim9m() noexcept {
+    MissileSpec s = aim9x();
+    s.name = "AIM-9M";
+    s.short_name = "9M";
+    s.g_limit = 35.0;
+    s.tvc_deg = 0.0;
+    s.seeker_gimbal_deg = 45.0;
+    s.flare_susceptibility = 0.45;
+    s.max_launch_ata_deg = 40.0;
+    return s;
+}
+
+} // namespace missile_specs
 
 } // namespace fastjet::sim

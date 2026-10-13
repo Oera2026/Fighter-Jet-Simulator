@@ -3,6 +3,7 @@
 #include "pilot_commands.hpp"
 #include "imu_sensor.hpp"
 #include "../aircraft/aircraft_config.hpp"
+#include "../aero/compressible_lift.hpp"
 #include "../fdm/flight_state.hpp"
 #include "../environment/atmosphere1976.hpp"
 #include "../environment/ground_collision.hpp"
@@ -26,31 +27,31 @@ namespace flcs {
  *     full authority.  Visual blackout fraction is exposed for screen-space rendering.
  *
  *  2. Auto-GCAS (Automatic Ground Collision Avoidance System)
- *     Mirrors the NASA/AFRL/Lockheed system that has saved 11+ F-16 pilots since 2014.
- *     Every tick the kinematic pull-out altitude required at the recovery G this
- *     airframe can actually pull right now (nominal 5 G, less when slow) — budgeted
- *     for the G onset lag and for the extra altitude a bank angle will cost while
- *     rolling wings level — is compared to the actual terrain clearance.  Engagement is judged
- *     purely on that predicted margin, not on how steep the current dive happens to
- *     be, so a shallow-but-low descent is caught exactly as reliably as a steep one.
- *     A hard 30 ft AGL deck is enforced on top of that as an unconditional backstop:
- *     no kinematic model is trusted blindly, so any descent through the deck forces
- *     recovery regardless of what the margin calculation says.  Recovery is a
- *     two-phase manoeuvre — roll wings-level first, then pull at the nominal
- *     recovery G, escalating smoothly toward a capped ceiling only if the height left
- *     or time-to-impact becomes critical (it never demands the airframe's full G
- *     limit — both are scaled to the configured airframe — since an
- *     unrealistic max-G pull risks GLOC or structural overstress and defeats the
- *     point of a *safety* system) — and it commands the throttle alongside the
- *     stick: idle while still banking into wings-level (bleeds off the dive instead
- *     of accelerating into the ground — unless the jet is too slow to spare the
- *     energy), then full power once pulling out (arrests
- *     the sink rate and prevents the recovery itself from bleeding into a stall).
- *     The commanded pull is faded out between 135 and 165 deg of bank (see
- *     bank_pull_scale), because only the cos(bank) share of the lift vector opposes
- *     the descent — pulling while
- *     inverted drives the nose into the terrain.  A deliberate pilot stick input
- *     hands control back once the jet is out of immediate danger.
+ *     Mirrors the NASA/AFRL/Lockheed system that has saved 11+ F-16 pilots since 2014,
+ *     and its defining property: it is nuisance-free, so pilots fly 100 ft passes,
+ *     terrain following and canyon runs with it ON.  Every tick it flies the
+ *     recovery it would perform — the current manoeuvre carrying on through the
+ *     system's reaction time, a roll at the achievable rate, then the airframe's
+ *     recovery G (nominal 5 G, less when slow) to a capped climb — through a
+ *     handful of fixed time steps, and reads the terrain under every point of it.
+ *     It fires only at the last instant: when the predicted minimum clearance falls
+ *     to the terrain buffer (30 ft by default, see @ref gcas_buffer_m).  Climb,
+ *     turn and load already on the jet are part of the prediction, so a pilot who
+ *     is already climbing over a ridge or holding a level turn is left alone.  Two
+ *     recoveries are predicted: wings level, and a climbing turn that keeps the
+ *     turn already being flown (the escape that follows a canyon bend; NASA's
+ *     multi-trajectory scheme).  The better one is flown.  Recovery is a two-phase
+ *     manoeuvre — roll to the recovery bank first, then pull — escalating toward a
+ *     capped ceiling only if the height left or time-to-impact becomes critical
+ *     (never the airframe's full G limit: both are scaled to the configured
+ *     airframe).  It commands the throttle alongside the stick: idle while still
+ *     rolling (unless the jet is too slow to spare the energy), then full power once
+ *     pulling.  Past 135 deg of bank the pull is faded to a 0 G unload (see
+ *     bank_pull_scale), because pulling while inverted drives the nose into the
+ *     terrain.  It hands back once the jet is climbing with terrain clearance
+ *     assured, or to a deliberate pilot input once the jet is out of danger; after
+ *     such a breakout it re-engages only for a last-ditch save (which then cannot
+ *     be broken out of), so a pilot flying low on purpose is not fought tick by tick.
  *
  *  3. Tumble / Spin Auto-Recovery
  *     Detects a departure (deep stall, flat spin, violent tumble) and applies
@@ -92,13 +93,39 @@ public:
     static constexpr double GLOC_WINGS_LEVEL_RAD  = 20.0 * (M_PI / 180.0);
 
     // --- GCAS thresholds ----------------------------------------------------
-    /// Minimum descent angle below which terrain closure isn't even considered [rad].
-    /// Deliberately small: this is NOT a "must be diving steeply" gate — whether the
-    /// system actually intervenes is decided by the kinematic altitude check below,
-    /// so shallow-but-low descents are covered too, not just steep dives.
-    static constexpr double GCAS_ARM_FPA_RAD      = -2.0 * (M_PI / 180.0);
-    /// Nominal recovery G used for both the kinematic pull-out calculation and the
-    /// commanded pitch during recovery — the two stay consistent by construction.
+    /// Default terrain buffer [m] (= 30 ft): the predicted recovery must keep at
+    /// least this much clearance, or it is started now.  It doubles as the floor
+    /// the system lets the pilot fly at: 50 ft passes are clear of it, a jet
+    /// settling below 30 ft is flown back up.  See @ref gcas_buffer_m.
+    static constexpr double GCAS_DEFAULT_BUFFER_M = 30.0 * 0.3048;
+    /// Extra predicted clearance [m] needed before a recovery hands back (or a
+    /// pilot may break out).  Hysteresis: released just above the buffer, the
+    /// next tick's prediction would fire again.
+    static constexpr double GCAS_RELEASE_MARGIN_M = 10.0;
+    /// Time the current manoeuvre is predicted to carry on before the recovery
+    /// starts to act [s]: decision, stick-to-surface and actuator lag.
+    static constexpr double GCAS_REACTION_S       = 0.20;
+    /// First-order lag of the load factor toward the recovery command [s]: the
+    /// pitch loop's G onset as flown closed-loop by these flight control laws.
+    static constexpr double GCAS_G_ONSET_TAU_S    = 0.35;
+    /// The predicted recovery pulls no steeper than this climb, then holds it [rad].
+    /// Shared with the flown recovery, which captures it in GCAS_CLIMB_CAPTURE_S.
+    static constexpr double GCAS_MAX_CLIMB_RAD    = 30.0 * (M_PI / 180.0);
+    static constexpr double GCAS_CLIMB_CAPTURE_S  = 1.0;
+    /// The prediction always looks at least this far ahead (rising terrain), and
+    /// at most this far (a slow pull out of a steep dive) [s].
+    static constexpr double GCAS_LOOKAHEAD_S      = 6.0;
+    static constexpr double GCAS_PREDICT_MAX_S    = 14.0;
+    /// Turn (horizontal load factor [g]) below which the climbing-turn escape is
+    /// not worth predicting separately, and the bank it may use at most [rad].
+    static constexpr double GCAS_MIN_TURN_G       = 0.3;
+    static constexpr double GCAS_MAX_TURN_BANK_RAD = 60.0 * (M_PI / 180.0);
+    /// After a pilot breakout the system stays inhibited until the stick has been
+    /// relaxed this long [s]; meanwhile only a last-ditch save (half the buffer)
+    /// re-engages it.
+    static constexpr double GCAS_INHIBIT_RELAX_S  = 1.0;
+    /// Nominal recovery G used for both the predicted recovery and the commanded
+    /// pitch during recovery — the two stay consistent by construction.
     static constexpr double GCAS_RECOVERY_G       = 5.0;
     /// Escalation ceiling for commanded G when time-to-impact is critical. Kept well
     /// below the airframe G limit so the save itself can't cause a structural
@@ -145,6 +172,8 @@ public:
     /// Wider than GCAS_WINGS_LEVEL_RAD so the two phases cannot chatter against
     /// each other while the jet settles through the band.
     static constexpr double GCAS_REBANK_RAD       = 40.0 * (M_PI / 180.0);
+    /// Minimum descent angle below which terrain closure isn't even considered [rad].
+    static constexpr double GCAS_ARM_FPA_RAD      = -2.0 * (M_PI / 180.0);
     /// Flight-path angle above which GCAS declares safe and disengages [rad] (0 deg = level flight).
     static constexpr double GCAS_SAFE_FPA_RAD     = 0.0  * (M_PI / 180.0);
     /// Minimum altitude above which GCAS will disengage after recovery [m].
@@ -267,7 +296,8 @@ public:
             a.roll_rate_dps   = cfg.flcs.max_roll_rate_dps;
             a.wing_area_m2    = cfg.aero.s_ref;
             a.cl_max          = cfg.aero.cl_max;
-            a.ref_mass_kg     = cfg.mass.empty_mass_kg + cfg.mass.internal_fuel_capacity_kg;
+            a.ref_mass_kg     = cfg.mass.empty_mass_kg + cfg.mass.internal_fuel_capacity_kg
+                              + cfg.mass.combat_payload_kg;
             a.g_command_law   = cfg.flcs.law_type
                               != aircraft::FLCSConfig::LawType::HYDRO_SAS_AUGMENTED;
             return a;
@@ -340,6 +370,14 @@ public:
      *                    emergency low-altitude descent — Auto-GCAS still enforces
      *                    the kinematic margin and the 30 ft hard deck whenever the
      *                    gear is up, no matter how gentle the sink rate looks.
+     * @param powered_lift True while a STOVL jet's lift system is engaged (F-35B
+     *                    converted or converting). Jet-borne flight is slow, at
+     *                    large flight-path angles and close to the ground by
+     *                    design: Auto-GCAS and the departure recovery would read
+     *                    a hover or a vertical landing as an emergency and fight
+     *                    the unified STOVL law, so both stand down (as the
+     *                    F-35's Auto-GCAS does in STOVL mode). GLOC monitoring
+     *                    carries on.
      * @return            Effective commands to pass to the FLCS.
      *
      * Auto-GCAS additionally drives @ref gcas_throttle_cmd this tick (see
@@ -352,10 +390,23 @@ public:
         const fdm::FlightState& state,
         const IMUData& imu,
         const PilotCommands& pilot_in,
-        bool gear_down = false
+        bool gear_down = false,
+        bool powered_lift = false
     ) noexcept {
         PilotCommands effective = pilot_in;
         gcas_throttle_cmd = -1.0;
+
+        if (powered_lift) {
+            step_gloc(dt, state, imu, pilot_in, effective);
+            gcas_state = GcasState::ARMED;
+            gcas_roll_dir = 0;
+            gcas_tti = 999.0;
+            gcas_nz_trim = 0.0;
+            tumble_state = TumbleState::ARMED;
+            tumble_persist_timer = 0.0;
+            departure_rotation = false;
+            return effective;
+        }
 
         // Fixed authority order.  Each stage may only be handed the *raw* pilot
         // inceptor positions to judge pilot intent (@p pilot_in) — never the
@@ -735,9 +786,11 @@ private:
             std::min(GCAS_MAX_RECOVERY_G, GCAS_MAX_G_FRAC * airframe.max_g));
 
         // Load factor the wing can actually produce right now.  Heavy (full-fuel)
-        // reference mass keeps this conservative.
+        // reference mass keeps this conservative, and so does the maximum lift
+        // coefficient falling with Mach.
         const auto air = environment::Atmosphere1976::compute(state.altitude(), V);
         const double n_lift_max = air.dynamic_pressure * airframe.wing_area_m2 * airframe.cl_max
+                                * aero::CompressibleLift::clmax_mach_factor(air.mach_number)
                                 / (airframe.ref_mass_kg * G0);
         const double n_pull = std::clamp(GCAS_USABLE_LIFT_FRAC * n_lift_max, 1.0, g_nominal);
 
