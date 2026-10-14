@@ -119,7 +119,8 @@ if(FASTJET_BUILD_TESTS)
         test_flight_realism
         test_ejection
         test_stovl
-        test_missile_warning)
+        test_missile_warning
+        test_air_combat)
 
     # Tests that need SDL3 and/or an OpenGL context.
     set(FASTJET_GRAPHICS_TESTS

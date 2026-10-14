@@ -102,17 +102,23 @@ enum class WeaponsLoadout : uint8_t {
  * fast he locks you up with the radar.
  */
 struct AiMissileDiscipline {
-    double off_boresight_deg;  ///< Heat-seeker cueing and shot limit (an ace's helmet sight: the whole gimbal)
-    double confirm_lock_s;     ///< Tone held before pickling
-    double spacing_s;          ///< Least time between heat-seeker shots
+    double off_boresight_deg;   ///< Heat-seeker cueing and shot limit (an ace's helmet sight: the whole gimbal)
+    double confirm_lock_s;      ///< Tone held before pickling
+    double spacing_s;           ///< Least time between heat-seeker shots
+    double max_off_tail_deg;    ///< Heat-seeker shots only this far off the target's tail...
+    double strong_off_tail_deg; ///< ...or this far on a strong tone (see HeatSeekerShooter)
     LaunchDoctrine mrm_doctrine;
-    double radar_acquire_s;    ///< Time to lock the bandit up with the radar
+    double radar_acquire_s;     ///< Time to lock the bandit up with the radar
 
+    /// A novice shoots heat seekers only from the target's rear hemisphere,
+    /// where the tail pipe fills the seeker. A veteran shoots from the beam or
+    /// behind it, and forward of the beam only on a strong tone. An ace trusts
+    /// the all-aspect seeker from any angle.
     [[nodiscard]] static constexpr AiMissileDiscipline of(AiSkill s) noexcept {
         switch (s) {
-            case AiSkill::NOVICE:  return {15.0, 1.0, 8.0, LaunchDoctrine::MAX_RANGE, 2.5};
-            case AiSkill::VETERAN: return {30.0, 0.6, 6.0, LaunchDoctrine::MAX_RANGE, 1.5};
-            case AiSkill::ACE:     return {180.0, 0.4, 4.0, LaunchDoctrine::NO_ESCAPE, 1.0};
+            case AiSkill::NOVICE:  return {15.0, 1.0, 8.0, 90.0, 90.0, LaunchDoctrine::MAX_RANGE, 2.5};
+            case AiSkill::VETERAN: return {30.0, 0.6, 6.0, 120.0, 180.0, LaunchDoctrine::MAX_RANGE, 1.5};
+            case AiSkill::ACE:     return {180.0, 0.4, 4.0, 180.0, 180.0, LaunchDoctrine::NO_ESCAPE, 1.0};
         }
         return of(AiSkill::VETERAN);
     }
@@ -293,8 +299,14 @@ public:
         for (int i = 0; i < world.count; ++i) {
             Aircraft& a = world.aircraft[static_cast<size_t>(i)];
             a.landing_gear.deployed = false;
+            // Still air (the gusts stay): missiles and rounds fly in still
+            // air, so the jets must too. In a wind, the jet with the tailwind
+            // in a head-on flew faster over the ground into the other's
+            // missile and was hit first: jet 0 won two fights in three.
+            a.wind.mean_wind_enabled = false;
             prespool(a, 0.9);
         }
+        maws_memory_.fill(MawsMemory{});
 
         ai_controlled[OWN] = s.own_is_ai;
         ai_controlled[BANDIT] = evade || s.geometry != StartGeometry::GUNNERY_RANGE;
@@ -342,6 +354,8 @@ public:
                 srm_shooters[idx].off_boresight_deg = d.off_boresight_deg;
                 srm_shooters[idx].confirm_lock_s = d.confirm_lock_s;
                 srm_shooters[idx].spacing_s = d.spacing_s;
+                srm_shooters[idx].max_off_tail_deg = d.max_off_tail_deg;
+                srm_shooters[idx].strong_off_tail_deg = d.strong_off_tail_deg;
                 // Radar missiles need the radar hunting the bandit (an AI
                 // pilot's radar is otherwise off in a dogfight).
                 const bool rf = world.stores[idx].mrm.count > 0 && world.radars[idx].spec.fitted;
@@ -373,18 +387,25 @@ public:
             const Aircraft& foe = world.aircraft[i == OWN ? BANDIT : OWN];
             if (ai_controlled[idx] && i == OWN && evade_mode()) {
                 // Both run every step to keep their tracks and timers current.
-                // Missiles are defeated off the RWR; a bandit close enough to
-                // see is a guns threat and gets basic fighter manoeuvres.
+                // Missiles are defeated off the RWR (and the MAWS, if fitted);
+                // a bandit close enough to see is a guns threat and gets basic
+                // fighter manoeuvres.
                 const RwrStatus rwr = world.rwr(OWN);
+                const MissileThreat threat = detect_missile_threat(i);
+                remember_maws(i, threat, dt);
                 const AircraftControls bfm = ai[idx].update(dt, self, foe);
-                const AircraftControls defend = evader.update(dt, self, rwr);
+                const AircraftControls defend = evader.update(dt, self, rwr, threat);
                 const double range = (foe.position() - self.position()).norm();
                 const bool missile_defence = evader.mode == EvasionPilot::Mode::NOTCH_MISSILE ||
                                              evader.mode == EvasionPilot::Mode::LAST_DITCH;
                 const bool visual_fight = range < VISUAL_FIGHT_RANGE_M && !missile_defence;
                 controls[idx] = visual_fight ? bfm : defend;
             } else if (ai_controlled[idx]) {
-                const MissileThreat threat = evade_mode() ? MissileThreat{} : detect_missile_threat(i);
+                MissileThreat threat{};
+                if (!evade_mode()) {
+                    threat = detect_missile_threat(i);
+                    remember_maws(i, threat, dt);
+                }
                 controls[idx] = ai[idx].update(dt, self, foe, threat);
                 if (evade_mode() && idx == BANDIT) {
                     controls[idx].pickle = false;
@@ -423,19 +444,27 @@ public:
 
     /**
      * @brief What AI pilot @p i knows about missiles coming at him: the one
-     * place an AI's missile threat picture comes from (a missile approach
-     * warner can feed it here).
+     * place an AI's missile threat picture comes from. Only his own sensors:
      *
-     * Today he knows a radar missile his RWR hears (the launcher's datalink,
-     * or its own seeker once pointed at him), and any missile he can see: one
-     * whose motor is still burning (the smoke trail) inside
-     * VISUAL_MISSILE_SMOKE_M, or any inside VISUAL_MISSILE_M. A heat seeker
-     * that has burnt out further away arrives unseen. The nearest one known
-     * is the threat.
+     *  - His RWR: a radar missile it hears (the launcher's datalink, or its
+     *    own seeker once pointed at him).
+     *  - His eyes: any missile whose motor is still burning (the smoke trail)
+     *    inside VISUAL_MISSILE_SMOKE_M, or any inside VISUAL_MISSILE_M. A heat
+     *    seeker that has burnt out further away arrives unseen.
+     *  - His own jet's MAWS (world.maws[i], if one is fitted): a missile
+     *    closing on him, its line of sight and time to go (a boosting
+     *    missile's included), and the launch call. A passive set loses the
+     *    missile when its motor burns out; he keeps defending against where
+     *    it was until its last time to go, stretched for the coast, has run out.
+     *
+     * The nearest missile heard or seen is the threat, timed by the MAWS when
+     * it has one too. One that only the MAWS has, silent on the RWR, is
+     * treated as a heat seeker.
      */
     [[nodiscard]] MissileThreat detect_missile_threat(int i) const noexcept {
         MissileThreat threat;
-        const Aircraft& self = world.aircraft[static_cast<size_t>(i)];
+        const auto idx = static_cast<size_t>(i);
+        const Aircraft& self = world.aircraft[idx];
         for (const Missile& m : world.missiles) {
             if (!m.active || m.target != i || m.shooter == i) continue;
             const math::Vector3 r = m.body.pos - self.position();
@@ -450,6 +479,31 @@ public:
             threat.range_m = range;
             threat.closure_mps = range > 1.0 ? (self.velocity() - m.body.vel).dot(r / range) : 0.0;
         }
+
+        const MissileWarningSystem& mws = world.maws[idx];
+        if (!mws.spec.fitted()) return threat;
+        const MawsStatus& w = mws.status;
+        const MawsMemory& mem = maws_memory_[idx];
+        if (!w.threat && mem.hold_s <= 0.0) return threat;
+        const math::Vector3 los = w.threat ? w.los_ned : mem.los_ned;
+        const double closing = w.threat ? w.closing_mps : mem.closing_mps;
+        const double tgo = w.threat ? w.time_to_go_s : mem.hold_s;
+        threat.maws = true;
+        threat.held = !w.threat;
+        threat.launch = w.launch;
+        // A live MAWS track times the missile best (a boosting one too); a
+        // remembered one only when nothing better has it.
+        if (w.threat || !threat.inbound) threat.tgo_s = tgo;
+        if (!threat.inbound) {
+            // Only the MAWS has it: on its line of sight, at the range it
+            // measures (pulse-doppler) or the one its closure and time to go give.
+            const double range = w.threat && w.range_valid ? w.range_m : closing * tgo;
+            threat.inbound = true;
+            threat.pos = self.position() + los * std::max(range, 1.0);
+            threat.range_m = range;
+            threat.closure_mps = closing;
+        }
+        threat.heat_seeker = !threat.radar_guided && !mem.rwr_heard;
         return threat;
     }
 
@@ -474,10 +528,45 @@ public:
     static constexpr double EJECT_DECISION_S = 1.5;
 
 private:
+    /// @brief What an AI pilot remembers of his own MAWS's latest threat.
+    struct MawsMemory {
+        double hold_s{0.0};      ///< Defence still held after a passive set lost the missile [s]
+        math::Vector3 los_ned{}; ///< Its last line of sight
+        double closing_mps{0.0};
+        bool rwr_heard{false};   ///< The RWR heard a missile while this one was tracked: a radar missile
+    };
+    /// A passive MAWS's last time to go, stretched for the coast after
+    /// burnout (the missile slows), plus a margin, is how long the defence is held.
+    static constexpr double MAWS_HOLD_STRETCH = 1.25;
+    static constexpr double MAWS_HOLD_MARGIN_S = 0.5;
+
+    std::array<MawsMemory, World::kMaxAircraft> maws_memory_{};
     int events_read_{0};
     int chaff_at_start_{0};
     double unlocked_far_s_{0.0};
     std::array<double, World::kMaxAircraft> eject_timer_{};
+
+    /// @brief Keep AI pilot @p i's memory of his own MAWS's threat: a passive
+    /// set's track is held for its time to go once the motor burns out.
+    void remember_maws(int i, const MissileThreat& threat, double dt) noexcept {
+        const auto idx = static_cast<size_t>(i);
+        const MissileWarningSystem& mws = world.maws[idx];
+        MawsMemory& mem = maws_memory_[idx];
+        if (!mws.spec.fitted()) {
+            mem = MawsMemory{};
+            return;
+        }
+        const MawsStatus& w = mws.status;
+        if (w.threat) {
+            mem.hold_s = mws.spec.needs_motor() ? MAWS_HOLD_STRETCH * w.time_to_go_s + MAWS_HOLD_MARGIN_S : 0.0;
+            mem.los_ned = w.los_ned;
+            mem.closing_mps = w.closing_mps;
+        } else {
+            mem.hold_s = std::max(0.0, mem.hold_s - dt);
+        }
+        if (threat.radar_guided) mem.rwr_heard = true;
+        else if (!w.threat && mem.hold_s <= 0.0) mem.rwr_heard = false;
+    }
 
     /// @brief Dogfight: each AI pilot's missile shots, heat seekers first; one
     /// missile of his in the air at a time.

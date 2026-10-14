@@ -119,6 +119,12 @@ private:
  * target that holds course. Shots are spaced, and only one of the pilot's
  * missiles is in the air at a time (shoot-look-shoot).
  *
+ * How far off the target's tail he shoots is his trust in the seeker: up to
+ * max_off_tail_deg, or strong_off_tail_deg on a strong tone (the target
+ * inside STRONG_LOCK_RANGE_FRACTION of the lock range its signature gives, so
+ * four times the irradiance the seeker needs to lock). 90 deg keeps a pilot
+ * in the target's rear hemisphere; 180 deg is all aspect.
+ *
  * The seeker only runs while the SRM store is selected, so the pilot keeps it
  * selected whenever he has heat seekers left (the gun fires on the trigger
  * whatever is selected).
@@ -128,7 +134,12 @@ public:
     double off_boresight_deg{30.0}; ///< Furthest off the nose the pilot will shoot
     double confirm_lock_s{0.5};     ///< Tone held this long before pickling
     double spacing_s{6.0};          ///< Least time between shots
+    double max_off_tail_deg{180.0}; ///< Furthest off the target's tail he shoots...
+    double strong_off_tail_deg{180.0}; ///< ...and on a strong tone
     double eval_period_s{0.25};     ///< Launch-zone refresh rate
+
+    /// A strong tone: the target inside this share of its lock range.
+    static constexpr double STRONG_LOCK_RANGE_FRACTION = 0.5;
 
     // Diagnostics
     FlyoutResult last_flyout{};
@@ -162,6 +173,7 @@ public:
         const double limit = std::min({off_boresight_deg, spec.seeker_gimbal_deg, spec.max_launch_ata_deg});
         if (los.norm() < spec.min_launch_range_m) return false;
         if (AirCombatGeometry::angle_between(nose, los) > limit * M_PI / 180.0) return false;
+        if (!aspect_ok(seeker, los.norm(), ir_off_tail_angle(t, a.position()))) return false;
 
         if (eval_timer_ > 0.0) return false;
         eval_timer_ = eval_period_s;
@@ -172,6 +184,14 @@ public:
         since_launch_ = 0.0;
         ++launches;
         return true;
+    }
+
+    /// @brief Will he shoot from @p off_tail_rad off the target's tail, at
+    /// @p range_m, on what @p seeker hears?
+    [[nodiscard]] bool aspect_ok(const IrSeeker& seeker, double range_m, double off_tail_rad) const noexcept {
+        const bool strong = range_m <= STRONG_LOCK_RANGE_FRACTION * seeker.lock_range_m;
+        const double limit_deg = strong ? std::max(max_off_tail_deg, strong_off_tail_deg) : max_off_tail_deg;
+        return off_tail_rad <= limit_deg * M_PI / 180.0;
     }
 
 private:

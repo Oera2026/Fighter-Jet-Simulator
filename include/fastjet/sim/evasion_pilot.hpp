@@ -4,6 +4,7 @@
 #include "fastjet/environment/ground_collision.hpp"
 #include "fastjet/flcs/onboard_flight_computer.hpp"
 #include "fastjet/sim/aircraft.hpp"
+#include "fastjet/sim/bfm_pilot.hpp"
 #include "fastjet/sim/radar.hpp"
 #include <algorithm>
 #include <cmath>
@@ -24,8 +25,15 @@ namespace fastjet::sim {
  *    across the missile's line of sight, so its lagging autopilot can't follow.
  *  - Nothing on the RWR: run cold at military power.
  *
+ * A jet with a missile approach warner (MAWS) also gets the missile itself:
+ * its line of sight and time to go from launch, whether the RWR hears it or
+ * not. One the MAWS sees and the RWR doesn't (and hasn't) is treated as a
+ * heat seeker: beamed the same way, but with flares instead of chaff, out of
+ * reheat, and a flare salvo with the break.
+ *
  * It uses the same FLCS stick laws as the other AI pilots and sees no truth
- * data about the threat: only what the RWR shows.
+ * data about the threat: only what the RWR shows and what
+ * Engagement::detect_missile_threat() tells it (the MAWS, and missiles it can see).
  */
 class EvasionPilot {
 public:
@@ -45,11 +53,16 @@ public:
         prev_missile_range_ = -1.0;
         missile_memory_ = 0.0;
         beam_side_ = 0.0;
+        flare_timer_ = 0.0;
+        salvo_left_ = 0;
+        salvo_fired_ = false;
+        flare_out_ = false;
         initialised_ = false;
         mode = Mode::CRUISE;
     }
 
-    [[nodiscard]] AircraftControls update(double dt, const Aircraft& self, const RwrStatus& rwr) noexcept {
+    [[nodiscard]] AircraftControls update(double dt, const Aircraft& self, const RwrStatus& rwr,
+                                          const MissileThreat& threat = {}) noexcept {
         constexpr double G0 = fdm::SixDoFFDM::GRAVITY_ACCEL;
         AircraftControls out{};
         out.throttle = 0.84;
@@ -61,6 +74,7 @@ public:
             cruise_alt_ = self.state.altitude();
         }
         chaff_timer_ -= dt;
+        flare_timer_ -= dt;
 
         // Closure on the missile from the change in its RWR range.
         double t_go = 1e9;
@@ -73,6 +87,23 @@ public:
         } else {
             prev_missile_range_ = -1.0;
         }
+        // The MAWS times the missile itself (a boosting one too), and may have
+        // one the RWR doesn't.
+        const bool maws = threat.inbound && threat.maws;
+        const bool maws_only = maws && !rwr.missile_valid;
+        if (maws && (!threat.held || !rwr.missile_valid)) t_go = std::min(t_go, threat.time_to_go());
+        const bool missile_known = rwr.missile_valid || maws;
+        const double missile_bearing =
+            rwr.missile_valid ? rwr.missile_bearing : RwrStatus::relative_bearing(self.state, threat.pos);
+        // Silent on the RWR now and lately: a heat seeker.
+        const bool heat_seeker = maws_only && threat.heat_seeker && missile_memory_ <= 0.0;
+        const bool flares_wanted = heat_seeker || (maws && threat.wants_flares());
+        if (threat.launch) {
+            // MAWS launch call: a program at once; the turn follows below.
+            out.dispense_flare = flares_wanted;
+            out.dispense = !heat_seeker;
+            flare_timer_ = chaff_interval_s;
+        }
 
         const double agl = environment::GroundCollision::get_agl(self.state);
         const double terrain = self.state.altitude() - agl;
@@ -80,37 +111,54 @@ public:
         double altitude = cruise_alt_;
         bool dispense = false;
 
-        if (rwr.missile_valid && t_go < break_time_to_go_s) {
+        if (missile_known && t_go < break_time_to_go_s) {
             mode = Mode::LAST_DITCH;
             // Break toward the side the missile is on (or the beam side if it
             // is dead astern), so the turn crosses its line of sight.
-            const double side = std::abs(std::sin(rwr.missile_bearing)) > 0.2
-                                    ? (rwr.missile_bearing > 0.0 ? 1.0 : -1.0)
+            const double side = std::abs(std::sin(missile_bearing)) > 0.2
+                                    ? (missile_bearing > 0.0 ? 1.0 : -1.0)
                                     : (beam_side_ != 0.0 ? -beam_side_ : 1.0);
             out.stick = break_turn(self, side);
-            out.throttle = 1.0;
-            out.dispense = chaff_timer_ <= 0.0;
-            if (out.dispense) chaff_timer_ = 0.3;
+            out.throttle = heat_seeker ? 0.8 : 1.0;
+            if (!heat_seeker) {
+                out.dispense = chaff_timer_ <= 0.0;
+                if (out.dispense) chaff_timer_ = 0.3;
+            }
+            // A flare salvo with the break against anything that may see heat.
+            if (flares_wanted && !salvo_fired_) {
+                salvo_left_ = FLARE_SALVO_PROGRAMS;
+                salvo_fired_ = true;
+            }
+            fire_salvo(out);
             return out;
         }
+        if (!missile_known || t_go > break_time_to_go_s + 1.0) salvo_fired_ = false;
         // A missile that drops off the RWR may only be searching: keep beaming
         // its last bearing until it has had time to go by.
         if (rwr.missile_valid) {
             missile_memory_ = threat_memory_s;
             missile_azimuth_ = psi + rwr.missile_bearing;
+        } else if (maws_only) {
+            // Only the MAWS has it: beam where it is.
+            missile_azimuth_ = psi + missile_bearing;
+            missile_memory_ = std::max(0.0, missile_memory_ - dt);
         } else {
             missile_memory_ = std::max(0.0, missile_memory_ - dt);
         }
-        if (rwr.missile_valid || missile_memory_ > 0.0) {
+        if (missile_known || missile_memory_ > 0.0) {
             mode = Mode::NOTCH_MISSILE;
             // Off the RWR, the missile is somewhere between the launcher and
             // here: beam the launcher, which also denies it the datalink.
-            const double threat = rwr.missile_valid ? missile_azimuth_
-                                  : rwr.emitter_valid ? psi + rwr.emitter_bearing
-                                                      : missile_azimuth_;
-            heading = beam_heading(psi, threat, beam_side_);
+            const double threat_az = missile_known       ? missile_azimuth_
+                                     : rwr.emitter_valid ? psi + rwr.emitter_bearing
+                                                         : missile_azimuth_;
+            heading = beam_heading(psi, threat_az, beam_side_);
             altitude = terrain + floor_agl_m;
             dispense = rwr.missile_valid && rwr.missile_range_m < 12000.0 && beaming(rwr.missile_bearing);
+            if (flares_wanted && t_go < FLARE_TGO_S && flare_timer_ <= 0.0) {
+                out.dispense_flare = true;
+                flare_timer_ = chaff_interval_s;
+            }
         } else if (rwr.level == RwrStatus::Level::LOCK && rwr.emitter_valid) {
             mode = Mode::NOTCH_RADAR;
             heading = beam_heading(psi, psi + rwr.emitter_bearing, beam_side_);
@@ -131,6 +179,7 @@ public:
             out.dispense = true;
             chaff_timer_ = chaff_interval_s;
         }
+        fire_salvo(out);
 
         // Heading and altitude hold: turn rate from the heading error, a level
         // (or descending) turn at the bank that gives it, G from the altitude error.
@@ -155,12 +204,21 @@ public:
         // endgame, and turn rate peaks near corner speed, far below Mach 1.4.
         const double v_target = 0.85 * environment::Atmosphere1976::compute(self.state.altitude()).speed_of_sound;
         out.throttle = V < v_target ? 1.0 : 0.7;
+        // Against a heat seeker, out of reheat: the plume is what it sees.
+        if (heat_seeker) out.throttle = std::min(out.throttle, 0.8);
         return out;
     }
 
 private:
+    static constexpr int FLARE_SALVO_PROGRAMS = 3; ///< Flare programs fired with the last-ditch break
+    static constexpr double FLARE_TGO_S = 6.0;     ///< Flares while beaming a missile this close to impact
+
     double trim_{0.0};
     double chaff_timer_{0.0};
+    double flare_timer_{0.0};
+    int salvo_left_{0};
+    bool salvo_fired_{false};
+    bool flare_out_{false};
     double prev_missile_range_{-1.0};
     double missile_memory_{0.0};
     double missile_azimuth_{0.0};
@@ -188,6 +246,16 @@ private:
         else if (side > 0.0 && e_right + SWITCH_MARGIN < e_left) side = -1.0;
         else if (side < 0.0 && e_left + SWITCH_MARGIN < e_right) side = 1.0;
         return side > 0.0 ? h_left : h_right;
+    }
+
+    /// @brief Fire what is left of the flare salvo, one program per press of
+    /// the switch (released every other step), and remember the switch.
+    void fire_salvo(AircraftControls& out) noexcept {
+        if (salvo_left_ > 0) {
+            out.dispense_flare = !flare_out_;
+            if (out.dispense_flare) --salvo_left_;
+        }
+        flare_out_ = out.dispense_flare;
     }
 
     [[nodiscard]] static bool beaming(double relative_bearing) noexcept {
