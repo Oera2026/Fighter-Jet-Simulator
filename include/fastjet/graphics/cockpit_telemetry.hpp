@@ -52,17 +52,19 @@ struct CombatTelemetry {
     bool blink = false;               ///< Warning flash phase (~3 Hz)
 
     // Weapons employment & DLZ
-    int selected_weapon = 0;          ///< 0: GUN, 1: IR (AIM-9X), 2: RADAR (AIM-120C)
-    char weapon_name[16] = "GUN";
-    int missiles_remaining = 0;
-    bool missile_locked = false;      ///< Weapon has valid lock
-    bool shoot_cue = false;           ///< Target within DLZ / in parameters
+    int selected_weapon = 0;          ///< 0: GUN, 1: SRM (heat seeker), 2: MRM (radar missile)
+    char weapon_name[16] = "GUN";     ///< Selected store's HUD legend ("9X", "120D", "MTR"...)
+    int missiles_remaining = 0;       ///< Rounds left in the selected store
+    bool missile_locked = false;      ///< Selected missile has what it needs: seeker tone or radar STT
+    bool shoot_cue = false;           ///< Locked and inside the launch zone
     double dlz_rmax_m = 0.0;          ///< Maximum kinematic range
     double dlz_rne_m = 0.0;           ///< No-escape range against manoeuvring target
     double dlz_rmin_m = 0.0;          ///< Minimum arming/turn range
     bool ir_seeker_active = false;    ///< Uncaged heat-seeker looking
     double ir_seeker_dir_b[3] = {1.0, 0.0, 0.0}; ///< Seeker bore/track vector
     bool ir_seeker_locked = false;    ///< Heat lock acquired
+    char weapon_cue[12] = "";         ///< Flashing pickle feedback, e.g. "NO LOCK" (empty: none)
+    double weapon_cue_s = 0.0;        ///< Time the cue has left
 };
 
 /// @brief The fire-control radar (FCR) page: a B-scope of azimuth against range.

@@ -851,7 +851,8 @@ public:
             ry -= line;
         }
 
-        // Armament selection: Gun vs Missile (AIM-9X / AIM-120C)
+        // Armament: the gun, or the selected missile store's legend and count
+        // ("9X 2", "120D 4"). Its lock state is cued under the pipper with SHOOT.
         if (c.selected_weapon == 0) {
             std::snprintf(buf, sizeof(buf), "%s %d", c.gun_name, c.ammo);
             draw_string(buf, rx, ry, D * 0.008f, -D, c.ammo > 0 ? hud_col : amber);
@@ -859,7 +860,6 @@ public:
         } else {
             std::snprintf(buf, sizeof(buf), "%s %d", c.weapon_name, c.missiles_remaining);
             draw_string(buf, rx, ry, D * 0.008f, -D, c.missiles_remaining > 0 ? hud_col : amber);
-            if (c.missile_locked) draw_string("LOCK", rx + D * 0.052f, ry, D * 0.008f, -D, hud_col);
         }
 
         if (c.chaff >= 0) {
@@ -904,9 +904,16 @@ public:
             add_line(dlz_x - D * 0.004f, tgt_y - D * 0.002f, -D, dlz_x - D * 0.004f, tgt_y + D * 0.002f, -D, hud_col);
         }
 
-        // Flashing SHOOT cue when target is within parameters
-        if (c.shoot_cue && c.blink) {
-            draw_string_centered("SHOOT", 0.0f, -D * std::tan(0.015f), D * 0.012f, -D, hud_col);
+        // Missile cues, centre low: a flashing SHOOT when locked inside the
+        // launch zone, otherwise a flashing NO LOCK (amber) after a pickle
+        // that found nothing to shoot at, or a steady LOCK.
+        const float cue_y = -D * std::tan(0.015f);
+        if (c.shoot_cue) {
+            if (c.blink) draw_string_centered("SHOOT", 0.0f, cue_y, D * 0.012f, -D, hud_col);
+        } else if (c.selected_weapon > 0 && c.weapon_cue[0] && c.weapon_cue_s > 0.0) {
+            if (c.blink) draw_string_centered(c.weapon_cue, 0.0f, cue_y, D * 0.010f, -D, amber);
+        } else if (c.selected_weapon > 0 && c.missile_locked) {
+            draw_string_centered("LOCK", 0.0f, cue_y, D * 0.009f, -D, hud_col);
         }
 
         // Heat seeker reticle (AIM-9X / ASRAAM / AIM-9M)

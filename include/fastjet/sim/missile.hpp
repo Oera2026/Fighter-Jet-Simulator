@@ -73,9 +73,25 @@ struct MissileSpec {
     double flare_susceptibility{0.0}; ///< Share of a flare's relative brightness that steals the track
     double flare_reject_s{0.0};     ///< Time a decoyed seeker takes to reject the flare (counter-countermeasures)
 
+    /// A seeker already tracking holds on this much further than it can
+    /// acquire: tracking needs less signal than detection (estimate).
+    static constexpr double IR_TRACK_MARGIN = 1.15;
+
     [[nodiscard]] double ref_area() const noexcept { return 0.25 * M_PI * diameter_m * diameter_m; }
     [[nodiscard]] double motor_time_s() const noexcept { return burn_time_s + sustain_time_s; }
     [[nodiscard]] bool infrared() const noexcept { return seeker == SeekerType::INFRARED; }
+
+    /**
+     * @brief Heat-seeker lock-on range against a target of IR @p signature
+     * (1 = a single-engine fighter's tail at military power; see ir_signature()).
+     *
+     * A point source's irradiance at the seeker falls as 1/R^2, so the range
+     * at which it gives the same signal-to-noise scales as sqrt(signature).
+     * Atmospheric absorption is ignored. Never beyond the seeker's own range.
+     */
+    [[nodiscard]] double ir_lock_range(double signature) const noexcept {
+        return std::min(seeker_range_m, ir_lock_range_m * std::sqrt(std::max(0.0, signature)));
+    }
 
     /// @brief Zero-lift drag coefficient against Mach: a transonic rise, then a slow supersonic decay.
     [[nodiscard]] static double cd0(double mach) noexcept {
@@ -216,6 +232,25 @@ struct FlareDecoy {
     const math::Vector3 rf = f.pos - seeker_pos;
     if (rt.norm() < 1.0) return false;
     return AirCombatGeometry::angle_between(rt, rf) <= fov_rad;
+}
+
+/**
+ * @brief Chance that a flare blooming in an IR seeker's gate steals its track.
+ *
+ * The seeker sees two sources in its gate and follows the brighter share, so
+ * the odds go with the flare's share of the light, I_f / (I_f + S), times the
+ * seeker's susceptibility (its counter-countermeasures). A hot target (from
+ * the tail, in reheat) is hard to decoy; a cold one (head-on, at idle) almost
+ * always loses the seeker to a fresh flare. The gain keeps the earlier odds
+ * (1.25 x susceptibility for a fresh flare) against a fighter's tail at
+ * military power (signature 1).
+ */
+[[nodiscard]] inline double flare_seduction_chance(double susceptibility, double flare_intensity,
+                                                   double target_signature) noexcept {
+    constexpr double GAIN = 1.75;
+    const double i_f = std::max(0.0, flare_intensity);
+    const double share = i_f / std::max(1e-6, i_f + std::max(0.0, target_signature));
+    return std::clamp(GAIN * susceptibility * share, 0.0, 0.95);
 }
 
 /**
@@ -422,41 +457,183 @@ inline constexpr double RUN_DASH_MACH = 1.5;         ///< ...and no faster than 
 }
 
 /**
- * @brief Dynamic Launch Zone (DLZ) range bracket for cockpit HUD and avionics.
+ * @brief Dynamic Launch Zone (DLZ) range bracket for the HUD.
+ *
+ * Found by flying the missile itself (predict_flyout) from the launcher's
+ * present state at a target placed along the present line of sight with its
+ * present velocity: Rmax against a target that holds course, Rne against one
+ * that turns cold and runs, Rmin the shortest range that still hits (inside
+ * it the missile cannot arm, or turn, before the target goes by; never less
+ * than the missile's minimum launch range). The hits lie in one band of
+ * range: a coarse geometric scan finds it and bisection refines its edges.
+ * That is a few dozen flyouts, about ten milliseconds for a radar missile,
+ * so a display runs a LaunchZoneSolver a few flyouts per frame instead.
  */
 struct DynamicLaunchZone {
     double rmax_m = 0.0;
     double rne_m = 0.0;
     double rmin_m = 0.0;
 
+    /// @brief A launch zone exists and @p range_m is inside it.
     [[nodiscard]] bool in_envelope(double range_m) const noexcept {
-        return range_m >= rmin_m && range_m <= rmax_m;
+        return rmax_m > rmin_m && range_m >= rmin_m && range_m <= rmax_m;
     }
 
-    [[nodiscard]] static DynamicLaunchZone compute(const fdm::FlightState& launcher,
-                                                   const fdm::FlightState& target,
-                                                   const MissileSpec& spec) noexcept {
-        DynamicLaunchZone dlz;
-        dlz.rmin_m = spec.min_launch_range_m;
+    /// @brief The whole computation at once (tests, tools).
+    [[nodiscard]] static DynamicLaunchZone compute(const fdm::FlightState& launcher, const fdm::FlightState& target,
+                                                   const MissileSpec& spec) noexcept;
+};
+
+/**
+ * @brief The DynamicLaunchZone search, one flyout at a time, so a display can
+ * spread it over frames: begin() with the present geometry, then advance()
+ * a few flyouts each frame until it reports done.
+ *
+ * The hits lie in one band of launch range. A geometric scan of SCAN_POINTS
+ * ranges finds it; bisection refines its near edge (Rmin) and far edge
+ * (Rmax) against a target that holds course; a second scan inside that band
+ * against a target that turns cold finds Rne.
+ */
+class LaunchZoneSolver {
+public:
+    static constexpr int SCAN_POINTS = 7;
+    static constexpr int BISECTIONS = 5;
+
+    void begin(const fdm::FlightState& launcher, const fdm::FlightState& target, const MissileSpec& spec) noexcept {
+        spec_ = spec;
+        pos_ = launcher.pos_ned;
+        vel_ = launcher.velocity_ned();
+        tgt_vel_ = target.velocity_ned();
         const math::Vector3 los = target.pos_ned - launcher.pos_ned;
         const double r = los.norm();
-        if (r < 1.0) {
-            dlz.rmax_m = spec.seeker_range_m;
-            dlz.rne_m = dlz.rmax_m * 0.55;
-            return dlz;
+        u_ = r > 1.0 ? los / r : launcher.q_att.rotate_body_to_ned(math::Vector3(1.0, 0.0, 0.0));
+        zone_ = {};
+        zone_.rmin_m = zone_.rmax_m = zone_.rne_m = spec.min_launch_range_m;
+        model_ = FlyoutTarget::STRAIGHT;
+        // No missile flies further than its time of flight at Mach 4.
+        start_band(spec.min_launch_range_m, std::max(spec.min_launch_range_m + 100.0, spec.max_tof_s * 1300.0));
+    }
+
+    /// @brief Fly up to @p flyouts more; true once the zone is complete.
+    bool advance(int flyouts) noexcept {
+        for (int n = 0; n < flyouts && phase_ != Phase::DONE; ++n) step();
+        return done();
+    }
+
+    [[nodiscard]] bool done() const noexcept { return phase_ == Phase::DONE; }
+    [[nodiscard]] const DynamicLaunchZone& zone() const noexcept { return zone_; }
+
+private:
+    enum class Phase : uint8_t { SCAN, NEAR_EDGE, FAR_EDGE, DONE };
+
+    MissileSpec spec_{};
+    math::Vector3 pos_{}, vel_{}, tgt_vel_{}, u_{1.0, 0.0, 0.0};
+    DynamicLaunchZone zone_{};
+    FlyoutTarget model_{FlyoutTarget::STRAIGHT};
+    Phase phase_{Phase::DONE};
+    int k_{0}, left_{0};
+    double r_{0.0}, ratio_{1.0};
+    double miss_below_{-1.0}, first_hit_{-1.0}, last_hit_{-1.0}, miss_above_{-1.0};
+    double hit_r_{0.0}, miss_r_{0.0}, near_{0.0}, far_{0.0};
+
+    [[nodiscard]] bool hits(double r) const noexcept {
+        return predict_flyout(spec_, pos_, vel_, pos_ + u_ * r, tgt_vel_, model_).hit;
+    }
+
+    void start_band(double lo, double hi) noexcept {
+        phase_ = Phase::SCAN;
+        k_ = 0;
+        r_ = std::max(1.0, lo);
+        ratio_ = std::pow(std::max(hi / r_, 1.0 + 1e-6), 1.0 / (SCAN_POINTS - 1));
+        miss_below_ = first_hit_ = last_hit_ = miss_above_ = -1.0;
+    }
+
+    void step() noexcept {
+        switch (phase_) {
+            case Phase::SCAN: {
+                if (hits(r_)) {
+                    if (first_hit_ < 0.0) first_hit_ = r_;
+                    last_hit_ = r_;
+                } else if (first_hit_ < 0.0) {
+                    miss_below_ = r_;
+                } else {
+                    miss_above_ = r_;
+                }
+                ++k_;
+                r_ *= ratio_;
+                if (miss_above_ > 0.0 || k_ >= SCAN_POINTS) scan_done();
+                break;
+            }
+            case Phase::NEAR_EDGE:
+            case Phase::FAR_EDGE: {
+                const double mid = 0.5 * (hit_r_ + miss_r_);
+                (hits(mid) ? hit_r_ : miss_r_) = mid;
+                if (--left_ > 0) break;
+                if (phase_ == Phase::NEAR_EDGE) {
+                    near_ = hit_r_;
+                    start_far_edge();
+                } else {
+                    far_ = hit_r_;
+                    band_done(true);
+                }
+                break;
+            }
+            case Phase::DONE: break;
         }
-        const math::Vector3 u = los / r;
-        const double v_launch = launcher.vel_b.x;
-        const math::Vector3 tgt_v = target.velocity_ned();
-        const double tgt_speed = tgt_v.norm();
-        const double aspect_cos = tgt_speed > 1.0 ? -tgt_v.dot(u) / tgt_speed : 0.0;
-        const double alt_scale = std::clamp(1.0 - target.pos_ned.z / 15000.0, 0.6, 2.0);
-        const double base_range = spec.seeker_range_m * alt_scale;
-        dlz.rmax_m = std::max(dlz.rmin_m * 1.5, base_range * (0.8 + 0.35 * aspect_cos + 0.15 * (v_launch / 300.0)));
-        dlz.rne_m = std::max(dlz.rmin_m * 1.2, dlz.rmax_m * 0.45);
-        return dlz;
+    }
+
+    void scan_done() noexcept {
+        if (first_hit_ < 0.0) {
+            band_done(false);
+            return;
+        }
+        near_ = first_hit_;
+        far_ = last_hit_;
+        if (miss_below_ > 0.0 && model_ == FlyoutTarget::STRAIGHT) {
+            phase_ = Phase::NEAR_EDGE;
+            hit_r_ = first_hit_;
+            miss_r_ = miss_below_;
+            left_ = BISECTIONS;
+            return;
+        }
+        start_far_edge();
+    }
+
+    void start_far_edge() noexcept {
+        if (miss_above_ < 0.0) {
+            band_done(true);
+            return;
+        }
+        phase_ = Phase::FAR_EDGE;
+        hit_r_ = last_hit_;
+        miss_r_ = miss_above_;
+        left_ = BISECTIONS;
+    }
+
+    void band_done(bool found) noexcept {
+        if (model_ == FlyoutTarget::STRAIGHT) {
+            if (!found) {
+                phase_ = Phase::DONE; // No zone: Rmin = Rmax
+                return;
+            }
+            zone_.rmin_m = near_;
+            zone_.rmax_m = zone_.rne_m = far_;
+            model_ = FlyoutTarget::TURN_COLD;
+            start_band(near_, far_);
+            return;
+        }
+        zone_.rne_m = found ? far_ : zone_.rmin_m;
+        phase_ = Phase::DONE;
     }
 };
+
+inline DynamicLaunchZone DynamicLaunchZone::compute(const fdm::FlightState& launcher, const fdm::FlightState& target,
+                                                    const MissileSpec& spec) noexcept {
+    LaunchZoneSolver s;
+    s.begin(launcher, target, spec);
+    while (!s.advance(16)) {}
+    return s.zone();
+}
 
 /**
  * @brief One missile in flight: body, guidance phase and fuze.
@@ -502,8 +679,11 @@ struct Missile {
      * @brief Advance guidance and flight one step.
      * @param uplink   The launcher's radar holds a live track this step.
      * @param tgt_pos  True target state (used only through the phase's sensor).
+     * @param tgt_ir_signature The target's IR signature seen from the missile
+     *        (heat seekers only): it sets how far out the seeker holds the track.
      */
-    void update(double dt, bool uplink, const math::Vector3& tgt_pos, const math::Vector3& tgt_vel) noexcept {
+    void update(double dt, bool uplink, const math::Vector3& tgt_pos, const math::Vector3& tgt_vel,
+                double tgt_ir_signature = 1.0) noexcept {
         // Infrared seekers track target thermal emission directly without radar datalink
         if (spec.infrared()) {
             const math::Vector3 boresight = body.vel.normalized();
@@ -513,7 +693,10 @@ struct Missile {
             } else {
                 const double tgt_dist = (tgt_pos - body.pos).norm();
                 const double ata = AirCombatGeometry::angle_between(boresight, tgt_pos - body.pos);
-                if (ata <= lim.gimbal_rad && tgt_dist <= spec.seeker_range_m) {
+                const double track_range = spec.ir_lock_range_m > 0.0
+                                               ? MissileSpec::IR_TRACK_MARGIN * spec.ir_lock_range(tgt_ir_signature)
+                                               : spec.seeker_range_m;
+                if (ata <= lim.gimbal_rad && tgt_dist <= track_range) {
                     phase = Phase::ACTIVE_TRACK;
                     est_pos = tgt_pos;
                     est_vel = tgt_vel;
@@ -674,6 +857,56 @@ namespace missile_specs {
     return s;
 }
 
+/**
+ * @brief AIM-120D AMRAAM: the AIM-120C airframe with a bigger motor grain,
+ * a better seeker and two-way datalink. Open sources credit it with about 50%
+ * more range than the C-7; most of that comes from lofting, which this
+ * model does not fly, so it gets only the extra impulse. Estimates.
+ */
+[[nodiscard]] inline constexpr MissileSpec aim120d() noexcept {
+    MissileSpec s = aim120c();
+    s.name = "AIM-120D";
+    s.short_name = "120D";
+    s.launch_mass_kg = 161.0;
+    s.burnout_mass_kg = 111.0;
+    s.burn_time_s = 5.5;              // 50 kg of propellant at the C's Isp
+    s.seeker_range_m = 16000.0;
+    s.pitbull_range_m = 12000.0;
+    s.notch_mps = 25.0;
+    s.chaff_seduction = 0.35;
+    s.max_tof_s = 90.0;
+    return s;
+}
+
+/**
+ * @brief MBDA Meteor: active radar BVR missile on a throttleable ducted
+ * rocket (ramjet). A short boost to ramjet take-over speed, then the
+ * sustainer holds Mach 3+ for most of the flight, so it arrives with energy
+ * to spare: the largest no-escape zone of any air-to-air missile. 190 kg,
+ * 178 mm, 3.65 m. Thrust and burn times are estimates.
+ */
+[[nodiscard]] inline constexpr MissileSpec meteor() noexcept {
+    MissileSpec s = aim120c();
+    s.name = "METEOR";
+    s.short_name = "MTR";
+    s.launch_mass_kg = 190.0;
+    s.burnout_mass_kg = 135.0;
+    s.thrust_n = 20000.0;             // Integral booster
+    s.burn_time_s = 3.0;
+    s.sustain_thrust_n = 2200.0;      // Ramjet cruise at Mach 3+ (estimate)
+    s.sustain_time_s = 40.0;
+    s.cl_max = 11.0;
+    s.g_limit = 35.0;
+    s.seeker_range_m = 15000.0;
+    s.pitbull_range_m = 12000.0;
+    s.notch_mps = 25.0;
+    s.chaff_seduction = 0.30;
+    s.max_tof_s = 110.0;
+    s.min_speed_mps = 200.0;
+    s.min_launch_range_m = 1200.0;
+    return s;
+}
+
 /// @brief AIM-9X Sidewinder: High-off-boresight thrust-vectored imaging IR dogfight missile (60 G)
 [[nodiscard]] inline constexpr MissileSpec aim9x() noexcept {
     MissileSpec s{};
@@ -726,6 +959,25 @@ namespace missile_specs {
     return s;
 }
 
+/**
+ * @brief IRIS-T (Typhoon, Luftwaffe and others): imaging IR dogfight
+ * missile with thrust vectoring and a +-90 deg seeker. 87 kg, 127 mm.
+ * Seeker and motor figures beyond that are estimates, close to the AIM-9X.
+ */
+[[nodiscard]] inline constexpr MissileSpec iris_t() noexcept {
+    MissileSpec s = aim9x();
+    s.name = "IRIS-T";
+    s.short_name = "IRIS";
+    s.launch_mass_kg = 87.4;
+    s.burnout_mass_kg = 58.0;
+    s.thrust_n = 16000.0;
+    s.burn_time_s = 3.2;
+    s.ir_lock_range_m = 15500.0;
+    s.flare_susceptibility = 0.15;
+    s.flare_reject_s = 0.5;
+    return s;
+}
+
 /// @brief AIM-9M Sidewinder (for A-10C): Classic analog IR seeker, 35 G
 [[nodiscard]] inline constexpr MissileSpec aim9m() noexcept {
     MissileSpec s = aim9x();
@@ -734,6 +986,7 @@ namespace missile_specs {
     s.g_limit = 35.0;
     s.tvc_deg = 0.0;
     s.seeker_gimbal_deg = 45.0;
+    s.ir_lock_range_m = 11000.0;    // InSb, not imaging: shorter reach (estimate)
     s.flare_susceptibility = 0.45;
     s.max_launch_ata_deg = 40.0;
     return s;

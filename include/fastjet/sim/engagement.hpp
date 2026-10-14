@@ -94,6 +94,30 @@ enum class WeaponsLoadout : uint8_t {
     FULL_LOADOUT,
 };
 
+/**
+ * @brief How an AI pilot of each skill employs missiles in a dogfight.
+ * Every skill flies the same missiles; what changes is how far off the nose
+ * he will cue the heat seeker and trust its lock, how long he waits for a
+ * steady tone, how he spaces his shots, his radar-missile doctrine and how
+ * fast he locks you up with the radar.
+ */
+struct AiMissileDiscipline {
+    double off_boresight_deg;  ///< Heat-seeker cueing and shot limit (an ace's helmet sight: the whole gimbal)
+    double confirm_lock_s;     ///< Tone held before pickling
+    double spacing_s;          ///< Least time between heat-seeker shots
+    LaunchDoctrine mrm_doctrine;
+    double radar_acquire_s;    ///< Time to lock the bandit up with the radar
+
+    [[nodiscard]] static constexpr AiMissileDiscipline of(AiSkill s) noexcept {
+        switch (s) {
+            case AiSkill::NOVICE:  return {15.0, 1.0, 8.0, LaunchDoctrine::MAX_RANGE, 2.5};
+            case AiSkill::VETERAN: return {30.0, 0.6, 6.0, LaunchDoctrine::MAX_RANGE, 1.5};
+            case AiSkill::ACE:     return {180.0, 0.4, 4.0, LaunchDoctrine::NO_ESCAPE, 1.0};
+        }
+        return of(AiSkill::VETERAN);
+    }
+};
+
 [[nodiscard]] constexpr const char* to_string(WeaponsLoadout w) noexcept {
     switch (w) {
         case WeaponsLoadout::GUNS_ONLY:    return "GUNS ONLY";
@@ -223,6 +247,8 @@ public:
     std::array<bool, World::kMaxAircraft> ai_controlled{};
     RangeTargetPilot range_pilot{};
     MissileShooter shooter{};    ///< The bandit's missile shot decisions (evade mode)
+    std::array<HeatSeekerShooter, World::kMaxAircraft> srm_shooters{}; ///< AI heat-seeker shots (dogfight)
+    std::array<MissileShooter, World::kMaxAircraft> mrm_shooters{};    ///< AI radar-missile shots (dogfight)
     EvasionPilot evader{};       ///< Flies the player's jet in an AI-flown evade (demo, tests)
     EngagementStats stats{};
     EngagementOutcome outcome{EngagementOutcome::IN_PROGRESS};
@@ -285,6 +311,8 @@ public:
 
         shooter = MissileShooter{};
         shooter.reset();
+        srm_shooters.fill(HeatSeekerShooter{});
+        mrm_shooters.fill(MissileShooter{});
         evader = EvasionPilot{};
         evader.reset();
         const AirframeMissileLoadout own_loadout = airframe_missile_loadout(s.own_type);
@@ -297,30 +325,28 @@ public:
             ai[BANDIT].far_chase_q_pa = EVADE_FAR_CHASE_Q_PA;
             world.radars[BANDIT].enable(OWN, profile.radar_acquire_s);
             const bool radar = world.radars[BANDIT].spec.fitted;
-            world.missile_spec[BANDIT] = missile_specs::aim120c();
-            world.missile_load[BANDIT] = radar ? profile.missiles : 0;
+            world.stores[BANDIT].mrm = {missile_specs::aim120c(), radar ? profile.missiles : 0};
             shooter.doctrine = radar ? profile.doctrine : LaunchDoctrine::NONE;
             shooter.shoot_shoot = profile.shoot_shoot;
             setup_data.time_limit_s = profile.survive_s;
-        } else {
-            // Dogfight mode: load weapons according to s.loadout
-            switch (s.loadout) {
-                case WeaponsLoadout::GUNS_ONLY:
-                    world.missile_load[OWN] = 0;
-                    world.missile_load[BANDIT] = 0;
-                    break;
-                case WeaponsLoadout::GUNS_AND_IR:
-                    world.missile_spec[OWN] = own_loadout.srm_spec;
-                    world.missile_load[OWN] = own_loadout.srm_count;
-                    world.missile_spec[BANDIT] = bandit_loadout.srm_spec;
-                    world.missile_load[BANDIT] = bandit_loadout.srm_count;
-                    break;
-                case WeaponsLoadout::FULL_LOADOUT:
-                    world.missile_spec[OWN] = own_loadout.mrm_count > 0 ? own_loadout.mrm_spec : own_loadout.srm_spec;
-                    world.missile_load[OWN] = own_loadout.mrm_count + own_loadout.srm_count;
-                    world.missile_spec[BANDIT] = bandit_loadout.mrm_count > 0 ? bandit_loadout.mrm_spec : bandit_loadout.srm_spec;
-                    world.missile_load[BANDIT] = bandit_loadout.mrm_count + bandit_loadout.srm_count;
-                    break;
+        } else if (s.loadout != WeaponsLoadout::GUNS_ONLY) {
+            // Dogfight: each jet's own heat seekers, and its radar missiles in the full load.
+            const bool with_mrm = s.loadout == WeaponsLoadout::FULL_LOADOUT;
+            world.stores[OWN].load(own_loadout, with_mrm);
+            world.stores[BANDIT].load(bandit_loadout, with_mrm);
+            for (int i = 0; i < world.count; ++i) {
+                const auto idx = static_cast<size_t>(i);
+                if (!ai_controlled[idx]) continue;
+                const AiMissileDiscipline d = AiMissileDiscipline::of(i == BANDIT ? bandit_skill : s.skill);
+                world.seekers[idx].search_half_deg = d.off_boresight_deg;
+                srm_shooters[idx].off_boresight_deg = d.off_boresight_deg;
+                srm_shooters[idx].confirm_lock_s = d.confirm_lock_s;
+                srm_shooters[idx].spacing_s = d.spacing_s;
+                // Radar missiles need the radar hunting the bandit (an AI
+                // pilot's radar is otherwise off in a dogfight).
+                const bool rf = world.stores[idx].mrm.count > 0 && world.radars[idx].spec.fitted;
+                mrm_shooters[idx].doctrine = rf ? d.mrm_doctrine : LaunchDoctrine::NONE;
+                if (rf) world.radars[idx].enable(i == OWN ? BANDIT : OWN, d.radar_acquire_s);
             }
         }
         chaff_at_start_ = world.chaff_load[OWN];
@@ -358,7 +384,8 @@ public:
                 const bool visual_fight = range < VISUAL_FIGHT_RANGE_M && !missile_defence;
                 controls[idx] = visual_fight ? bfm : defend;
             } else if (ai_controlled[idx]) {
-                controls[idx] = ai[idx].update(dt, self, foe);
+                const MissileThreat threat = evade_mode() ? MissileThreat{} : detect_missile_threat(i);
+                controls[idx] = ai[idx].update(dt, self, foe, threat);
                 if (evade_mode() && idx == BANDIT) {
                     controls[idx].pickle = false;
                     controls[idx].dispense = false;
@@ -378,6 +405,8 @@ public:
             for (auto& c : controls) c.trigger = false;
         } else if (evade_mode()) {
             (void)shooter.update(dt, world, BANDIT, OWN);
+        } else {
+            employ_missiles(dt);
         }
 
         world.step(dt, controls);
@@ -386,6 +415,43 @@ public:
     }
 
     [[nodiscard]] bool evade_mode() const noexcept { return setup_data.mode == EngagementMode::EVADE; }
+
+    /// Range inside which a pilot sees a missile whose motor is burning (its smoke trail) [m].
+    static constexpr double VISUAL_MISSILE_SMOKE_M = 5000.0;
+    /// Range inside which a pilot sees a coasting missile [m].
+    static constexpr double VISUAL_MISSILE_M = 1500.0;
+
+    /**
+     * @brief What AI pilot @p i knows about missiles coming at him: the one
+     * place an AI's missile threat picture comes from (a missile approach
+     * warner can feed it here).
+     *
+     * Today he knows a radar missile his RWR hears (the launcher's datalink,
+     * or its own seeker once pointed at him), and any missile he can see: one
+     * whose motor is still burning (the smoke trail) inside
+     * VISUAL_MISSILE_SMOKE_M, or any inside VISUAL_MISSILE_M. A heat seeker
+     * that has burnt out further away arrives unseen. The nearest one known
+     * is the threat.
+     */
+    [[nodiscard]] MissileThreat detect_missile_threat(int i) const noexcept {
+        MissileThreat threat;
+        const Aircraft& self = world.aircraft[static_cast<size_t>(i)];
+        for (const Missile& m : world.missiles) {
+            if (!m.active || m.target != i || m.shooter == i) continue;
+            const math::Vector3 r = m.body.pos - self.position();
+            const double range = r.norm();
+            const bool heard = world.missile_warning(m);
+            const bool seen = range < VISUAL_MISSILE_M ||
+                              (range < VISUAL_MISSILE_SMOKE_M && m.body.motor_burning(m.spec));
+            if (!(heard || seen) || (threat.inbound && range >= threat.range_m)) continue;
+            threat.inbound = true;
+            threat.radar_guided = heard;
+            threat.pos = m.body.pos;
+            threat.range_m = range;
+            threat.closure_mps = range > 1.0 ? (self.velocity() - m.body.vel).dot(r / range) : 0.0;
+        }
+        return threat;
+    }
 
     /// @brief What the player's RWR shows.
     [[nodiscard]] RwrStatus own_rwr() const noexcept { return world.rwr(OWN); }
@@ -412,6 +478,17 @@ private:
     int chaff_at_start_{0};
     double unlocked_far_s_{0.0};
     std::array<double, World::kMaxAircraft> eject_timer_{};
+
+    /// @brief Dogfight: each AI pilot's missile shots, heat seekers first; one
+    /// missile of his in the air at a time.
+    void employ_missiles(double dt) noexcept {
+        for (int i = 0; i < world.count; ++i) {
+            const auto idx = static_cast<size_t>(i);
+            if (!ai_controlled[idx]) continue;
+            const int foe = i == OWN ? BANDIT : OWN;
+            if (!srm_shooters[idx].update(dt, world, i, foe)) (void)mrm_shooters[idx].update(dt, world, i, foe);
+        }
+    }
 
     /// @brief A conscious pilot in a jet that is destroyed, or that has broken
     /// itself by over-G, pulls the handle once he has taken it in.
@@ -521,7 +598,7 @@ private:
         constexpr double DT = Aircraft::DT;
         const auto b = static_cast<size_t>(BANDIT);
         const bool nothing_inbound = world.missiles_in_flight(BANDIT, OWN) == 0;
-        const bool winchester = world.missile_load[b] == 0 && world.aircraft[b].gun.ammo == 0 && nothing_inbound;
+        const bool winchester = world.stores[b].missiles() == 0 && world.aircraft[b].gun.ammo == 0 && nothing_inbound;
         const double range = (world.aircraft[b].position() - world.aircraft[OWN].position()).norm();
         const bool lost = !world.radars[b].locked() && nothing_inbound && range > ESCAPE_RANGE_M;
         unlocked_far_s_ = lost ? unlocked_far_s_ + DT : 0.0;

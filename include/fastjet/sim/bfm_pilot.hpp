@@ -50,6 +50,21 @@ struct PilotSkill {
     }
 };
 
+/**
+ * @brief A missile the pilot knows is coming at him. Engagement::detect_missile_threat()
+ * is the one place that decides what an AI pilot knows about missiles (the
+ * RWR and what he can see today; a missile approach warner can feed it).
+ */
+struct MissileThreat {
+    bool inbound{false};
+    bool radar_guided{false}; ///< Heard on the RWR: a radar missile. Otherwise the type is unknown.
+    math::Vector3 pos{};      ///< Where the missile is [m, NED]
+    double range_m{0.0};
+    double closure_mps{0.0};
+
+    [[nodiscard]] double time_to_go() const noexcept { return closure_mps > 50.0 ? range_m / closure_mps : 1e9; }
+};
+
 /// @brief What an AI pilot knows about a bandit (a delayed track, not the truth).
 struct TrackSample {
     math::Vector3 pos{};
@@ -116,6 +131,7 @@ public:
         solution_ = {};
         solution_timer_ = 0.0;
         g_easing_ = false;
+        threat_cm_timer_ = 0.0;
         roll_stick_ = 0.0;
         rudder_int_ = 0.0;
         g_cmd = 1.0;
@@ -125,8 +141,10 @@ public:
         maneuver = Maneuver::PURE_PURSUIT;
     }
 
-    /// @brief Fly one step against @p bandit. Call every physics step.
-    [[nodiscard]] AircraftControls update(double dt, const Aircraft& self, const Aircraft& bandit) noexcept {
+    /// @brief Fly one step against @p bandit, defending against @p threat if
+    /// one is inbound. Call every physics step.
+    [[nodiscard]] AircraftControls update(double dt, const Aircraft& self, const Aircraft& bandit,
+                                          const MissileThreat& threat = {}) noexcept {
         time_ += dt;
         record_track(bandit);
         AircraftControls out{};
@@ -231,6 +249,20 @@ public:
             }
         }
 
+        // Missile defence endgame: a second or two before impact, break hard
+        // into the missile, across its line of sight. Its line-of-sight rate,
+        // and so the G it must pull, is greatest that way, and a missile that
+        // has coasted slow cannot follow.
+        if (threat.inbound && threat.time_to_go() < MISSILE_BREAK_TGO_S + skill.reaction_s) {
+            maneuver = Maneuver::BREAK;
+            const math::Vector3 v_dir = self.state.velocity_ned().normalized();
+            const math::Vector3 to_m = threat.pos - self.state.pos_ned;
+            math::Vector3 across = to_m - v_dir * to_m.dot(v_dir);
+            if (across.norm() < 1.0) across = self.state.q_att.rotate_body_to_ned(math::Vector3(0.0, 0.0, -1.0));
+            aim = self.state.pos_ned + v_dir * 300.0 + across.normalized() * 1000.0;
+            g_ceiling = g_max;
+        }
+
         // Overshoot and collision avoidance: nobody presses inside the minimum
         // range or flies toward a collision. The closest point of approach is
         // predicted from the relative motion; if it is too close and coming
@@ -306,6 +338,9 @@ public:
         if (V > 0.9 * corner || geo.range < 600.0) throttle = std::min(throttle, closure_throttle);
         if (V > v_cap - 0.02 * a_sound) throttle = std::min(throttle, 0.8); // out of reheat
         if (V > v_cap + 0.08 * a_sound) speedbrake = true;
+        // A missile that may be a heat seeker: a trained pilot comes out of
+        // reheat, the brightest thing in its seeker's view.
+        if (threat.inbound && !threat.radar_guided && skill.uses_energy) throttle = std::min(throttle, 0.8);
 
         // Hard deck: blend the aim point up and away from the ground, starting
         // with enough height left to pull out of the current dive. A pull-out
@@ -365,15 +400,15 @@ public:
                 flare_timer_ = (skill.uses_energy ? 1.0 : 2.2) + 0.4 * rng_.uniform();
             }
         }
-
-        // ---- Missile employment ----
-        missile_cooldown_ = std::max(0.0, missile_cooldown_ - dt);
-        if (situation == Situation::OFFENSIVE && missile_cooldown_ <= 0.0 && skill.uses_energy) {
-            if (geo.range > 800.0 && geo.range < 12000.0 && geo.ata < 20.0 * DEG) {
-                out.pickle = true;
-                missile_cooldown_ = 4.0;
-            }
+        // A missile inbound: chaff against a radar missile, flares and chaff
+        // against one of unknown type, all the way in.
+        threat_cm_timer_ = std::max(0.0, threat_cm_timer_ - dt);
+        if (threat.inbound && threat_cm_timer_ <= 0.0) {
+            out.dispense = true;
+            out.dispense_flare = out.dispense_flare || !threat.radar_guided;
+            threat_cm_timer_ = skill.uses_energy ? 0.6 : 1.2;
         }
+        // Missile shots are not the BFM pilot's: see MissileShooter and HeatSeekerShooter.
         return out;
     }
 
@@ -398,6 +433,7 @@ private:
     static constexpr double CPA_HORIZON_S = 4.0;  ///< Look-ahead for collision avoidance
     static constexpr double CPA_MIN_MISS_M = 200.0;
     static constexpr double MAX_SHOT_ASPECT = 120.0 * M_PI / 180.0; ///< No forward-quarter snapshots
+    static constexpr double MISSILE_BREAK_TGO_S = 1.8; ///< Endgame break this long before impact (plus reaction)
     static constexpr double G_OFFSET_RATE = 12.0; ///< [G/s]
     static constexpr double MAX_CHASE_Q_PA = 75000.0; ///< ~350 m/s at sea level, ~450 m/s at 5 km
     static constexpr double MANOEUVRE_RANGE_M = 6000.0;
@@ -429,7 +465,7 @@ private:
     math::Vector3 los_rate_{};
     bool has_prev_aim_{false};
     double flare_timer_{0.0};
-    double missile_cooldown_{0.0};
+    double threat_cm_timer_{0.0};
     DamageRng rng_{};
 
     double gaussian() noexcept {
