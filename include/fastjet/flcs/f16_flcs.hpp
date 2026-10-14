@@ -78,12 +78,12 @@ public:
         // 2. Pitch Axis Control Law
         const bool is_sat = stabilator.is_pos_limited || stabilator.is_rate_limited;
         const double de_cmd = pitch_ctrl.update(dt, pilot, imu, is_sat, &trim_model, mass.mass_kg,
-                                                &compute_lef_schedule);
+                                                &compute_lef_schedule, inertial_pitch_moment(imu, mass));
 
         // 3. Roll & Yaw Axes Control Laws
         double da_cmd{0.0};
         double dr_cmd{0.0};
-        lat_dir_ctrl.update(dt, pilot, imu, da_cmd, dr_cmd);
+        lat_dir_ctrl.update(dt, pilot, imu, da_cmd, dr_cmd, mass.Izz, mass.mass_kg, rudder.position);
 
         // 4. Step Hydraulic Actuators (Lag filter + rate limits + deflection limits)
         const double de_actual = stabilator.step(de_cmd, dt);

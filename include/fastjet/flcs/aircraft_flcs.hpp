@@ -122,18 +122,6 @@ public:
         return (180.0 / M_PI) * G0 * (nz_cmd - gz) / std::max(airspeed, 50.0);
     }
 
-    /// @brief Gains of one G-command pitch law.
-    struct GLawGains {
-        double Kp;               ///< Proportional [deg / G]
-        double Ki;               ///< Integral [deg / (G s)]
-        double Kd;               ///< Pitch-rate damper [deg / (deg/s)]
-        double integrator_limit; ///< [G s]
-        double aoa_k1;           ///< AoA limiter push per degree over [deg / deg]
-        double aoa_k2;           ///< ...and per degree squared
-        double de_limit;         ///< Stabilator / canard authority [deg]
-        double q_cmd_max_dps;    ///< Pitch-rate command at full stick, low q
-    };
-
     /// The integrator sees the G error clipped to this band [G].
     static constexpr double INTEGRATE_BAND_G = 1.0;
     /// Nose-down stabilator per G over the limit [deg / G], gain-scheduled.
@@ -156,21 +144,64 @@ public:
     /// ...and while the jet's pitch rate is within this of the reference's
     /// [deg/s]: a jet still catching the reference up is not mistrimmed.
     static constexpr double PITCH_STEADY_DPS = 4.0;
+    /// Dynamic pressure band [Pa] over which the law goes from pitch-rate
+    /// command (barely flying, where G means little) to G command. Every
+    /// jet's approach (~3 kPa) is above it: blended up to 6 kPa, the G and
+    /// pitch-rate commands disagreed, the jet settled 0.2-0.8 G short and a
+    /// pilot closing the loop on attitude there could set up a PIO.
+    static constexpr double Q_BLEND_LO_PA = 800.0;
+    static constexpr double Q_BLEND_HI_PA = 2000.0;
+    /// Loop-gain schedule: control power grows with dynamic pressure, so the
+    /// loop gains go as sqrt(Q_SCHEDULE_PA / q) within these bounds.
+    static constexpr double Q_SCHEDULE_PA = 15000.0;
+    static constexpr double Q_SCALE_MIN = 0.30;
+    static constexpr double Q_SCALE_MAX = 1.40;
+    /// Nose-down pitch-rate command per degree of alpha beyond the stick's
+    /// alpha, in the pitch-rate-command region [deg/s / deg].
+    static constexpr double ALPHA_OVER_Q_DPS = 1.0;
 
     /**
-     * @brief G-command pitch law shared by the F-15EX, Typhoon and F-22.
+     * @brief Highest alpha the stick allows [deg]: the hands-off alpha
+     * (FLCSConfig::PitchLaw::alpha_hands_off_deg) with the stick centred or
+     * forward, the airframe's alpha limit at full aft stick.
+     *
+     * At low speed, where the wing cannot make the G the stick asks for, this
+     * makes the stick an alpha command. Asking for 1 G with nothing to say how
+     * much alpha to spend on it, a centred stick held the Typhoon at 34 deg,
+     * the F-22 at 60 and the F-35B at 50 for as long as the jet would mush.
+     */
+    [[nodiscard]] double alpha_cap_deg(double pitch_in) const noexcept {
+        const double hands_off = std::min(config.pitch.alpha_hands_off_deg, config.alpha_limit_deg);
+        return hands_off + std::clamp(pitch_in, 0.0, 1.0) * (config.alpha_limit_deg - hands_off);
+    }
+
+    /**
+     * @brief G-command pitch law shared by the F-15EX, Typhoon, F-22 and F-35B
+     * (gains in FLCSConfig::PitchLaw).
      *
      * Full aft stick commands the airframe's limit G. The stick's G passes
      * through a reference model (GReferenceModel) and the law flies that
      * trajectory: a model-based feed-forward of the stabilator it needs
-     * (PitchTrimModel), a pitch-rate damper acting only on the rate beyond
-     * what following it needs, and PI on the G error, with the gains scheduled
-     * down as dynamic pressure rises (control power grows with it). A
-     * predictive AoA limiter takes over near the alpha limit, and any
-     * excursion past the G limit is pushed back.
+     * (PitchTrimModel), alpha feedback about the alpha the model says that G
+     * takes, a pitch-rate damper acting only on the rate beyond what following
+     * it needs, and PI on the G error, with the gains scheduled down as dynamic
+     * pressure rises (control power grows with it).
+     *
+     * The alpha feedback is the stability the relaxed-stability airframes
+     * lack, in degrees per degree: both the instability and the stabilator's
+     * power are coefficients, so one gain holds at any speed, where a G loop's
+     * stiffness falls away with dynamic pressure (at 120 m/s the Typhoon's G
+     * error alone was weaker than its instability, and a 1 G step took 2.3 s).
+     *
+     * A G the wing cannot make below the stick's alpha (alpha_cap_deg) is
+     * flown as that alpha instead. A predictive AoA limiter guards the
+     * airframe's alpha limit, and any excursion past the G limit is pushed
+     * back.
      */
     [[nodiscard]] double g_command_pitch(double dt, const PilotCommands& pilot, const IMUData& imu,
-                                         double q_bar, double mass_kg, const GLawGains& k) noexcept {
+                                         double q_bar, const fdm::MassProperties& mass) noexcept {
+        const aircraft::FLCSConfig::PitchLaw& k = config.pitch;
+        const double mass_kg = mass.mass_kg;
         const double pitch_in = std::clamp(pilot.pitch_stick, -1.0, 1.0);
         const double nz_raw = (pitch_in >= 0.0) ? (1.0 + pitch_in * (config.max_g_positive - 1.0))
                                                 : (1.0 + pitch_in * (1.0 - config.max_g_negative));
@@ -179,13 +210,18 @@ public:
         const double nz_max_rolling = config.max_g_positive - ROLL_G_RELIEF * roll_frac;
         // The G the law flies: the stick's G, shaped by the reference model.
         double Nz_cmd = nz_ref.step(dt, std::clamp(nz_raw, config.max_g_negative, nz_max_rolling),
-                                    GReferenceModel::natural_frequency(q_bar));
-        const double q_cmd = pitch_in * k.q_cmd_max_dps;
+                                    GReferenceModel::natural_frequency(q_bar) * k.ref_bandwidth);
+        // The alpha the stick allows. Barely flying, where the law commands
+        // pitch rate, alpha beyond it asks for nose-down rate: a centred
+        // stick holding pitch rate at zero otherwise held a stalled jet's
+        // nose up at 40 deg alpha as it mushed.
+        const double alpha_cap = alpha_cap_deg(pitch_in);
+        const double q_cmd = pitch_in * k.q_cmd_max_dps - ALPHA_OVER_Q_DPS * std::max(0.0, imu.alpha_deg - alpha_cap);
 
-        // Pitch rate at low speed, G at high speed.
-        const double w_Nz = std::clamp((q_bar - 2000.0) / 4000.0, 0.0, 1.0);
+        // Pitch rate when barely flying, G above (Q_BLEND_LO_PA).
+        const double w_Nz = std::clamp((q_bar - Q_BLEND_LO_PA) / (Q_BLEND_HI_PA - Q_BLEND_LO_PA), 0.0, 1.0);
         // Control power grows with dynamic pressure; so must the loop gain fall.
-        const double q_scale = std::clamp(std::sqrt(15000.0 / std::max(2500.0, q_bar)), 0.30, 1.40);
+        const double q_scale = std::clamp(std::sqrt(Q_SCHEDULE_PA / std::max(2500.0, q_bar)), Q_SCALE_MIN, Q_SCALE_MAX);
 
         // Predictive AoA limiter: anticipates stall entry and smoothly arrests pitch rate.
         const double alpha_pred = predicted_alpha_deg(imu, ALPHA_LEAD_S);
@@ -211,18 +247,36 @@ public:
             }
         }
 
+        // Feed-forward: the stabilator a steady pull at the reference G needs
+        // (PitchTrimModel), solved no further than the alpha the stick allows.
+        // At low q, where the law commands pitch rate, it holds the 1 G trim.
+        const double nz_ff = w_Nz * Nz_cmd + (1.0 - w_Nz);
+        double q_ref = 0.0;
+        double de_ff = trim_model.feed_forward(dt, nz_ff, imu, mass_kg, std::min(alpha_cap, TRIM_ALPHA_MAX_DEG),
+                                               k.de_limit, q_ref);
+        // The reference alpha: what the model says the G takes, or, when the
+        // wing cannot make that G below the stick's alpha, the stick's alpha
+        // and the G the jet makes there.
+        double alpha_ref = trim_model.solved_alpha_deg();
+        const bool short_of_g = trim_model.short_of_g();
+        if (short_of_g) {
+            alpha_ref = alpha_cap;
+            const double nz_avail = trim_model.nz_at_alpha(alpha_cap, imu, mass_kg);
+            if (Nz_cmd > nz_avail) {
+                // Trim for the pull the jet will actually fly: solved for the
+                // stick's G, the feed-forward assumed that G's pitch rate and
+                // short-changed the nose-down trim an unstable jet needs.
+                Nz_cmd = nz_avail;
+                de_ff = trim_model.stabilator_for(w_Nz * Nz_cmd + (1.0 - w_Nz), imu, mass_kg,
+                                                  std::min(alpha_cap, TRIM_ALPHA_MAX_DEG), k.de_limit);
+                q_ref = steady_pull_rate_dps(Nz_cmd, imu.airspeed, imu.gz);
+            }
+        }
+        const double de_alpha = w_Nz * k.k_alpha * (imu.alpha_deg - alpha_ref);
+
         const double err_Nz = Nz_cmd - imu.Nz;
         const double err_q  = (q_cmd - imu.q_deg) * 0.04;
         const double error  = w_Nz * err_Nz + (1.0 - w_Nz) * err_q;
-
-        // Feed-forward: the stabilator a steady pull at the reference G needs
-        // (PitchTrimModel). At low q, where the law commands pitch rate, it
-        // holds the 1 G trim.
-        const double nz_ff = w_Nz * Nz_cmd + (1.0 - w_Nz);
-        double q_ref = 0.0;
-        const double de_ff = trim_model.feed_forward(dt, nz_ff, imu, mass_kg,
-                                                     std::min(config.alpha_limit_deg, TRIM_ALPHA_MAX_DEG),
-                                                     k.de_limit, q_ref);
 
         // Damp only the pitch rate beyond what following the reference needs.
         // Referenced to the measured G instead, the damper braked the onset
@@ -239,11 +293,12 @@ public:
         const double stop = std::min(k.de_limit, stabilator.pos_max);
         const bool pinned = (stabilator.position <= -stop + 0.5 && error > 0.0)
                          || (stabilator.position >= stop - 0.5 && error < 0.0);
-        // Near an alpha limit the trim that pulls toward it bleeds away and
-        // only trim away from the limit may build. (Scaling the whole
-        // integrator down instead left it pinned just above zero, so a jet at
-        // the limit could never trim nose-down and hung there hands-off.)
-        const bool near_pos_alpha = alpha_pred >= (config.alpha_limit_deg - 2.5);
+        // Near an alpha limit (or flying the stick's alpha) the trim that
+        // pulls toward it bleeds away and only trim away from it may build:
+        // the shortfall in G there is the limit at work, not mistrim. (Scaling
+        // the whole integrator down instead left it pinned just above zero,
+        // so a jet at the limit could never trim nose-down and hung there.)
+        const bool near_pos_alpha = alpha_pred >= (config.alpha_limit_deg - 2.5) || short_of_g;
         const bool near_neg_alpha = alpha_pred <= (NEG_ALPHA_LIMIT_DEG + 2.5);
         if (dt > 0.0) {
             if (near_pos_alpha && pitch_integrator > 0.0) {
@@ -271,57 +326,87 @@ public:
         const double over_g = std::max(0.0, imu.Nz - config.max_g_positive)
                             - std::max(0.0, config.max_g_negative - imu.Nz);
 
-        const double de = de_ff - q_scale * (k.Kp * error + k.Ki * pitch_integrator)
-                        + k.Kd * (imu.q_deg - q_steady)
+        // The inertial pitch-up of a roll at alpha, fed forward.
+        const double de_coupling = trim_model.stabilator_for_moment(inertial_pitch_moment(imu, mass), q_bar);
+
+        const double de = de_ff + de_coupling + de_alpha - q_scale * (k.kp * error + k.ki * pitch_integrator)
+                        + k.kd * (imu.q_deg - q_steady)
                         + q_scale * OVER_G_PUSH * over_g + aoa_override_de;
         return std::clamp(de, -k.de_limit, k.de_limit);
     }
 
-    /// @brief Gains of one fly-by-wire roll law.
-    struct RollLawGains {
-        double kp;          ///< Roll-rate error to aileron [deg / (deg/s)]
-        double ki;          ///< Roll-rate trim [deg / deg]
-        double da_limit;    ///< Aileron authority [deg]
-        double pedal_deg;   ///< Rudder at full pedal [deg]
-        double k_yaw;       ///< Yaw damper [deg / (deg/s)]
-        double k_beta;      ///< Sideslip feedback [deg / deg]
-        double dr_limit;    ///< Rudder authority [deg]
-    };
+    /// Aileron roll power [1/rad] and rudder yaw power [1/rad] of the
+    /// generic airframes (AircraftAeroModel).
+    static constexpr double CL_DELTA_A = 0.22;
+    static constexpr double CN_DELTA_R = 0.10;
+    /// Side force with sideslip and rudder [1/rad] (AircraftAeroModel).
+    static constexpr double CY_BETA = 0.75;
+    static constexpr double CY_DELTA_R = 0.18;
 
     /// @brief Aileron that holds a steady roll at @p p_dps [deg]: where the
     /// aileron's rolling moment balances roll damping. Independent of dynamic
     /// pressure, it scales only with 1 / airspeed.
     [[nodiscard]] double steady_roll_aileron_deg(double p_dps, double airspeed) const noexcept {
-        constexpr double CL_DELTA_A = 0.22; // Aileron roll power [1/rad] (AircraftAeroModel)
         return aero_cfg.roll_damping * aero_cfg.b_span / (2.0 * std::max(airspeed, 50.0) * CL_DELTA_A) * p_dps;
     }
 
     /**
-     * @brief Roll-rate command law shared by the F-15EX, Typhoon and F-22.
+     * @brief Roll/yaw law shared by the F-15EX, Typhoon, F-22 and F-35B
+     * (gains in FLCSConfig::RollLaw).
      *
-     * The shaped command (RollShaping) drives a feed-forward of the aileron a
-     * steady roll needs, so the rate arrives without waiting on the trim
-     * integrator, plus proportional feedback and a small trim for what the
-     * feed-forward misses. Roll rate is cut back toward the alpha limit, and
-     * the yaw damper works on the stability axis so the jet rolls about its
-     * flight path.
+     * The stick commands a roll rate about the flight path, cut back toward
+     * the alpha limit. The shaped command (RollShaping) is flown as body roll
+     * rate p = mu-dot cos(alpha) by the ailerons, with a feed-forward of the
+     * aileron a steady roll needs, so the rate arrives without waiting on the
+     * trim integrator, plus proportional feedback and a small trim for what
+     * the feed-forward misses. The rudder supplies the yaw rate
+     * r = mu-dot sin(alpha) the roll needs (aileron-rudder interconnect: the
+     * yaw-damping moment it must overcome and the yaw acceleration to build
+     * it), and closes on sideslip rate and sideslip.
      */
-    void fbw_roll_law(double dt, const PilotCommands& pilot, const IMUData& imu, const RollLawGains& k,
+    void fbw_roll_law(double dt, const PilotCommands& pilot, const IMUData& imu, const fdm::MassProperties& mass,
                       double& da_cmd, double& dr_cmd) noexcept {
-        const double atten_start = 0.6 * config.alpha_limit_deg;
+        const double Izz = mass.Izz;
+        constexpr double D2R = M_PI / 180.0;
+        const aircraft::FLCSConfig::RollLaw& k = config.roll;
+        const double atten_start = k.atten_start_frac * config.alpha_limit_deg;
         const double atten = std::clamp(
-            1.0 - 0.75 * (imu.alpha_deg - atten_start) / (config.alpha_limit_deg - atten_start), 0.25, 1.0);
-        const double p_cmd = std::clamp(pilot.roll_stick, -1.0, 1.0) * config.max_roll_rate_dps * atten;
-        const double p_ref = roll_shaping.shape(dt, p_cmd);
+            1.0 - (1.0 - k.atten_min) * (imu.alpha_deg - atten_start) / (config.alpha_limit_deg - atten_start),
+            k.atten_min, 1.0);
+        // Yaw authority at this dynamic pressure: how fast the rudder can
+        // build (and stop) the yaw rate a flight-path roll needs.
+        const double dr_lim = std::min(k.dr_limit, rudder.pos_max);
+        const double qsb = imu.q_bar * aero_cfg.s_ref * aero_cfg.b_span;
+        const double yaw_accel_max = Izz > 0.0 ? qsb * CN_DELTA_R * dr_lim * D2R / Izz : 1e9;
+        const double mu_max = std::min(config.max_roll_rate_dps * atten,
+                                       RollShaping::coordinated_roll_rate_max_dps(imu, yaw_accel_max));
+        const double mu_cmd = std::clamp(pilot.roll_stick, -1.0, 1.0) * mu_max;
+        const double mu_ref = roll_shaping.shape(dt, mu_cmd, k.roll_cmd_tau_s,
+                                                 RollShaping::coordinated_roll_accel_max_dps2(imu, yaw_accel_max));
+        const double a = RollShaping::kinematic_alpha(imu);
+        const double p_ref = mu_ref * std::cos(a);
+        const double r_ref = mu_ref * std::sin(a);
 
         const double da_lim = std::min(k.da_limit, aileron.pos_max);
         const double da_ff = std::clamp(steady_roll_aileron_deg(p_ref, imu.airspeed), -da_lim, da_lim);
         const double da_p = da_ff - k.kp * (p_ref - imu.p_deg);
         da_cmd = std::clamp(da_p + roll_trim.update(dt, p_ref, imu.p_deg, k.ki, da_p, da_lim), -da_lim, da_lim);
 
-        const double r_damp = roll_shaping.damper_rate(dt, imu);
-        dr_cmd = std::clamp(-pilot.rudder_pedal * k.pedal_deg + k.k_yaw * r_damp - k.k_beta * imu.beta_deg,
-                            -k.dr_limit, k.dr_limit);
+        // ARI: Cn_dr dr = Izz r-dot / (q S b) - Cn_r (b / 2V) r. Negative rudder
+        // yaws the nose right.
+        const double lat = aero_cfg.b_span / (2.0 * std::max(imu.airspeed, 50.0));
+        const double cn_accel = (Izz > 0.0 && qsb > 1.0) ? Izz * roll_shaping.p_ref_rate * std::sin(a) * D2R / qsb : 0.0;
+        const double cn_needed = cn_accel - aero_cfg.yaw_damping * lat * r_ref * D2R;
+        const double dr_ari = std::clamp(-cn_needed / (CN_DELTA_R * D2R), -dr_lim, dr_lim);
+
+        // Sideslip-rate damper (r beyond the yaw rate that holds sideslip) and
+        // sideslip feedback.
+        const double pg = trim_model.aero.prandtl_glauert(
+            environment::Atmosphere1976::compute(imu.altitude, imu.airspeed).mach_number);
+        const double beta = RollShaping::air_sideslip_deg(imu, mass.mass_kg, aero_cfg.s_ref, -pg * CY_BETA * D2R,
+                                                          pg * CY_DELTA_R * rudder.position * D2R);
+        const double dr_damp = k.k_yaw * (imu.r_deg - RollShaping::coordinated_yaw_rate_dps(imu)) - k.k_beta * beta;
+        dr_cmd = std::clamp(-pilot.rudder_pedal * k.pedal_deg + dr_ari + dr_damp, -dr_lim, dr_lim);
     }
 
     /**
@@ -350,53 +435,40 @@ public:
         const double q_bar = dynamic_pressure;
 
         switch (config.law_type) {
-            case aircraft::FLCSConfig::LawType::DIGITAL_FBW_G_ALPHA: {
-                // F-15EX Digital FBW: G command blending with smooth predictive AoA protection
-                de_cmd = g_command_pitch(dt, pilot, imu, q_bar, mass.mass_kg, {1.60, 3.00, 0.56, 25.0, 2.2, 0.15, 25.0, 30.0});
-
-                // Roll & Yaw: roll rate command + yaw rate damper + turn coordination
-                fbw_roll_law(dt, pilot, imu, {0.20, 0.30, 25.0, 25.0, 0.40, 0.20, 30.0}, da_cmd, dr_cmd);
-                break;
-            }
-
-            case aircraft::FLCSConfig::LawType::UNIFIED_STOVL: {
-                // F-35B up-and-away (CTOL mode): G command with AoA limiting and
-                // roll-rate command. Once converted, StovlControlLaw flies the jet
-                // and drives these actuators through drive_surfaces().
-                de_cmd = g_command_pitch(dt, pilot, imu, q_bar, mass.mass_kg, {1.30, 2.50, 0.60, 20.0, 2.0, 0.12, 25.0, 30.0});
-                fbw_roll_law(dt, pilot, imu, {0.15, 0.30, 25.0, 25.0, 0.40, 0.20, 30.0}, da_cmd, dr_cmd);
-                break;
-            }
-
-            case aircraft::FLCSConfig::LawType::CAREFREE_DELTA_CANARD: {
-                // Eurofighter Typhoon Carefree Handling
-                de_cmd = g_command_pitch(dt, pilot, imu, q_bar, mass.mass_kg, {1.04, 2.00, 0.70, 15.0, 2.0, 0.12, 30.0, 30.0});
-
-                fbw_roll_law(dt, pilot, imu, {0.12, 0.30, 25.0, 28.0, 0.45, 0.25, 30.0}, da_cmd, dr_cmd);
+            case aircraft::FLCSConfig::LawType::DIGITAL_FBW_G_ALPHA:     // F-15EX
+            case aircraft::FLCSConfig::LawType::CAREFREE_DELTA_CANARD:   // Eurofighter Typhoon
+            case aircraft::FLCSConfig::LawType::UNIFIED_STOVL: {         // F-35B up and away
+                // G command with alpha limiting and flight-path roll-rate
+                // command; per-jet gains and handling in FLCSConfig. Once the
+                // F-35B converts, StovlControlLaw flies the jet and drives
+                // these actuators through drive_surfaces().
+                de_cmd = g_command_pitch(dt, pilot, imu, q_bar, mass);
+                fbw_roll_law(dt, pilot, imu, mass, da_cmd, dr_cmd);
                 break;
             }
 
             case aircraft::FLCSConfig::LawType::FBW_TVC_ALLOCATED: {
                 // F-22A Raptor: Unified aerodynamic surfaces + 2D thrust vectoring
-                de_cmd = g_command_pitch(dt, pilot, imu, q_bar, mass.mass_kg, {1.08, 2.00, 0.64, 15.0, 1.8, 0.10, 25.0, 32.0});
+                de_cmd = g_command_pitch(dt, pilot, imu, q_bar, mass);
                 const double alpha_pred = predicted_alpha_deg(imu, ALPHA_LEAD_S);
 
                 // TVC Pitch Allocation: Pitch-up elevator (de < 0) corresponds to nozzle pitch-up.
                 // The nose-up stick feed-forward fades out as predicted alpha closes on
-                // the limit, leaving the nozzles to the control law's own command (which
-                // carries the AoA limiter).  Unfaded, the raw stick kept the nozzles
-                // pitching up against the limiter's push: full aft stick below ~180 m/s
-                // drove alpha through the 65 deg limit and tumbled the jet end over end.
+                // the alpha the stick allows (alpha_cap_deg), leaving the nozzles to the
+                // control law's own command (which carries the AoA limiter).  Unfaded, the
+                // raw stick kept the nozzles pitching up against the limiter's push: full
+                // aft stick below ~180 m/s drove alpha through the 65 deg limit and tumbled
+                // the jet end over end.
                 const double q_factor = std::clamp(1.0 - dynamic_pressure / 15000.0, 0.0, 1.0);
                 const double alpha_factor = std::clamp((imu.alpha_deg - 20.0) / 20.0, 0.0, 1.0);
                 const double tvc_weight = (std::max)(q_factor, alpha_factor);
                 const double stick_ff = (pilot.pitch_stick > 0.0)
-                    ? pilot.pitch_stick * std::clamp((config.alpha_limit_deg - alpha_pred) / 10.0, 0.0, 1.0)
+                    ? pilot.pitch_stick * std::clamp((alpha_cap_deg(pilot.pitch_stick) - alpha_pred) / 10.0, 0.0, 1.0)
                     : pilot.pitch_stick;
 
                 tvc_pitch_cmd = std::clamp(stick_ff * (0.35 + 0.65 * tvc_weight) - (de_cmd / 25.0) * 0.5 * tvc_weight, -1.0, 1.0);
 
-                fbw_roll_law(dt, pilot, imu, {0.10, 0.30, 22.0, 26.0, 0.40, 0.20, 28.0}, da_cmd, dr_cmd);
+                fbw_roll_law(dt, pilot, imu, mass, da_cmd, dr_cmd);
                 break;
             }
 

@@ -47,11 +47,17 @@ public:
     }
 
     /**
-     * @brief Creates standard F-16 Flaperon (Aileron) actuator:
-     * tau = 0.05s, rate limit = 52 deg/s, deflection limits = [-20, +20] deg.
+     * @brief Creates the roll-surface actuator: the flaperons together with the
+     * differential tail the TP-1538 aileron derivative lumps in.
+     * tau = 0.05s, rate limit = 80 deg/s (Stevens & Lewis' lumped aileron),
+     * deflection limits = [-20, +20] deg.
+     *
+     * At the flaperon's own 52 deg/s the roll surface needed 0.6 s to swing
+     * from a full-rate roll to the opposite stop, and every jet rolled on
+     * 100-180 deg after the stick came back to centre.
      */
     static constexpr Actuator create_flaperon(double init_deg = 0.0) noexcept {
-        return Actuator(0.05, 52.0, -20.0, 20.0, init_deg);
+        return Actuator(0.05, 80.0, -20.0, 20.0, init_deg);
     }
 
     /**
