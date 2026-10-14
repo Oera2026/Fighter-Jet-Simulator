@@ -7,6 +7,7 @@
 #include "fastjet/sim/damage_model.hpp"
 #include "fastjet/sim/ejection_seat.hpp"
 #include "fastjet/sim/gun.hpp"
+#include "fastjet/sim/infrared.hpp"
 #include "fastjet/sim/missile.hpp"
 #include "fastjet/sim/missile_warning.hpp"
 #include "fastjet/sim/radar.hpp"
@@ -67,8 +68,8 @@ public:
     std::array<ChaffCloud, kMaxChaff> chaff{};
     std::array<FlareDecoy, kMaxFlares> flares{};
     std::array<FireControlRadar, kMaxAircraft> radars{};
-    std::array<int, kMaxAircraft> missile_load{}; ///< Missiles left on the rails
-    std::array<MissileSpec, kMaxAircraft> missile_spec{};
+    std::array<WeaponStores, kMaxAircraft> stores{}; ///< Missiles on the rails and the selected weapon
+    std::array<IrSeeker, kMaxAircraft> seekers{};    ///< Heat-seeker heads (active while one is selected)
     std::array<int, kMaxAircraft> chaff_load{};   ///< Chaff cartridges left
     std::array<int, kMaxAircraft> flare_load{};   ///< Flare cartridges left
     std::array<EjectionSeat, kMaxAircraft> seats{}; ///< Each jet's escape system
@@ -89,7 +90,10 @@ public:
         next_round_ = 0;
         next_chaff_ = 0;
         next_flare_ = 0;
-        missile_load.fill(0);
+        for (auto& st : stores) st.clear();
+        for (auto& sk : seekers) sk = IrSeeker{};
+        launch_cue.fill(LaunchCue::NONE);
+        pickle_presses.fill(0);
         chaff_load.fill(0);
         flare_load.fill(0);
         program_left_.fill(0);
@@ -121,7 +125,8 @@ public:
         was_crashed_[static_cast<size_t>(i)] = false;
         was_alive_[static_cast<size_t>(i)] = true;
         radars[static_cast<size_t>(i)].configure(type);
-        missile_load[static_cast<size_t>(i)] = 0;
+        stores[static_cast<size_t>(i)].clear();
+        seekers[static_cast<size_t>(i)] = IrSeeker{};
         chaff_load[static_cast<size_t>(i)] = DEFAULT_CHAFF;
         flare_load[static_cast<size_t>(i)] = DEFAULT_FLARES;
         seats[static_cast<size_t>(i)].reset();
@@ -163,29 +168,34 @@ public:
 
     static constexpr int DEFAULT_CHAFF = 60;
 
-    /// @brief Fire a missile from @p shooter at @p target. It needs a missile on
-    /// the rails and a radar lock on the target to initialise its guidance.
-    /// Returns the missile's slot, or -1.
-    /// @brief Fire a missile from @p shooter at @p target. Active radar missiles
-    /// need a radar lock; infrared heat-seekers need the target within their
-    /// seeker gimbal FOV and range. Returns the missile's slot, or -1.
-    int launch_missile(int shooter, int target) noexcept {
+    /// @brief What the latest pickle press did (for a "NO LOCK" cue).
+    enum class LaunchCue : uint8_t { NONE, LAUNCH, NO_LOCK, EMPTY };
+    std::array<LaunchCue, kMaxAircraft> launch_cue{};
+    std::array<int, kMaxAircraft> pickle_presses{}; ///< Counts presses, so a display can tell a new one
+
+    /**
+     * @brief Fire a missile from @p shooter's @p which store at @p target.
+     *
+     * An active radar missile needs the shooter's radar in single-target track
+     * on the target to start its guidance. A heat seeker needs the shooter's
+     * seeker locked on the target, which needs that store selected. When a
+     * selected store runs dry, the next weapon is selected. Returns the
+     * missile's slot, or -1.
+     */
+    int launch_missile(int shooter, int target, WeaponSel which) noexcept {
         if (shooter < 0 || shooter >= count || target < 0 || target >= count || shooter == target) return -1;
         const auto si = static_cast<size_t>(shooter);
         const auto ti = static_cast<size_t>(target);
         const Aircraft& a = aircraft[si];
         const Aircraft& t = aircraft[ti];
-        const MissileSpec& spec = missile_spec[si];
-        if (missile_load[si] <= 0 || !a.alive() || !t.alive()) return -1;
+        MissileStore* store = stores[si].store(which);
+        if (store == nullptr || store->count <= 0 || !a.alive() || !t.alive()) return -1;
+        const MissileSpec& spec = store->spec;
 
         const FireControlRadar& radar = radars[si];
         if (spec.infrared()) {
-            const math::Vector3 nose = a.state.q_att.rotate_body_to_ned(math::Vector3(1.0, 0.0, 0.0));
-            const math::Vector3 los = t.position() - a.position();
-            const double range = los.norm();
-            if (range > spec.seeker_range_m) return -1;
-            const double ata_deg = AirCombatGeometry::angle_between(nose, los) * 180.0 / M_PI;
-            if (ata_deg > spec.seeker_gimbal_deg) return -1;
+            const IrSeeker& sk = seekers[si];
+            if (stores[si].selected != which || !sk.locked || sk.target != target) return -1;
         } else {
             if (!radar.locked() || radar.target != target) return -1;
         }
@@ -195,7 +205,8 @@ public:
             if (!missiles[static_cast<size_t>(k)].active) { slot = k; break; }
         }
         if (slot < 0) return -1;
-        --missile_load[si];
+        --store->count;
+        if (store->count == 0 && stores[si].selected == which) stores[si].cycle();
         Missile& m = missiles[static_cast<size_t>(slot)];
         m = Missile{};
         m.spec = spec;
@@ -262,6 +273,25 @@ public:
         return s;
     }
 
+    /// @brief Can the target's RWR hear this missile? The launcher's uplink
+    /// while it holds lock, or the missile's own seeker once it is pointed at
+    /// the jet. An inertial missile, or one searching somewhere else, is silent.
+    [[nodiscard]] bool missile_warning(const Missile& m) const noexcept {
+        if (m.spec.infrared()) return false; // Heat seekers are passive and silent on the RWR
+        switch (m.phase) {
+            case Missile::Phase::DATALINK:
+                return m.shooter >= 0 && radars[static_cast<size_t>(m.shooter)].track_fresh();
+            case Missile::Phase::ACTIVE_TRACK: return true;
+            case Missile::Phase::ACTIVE_SEARCH: {
+                if (m.decoy_timer > 0.0) return false;
+                const Aircraft& t = aircraft[static_cast<size_t>(m.target)];
+                return AirCombatGeometry::angle_between(m.est_pos - m.body.pos, t.position() - m.body.pos) <
+                       2.0 * m.spec.seeker_basket_deg * M_PI / 180.0;
+            }
+            default: return false;
+        }
+    }
+
     // ---------------------------------------------------------------------
     // Hit geometry (public for tests)
     // ---------------------------------------------------------------------
@@ -322,25 +352,6 @@ private:
     std::array<bool, kMaxAircraft> prev_flare_{};
     std::array<bool, kMaxAircraft> prev_pickle_{};
 
-    /// @brief Can the target's RWR hear this missile? The launcher's uplink
-    /// while it holds lock, or the missile's own seeker once it is pointed at
-    /// the jet. An inertial missile, or one searching somewhere else, is silent.
-    [[nodiscard]] bool missile_warning(const Missile& m) const noexcept {
-        if (m.spec.infrared()) return false; // Heat seekers are passive and silent on the RWR
-        switch (m.phase) {
-            case Missile::Phase::DATALINK:
-                return m.shooter >= 0 && radars[static_cast<size_t>(m.shooter)].track_fresh();
-            case Missile::Phase::ACTIVE_TRACK: return true;
-            case Missile::Phase::ACTIVE_SEARCH: {
-                if (m.decoy_timer > 0.0) return false;
-                const Aircraft& t = aircraft[static_cast<size_t>(m.target)];
-                return AirCombatGeometry::angle_between(m.est_pos - m.body.pos, t.position() - m.body.pos) <
-                       2.0 * m.spec.seeker_basket_deg * M_PI / 180.0;
-            }
-            default: return false;
-        }
-    }
-
     /// @brief Countermeasures, radars and missiles. Kept out of line so that
     /// step() compiles the aircraft pipeline exactly as the single-jet
     /// reference loop does (same inlining, same FMA contraction), which
@@ -350,6 +361,7 @@ private:
         dispense_countermeasures(dt, controls);
         step_escape_systems(dt, controls);
         step_radars(dt);
+        step_seekers(dt);
         fire_missiles(controls);
         step_missiles(dt);
         step_chaff(dt);
@@ -357,41 +369,45 @@ private:
         for (int i = 0; i < count; ++i) maws[static_cast<size_t>(i)].update(dt, i, aircraft[static_cast<size_t>(i)], missiles);
     }
 
+    /// @brief Each jet's heat-seeker head: searching or tracking while a heat
+    /// seeker with rounds left is selected, caged otherwise.
+    void step_seekers(double dt) noexcept {
+        for (int i = 0; i < count; ++i) {
+            const auto idx = static_cast<size_t>(i);
+            const MissileStore* st = stores[idx].selected_store();
+            IrSeeker& sk = seekers[idx];
+            if (st == nullptr || st->count <= 0 || !st->spec.infrared() || !aircraft[idx].alive()) {
+                sk.cage();
+                sk.dir_ned = aircraft[idx].state.q_att.rotate_body_to_ned(math::Vector3(1.0, 0.0, 0.0));
+                continue;
+            }
+            sk.update(dt, i, aircraft.data(), count, st->spec, radars[idx]);
+        }
+    }
+
+    /// @brief The pickle button fires the selected store: a heat seeker at
+    /// what its seeker has locked, a radar missile at the radar's STT target.
     void fire_missiles(const std::array<AircraftControls, kMaxAircraft>& controls) noexcept {
         for (int i = 0; i < count; ++i) {
             const auto idx = static_cast<size_t>(i);
             const bool pressed = controls[idx].pickle && !prev_pickle_[idx];
             prev_pickle_[idx] = controls[idx].pickle;
-            if (!pressed || missile_load[idx] <= 0 || !aircraft[idx].alive()) continue;
-
+            if (!pressed || !aircraft[idx].alive()) continue;
+            const WeaponSel sel = stores[idx].selected;
+            const MissileStore* st = stores[idx].selected_store();
+            if (st == nullptr) continue; // Gun selected: the pickle does nothing
+            ++pickle_presses[idx];
+            if (st->count <= 0) {
+                launch_cue[idx] = LaunchCue::EMPTY;
+                continue;
+            }
             int tgt = -1;
-            const MissileSpec& spec = missile_spec[idx];
-            if (spec.infrared()) {
-                if (radars[idx].locked() && radars[idx].target >= 0 && radars[idx].target != i) {
-                    tgt = radars[idx].target;
-                } else {
-                    double best_score = 1e9;
-                    const math::Vector3 nose = aircraft[idx].state.q_att.rotate_body_to_ned(math::Vector3(1.0, 0.0, 0.0));
-                    for (int j = 0; j < count; ++j) {
-                        if (j == i || !aircraft[static_cast<size_t>(j)].alive()) continue;
-                        const math::Vector3 los = aircraft[static_cast<size_t>(j)].position() - aircraft[idx].position();
-                        const double r = los.norm();
-                        if (r > spec.seeker_range_m) continue;
-                        const double ata_deg = AirCombatGeometry::angle_between(nose, los) * 180.0 / M_PI;
-                        if (ata_deg <= spec.seeker_gimbal_deg && r < best_score) {
-                            best_score = r;
-                            tgt = j;
-                        }
-                    }
-                }
-            } else {
-                if (radars[idx].locked() && radars[idx].target >= 0 && radars[idx].target != i) {
-                    tgt = radars[idx].target;
-                }
+            if (st->spec.infrared()) {
+                if (seekers[idx].locked) tgt = seekers[idx].target;
+            } else if (radars[idx].locked() && radars[idx].target >= 0 && radars[idx].target != i) {
+                tgt = radars[idx].target;
             }
-            if (tgt >= 0) {
-                launch_missile(i, tgt);
-            }
+            launch_cue[idx] = tgt >= 0 && launch_missile(i, tgt, sel) >= 0 ? LaunchCue::LAUNCH : LaunchCue::NO_LOCK;
         }
     }
 
@@ -520,7 +536,8 @@ private:
                 if (!flare_in_gates(m.body.pos, victim.position(), f, m.spec.ir_fov_deg * M_PI / 180.0)) {
                     continue;
                 }
-                const double p = m.spec.flare_susceptibility * (f.intensity() / 2.0);
+                const double p = flare_seduction_chance(m.spec.flare_susceptibility, f.intensity(),
+                                                        ir_signature(victim, m.body.pos));
                 if (rng_.uniform() < p) {
                     m.seduce(f);
                     push({CombatEvent::Kind::LOCK_BROKEN_FLARE, f.owner, m.shooter, HitZone::FUSELAGE, time, 0.0});
@@ -537,7 +554,8 @@ private:
             const bool uplink = aircraft[static_cast<size_t>(m.shooter)].alive() && radar.target == m.target &&
                                 radar.track_fresh();
             const math::Vector3 p0 = m.body.pos;
-            m.update(dt, uplink, tgt.position(), tgt.velocity());
+            const double sig = m.spec.infrared() ? ir_signature(tgt, m.body.pos) : 1.0;
+            m.update(dt, uplink, tgt.position(), tgt.velocity(), sig);
 
             // Proximity fuze: closest approach this step, swept against every jet but the shooter.
             if (m.body.tof > m.spec.arm_time_s) {
