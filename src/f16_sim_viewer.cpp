@@ -518,6 +518,7 @@ int main(int argc, char* argv[]) {
     sim::RadarScope radar_scope;
     sim::SweepScope sweep_scope;        // Right MFD in a fight: 360 deg sweep display
     double sweep_world_time = 0.0;      // World time it was last turned to
+    unsigned maws_logged = 0;           // MAWS launch declarations already put on the console
     bool left_mfd_fcr = true;
     bool radar_lock_failed_shown = false;
     auto active_world = [&]() -> sim::World& { return dogfight_active ? dogfight->world : *free_world; };
@@ -1414,10 +1415,13 @@ int main(int argc, char* argv[]) {
         // Dogfight: the bandit, tracers and the combat HUD.
         renderer.clear_traffic();
         renderer.clear_tracers();
+        // F-35B weapons-bay doors: open while a radar missile clears the jet.
+        renderer.set_ownship_weapon_bay(graphics::weapon_bay_doors(active_world().missiles, sim::Engagement::OWN));
         if (dogfight_active) {
             const sim::World& w = dogfight->world;
             const sim::Aircraft& bandit = dogfight->bandit();
-            renderer.add_traffic(render_state_of(bandit), bandit.landing_gear.deployed, bandit.type, &bandit.stovl);
+            renderer.add_traffic(render_state_of(bandit), bandit.landing_gear.deployed, bandit.type, &bandit.stovl,
+                                 graphics::weapon_bay_doors(w.missiles, sim::Engagement::BANDIT));
             // One round in five is a tracer, as in a real belt.
             for (int r = 0; r < sim::World::kMaxRounds; r += 5) {
                 const sim::Projectile& p = w.rounds[static_cast<size_t>(r)];
@@ -1607,6 +1611,28 @@ int main(int argc, char* argv[]) {
                               static_cast<int>(bandit_name.size()), bandit_name.data(),
                               sim::to_string(dogfight_setup.geometry));
             }
+            {
+                // Missile approach warning, in every fight: it sees the heat
+                // seekers the RWR cannot hear.
+                const sim::MissileWarningSystem& mws = w.maws[sim::Engagement::OWN];
+                const sim::MawsStatus& ms = mws.status;
+                c.maws_fitted = mws.spec.fitted();
+                c.maws_threat = ms.threat;
+                c.maws_threat_count = ms.threat_count;
+                c.maws_clock = ms.clock;
+                c.maws_bearing_deg = ms.bearing_rad * 180.0 / M_PI;
+                c.maws_elevation_deg = ms.elevation_rad * 180.0 / M_PI;
+                c.maws_time_to_go_s = ms.time_to_go_s;
+                c.maws_range_valid = ms.range_valid;
+                c.maws_range_m = ms.range_m;
+                c.maws_launch_count = ms.launch_count;
+                if (ms.launch_count < maws_logged) maws_logged = 0; // A new world
+                if (ms.launch_count > maws_logged) {
+                    maws_logged = ms.launch_count;
+                    std::cout << "[MAWS] " << mws.spec.name << ": missile " << ms.clock << " o'clock, "
+                              << static_cast<int>(std::lround(ms.time_to_go_s)) << " s to go.\n";
+                }
+            }
             if (dogfight->finished()) {
                 // Name a self-inflicted loss: pulling the wings off is not being shot down.
                 const char* cause = own->damage.pilot_ejected ? "  (EJECTED)"
@@ -1657,7 +1683,8 @@ int main(int argc, char* argv[]) {
         was_ejected = own_ejected;
         renderer.set_ownship_visible(!own_ejected);
         if (own_ejected) {
-            renderer.add_traffic(render_state_of(*own), own->landing_gear.deployed, own->type, &own->stovl);
+            renderer.add_traffic(render_state_of(*own), own->landing_gear.deployed, own->type, &own->stovl,
+                                 graphics::weapon_bay_doors(active_world().missiles, sim::Engagement::OWN));
             // F1 has no cockpit to go back to.
             renderer.camera_rig().set_mode(graphics::CameraMode::CHASE);
         }
@@ -1778,6 +1805,7 @@ int main(int argc, char* argv[]) {
 
         // No threat tones over a paused sim.
         if (main_menu.is_visible() || renderer.menu().is_open()) tel.combat.rwr_level = 0;
+        if (main_menu.is_visible() || renderer.menu().is_open()) tel.combat.maws_threat = false;
 
         // Update procedural audio engine with real-time acoustics
         fdm::FlightState render_state = render_state_of(*own);

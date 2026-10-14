@@ -47,6 +47,19 @@ struct CombatTelemetry {
     bool rwr_missile_valid = false;
     double rwr_missile_bearing_deg = 0.0;
     double rwr_missile_range_m = 0.0;
+    // Missile approach warning system (MAWS): sees missiles the RWR cannot
+    // hear (heat seekers), by the motor's plume or with its own doppler
+    // radar. Bearing as the RWR's; elevation positive above the wing plane.
+    bool maws_fitted = false;         ///< The jet carries a missile approach warner
+    bool maws_threat = false;         ///< A declared missile is closing on the jet
+    int maws_threat_count = 0;
+    int maws_clock = 12;              ///< Most urgent threat's clock position (12 on the nose)
+    double maws_bearing_deg = 0.0;
+    double maws_elevation_deg = 0.0;
+    double maws_time_to_go_s = 0.0;   ///< Estimated time to impact
+    bool maws_range_valid = false;    ///< Range measured (pulse-doppler MAW only)
+    double maws_range_m = 0.0;
+    unsigned maws_launch_count = 0;   ///< Threats declared so far: a rise cues the launch tone once
     int chaff = -1;                   ///< Cartridges left (-1: no dispenser shown)
     int flares = -1;                  ///< Flares left (-1: no dispenser shown)
     bool blink = false;               ///< Warning flash phase (~3 Hz)
