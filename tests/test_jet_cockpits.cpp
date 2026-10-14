@@ -4,10 +4,14 @@
 // instrument face turns toward the eye, the Typhoon carries its own
 // glareshield (MDEF, DWP, Get-U-Home display) and wide-angle HUD, and the
 // F-35B its panoramic display and no HUD at all. The F-35B's lift system
-// poses its doors and swivels its nozzle as the flight model says.
+// poses its doors and swivels its nozzle as the flight model says, and its
+// weapons-bay doors open for its radar-missile launches.
 
 #include "fastjet/graphics/jet_cockpits.hpp"
+#include "fastjet/sim/missile.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -298,6 +302,129 @@ void test_f35b_lift_system_pose() {
     std::cout << "PASS\n";
 }
 
+/// The F-35B's weapons bays: two 3.6 m bays either side of the keel between
+/// the LiftFan's exit and the main gear, an inboard and an outboard door
+/// each. Shut, the doors lie flush on the belly; open, they hang below it,
+/// clear of the fuselage, of each other and of the ground with the struts
+/// fully compressed.
+void test_f35b_weapon_bay_doors() {
+    std::cout << "[Test] F-35B: weapons-bay doors flush shut, clear open... " << std::flush;
+    using namespace airframe_build;
+    using namespace airframe_build::f35b_layout;
+    const AirframeInfo info = airframe_info(AircraftType::F35B_LIGHTNING_II);
+    const std::vector<ProceduralPart> parts = f35b(info);
+    const std::vector<Section>& body = f35b_body();
+    const auto& gear = kConfig.gear;
+    assert(std::abs((kBayFwd - kBayAft) - 3.60f) < 1e-4f);
+    // Between the LiftFan's lower doors and the main gear, clear of the nose wheel.
+    assert(kBayFwd + kBayTooth < kFanExitAft && kBayFwd + kBayTooth < static_cast<float>(gear.nose_pos_b.x) - 0.30f);
+    assert(kBayOut < static_cast<float>(gear.main_r_pos_b.y) - 0.5f);
+
+    // Every vertex of every bay-door part, with its joint.
+    struct DoorVertex {
+        V3 p;
+        int joint;
+    };
+    std::vector<DoorVertex> doors;
+    for (const ProceduralPart& part : parts) {
+        if (part.joint < kBayInL || part.joint > kBayOutR) continue;
+        for (size_t v = 0; v + 5 < part.vertices.size(); v += 6) {
+            doors.push_back({{part.vertices[v], part.vertices[v + 1], part.vertices[v + 2]}, part.joint});
+        }
+    }
+    assert(!doors.empty());
+    for (int j = kBayInL; j <= kBayOutR; ++j) {
+        assert(std::count_if(doors.begin(), doors.end(), [j](const DoorVertex& d) { return d.joint == j; }) > 0);
+    }
+
+    // Shut: flush with the belly (the outer face 10 mm proud, the door's
+    // thickness inside the skin), each door within its own bay.
+    propulsion::StovlStatus st;
+    st.equipped = true;
+    const StovlPose shut = f35b_stovl_pose(st, {});
+    double proud = 0.0;
+    for (const DoorVertex& d : doors) {
+        const V3 p = transform(shut.joints.m[static_cast<size_t>(d.joint)], d.p);
+        const float dz = p.z - skin_z(body, p.x, p.y, false); // + below the belly, outside
+        proud = std::max(proud, static_cast<double>(dz));
+        assert(dz > -0.030f && dz < 0.015f);
+        assert(p.x > kBayAft - kBayTooth - 0.01f && p.x < kBayFwd + kBayTooth + 0.01f);
+        const bool left = d.joint == kBayInL || d.joint == kBayOutL;
+        assert(left ? (p.y < -kBayIn + 1e-3f && p.y > -kBayOut - 1e-3f) : (p.y > kBayIn - 1e-3f && p.y < kBayOut + 1e-3f));
+    }
+
+    // Open: the doors hang down a little past vertical.
+    const StovlPose open = f35b_stovl_pose(st, {1.0f, 1.0f});
+    const float ground = info.contact_z - static_cast<float>(gear.max_stroke); // struts bottomed
+    float lowest = -1e9f, inner_gap = 1e9f, drop = 1e9f;
+    for (const DoorVertex& d : doors) {
+        const V3 p = transform(open.joints.m[static_cast<size_t>(d.joint)], d.p);
+        // Not into the fuselage: never deeper inside the belly than the door is thick.
+        if (std::abs(p.y) < 1.15f) assert(p.z > skin_z(body, p.x, p.y, false) - 0.04f);
+        lowest = std::max(lowest, p.z);
+        if (d.joint == kBayInL || d.joint == kBayInR) inner_gap = std::min(inner_gap, std::abs(p.y));
+        // The seam edges swing down and away from the belly.
+        if (std::abs(std::abs(d.p.y) - kBaySeam) < 0.01f) drop = std::min(drop, p.z - skin_z(body, d.p.x, d.p.y, false));
+    }
+    std::printf("(shut %.0f mm proud, open %.2f m down, %.2f m above bottomed-gear ground, inboard doors %.2f m apart) ",
+                proud * 1000.0, drop, ground - lowest, 2.0f * inner_gap);
+    assert(drop > 0.30f);
+    assert(lowest < ground - 0.25f);
+    assert(inner_gap > 0.05f);
+    // Each bay opens on its own.
+    const StovlPose left_only = f35b_stovl_pose(st, {1.0f, 0.0f});
+    assert(std::abs(left_only.joints.m[kBayInR](2, 3)) < 1e-6f && std::abs(left_only.joints.m[kBayInL](1, 2)) > 0.9f);
+    std::cout << "PASS\n";
+}
+
+/// The bay doors follow the jet's own radar-missile launches from the
+/// missiles in the air: they snap open, hold ~1.5 s while the missile
+/// clears, then shut; consecutive launches alternate bays. Heat-seekers
+/// (external rails) and other jets' missiles leave them shut.
+void test_f35b_weapon_bay_cycle() {
+    std::cout << "[Test] F-35B: bay doors cycle with radar-missile launches... " << std::flush;
+    std::array<sim::Missile, 4> missiles{};
+    auto doors = [&](int shooter) { return weapon_bay_doors(missiles, shooter); };
+    assert(doors(0).left == 0.0f && doors(0).right == 0.0f);
+
+    sim::Missile& amraam = missiles[0];
+    amraam.active = true;
+    amraam.shooter = 0;
+    amraam.spec = sim::missile_specs::aim120c();
+    amraam.body.tof = 0.0;
+    assert(doors(0).right == 0.0f); // released this instant: the doors just start
+    amraam.body.tof = 0.1;
+    assert(doors(0).right > 0.2f && doors(0).right < 1.0f && doors(0).left == 0.0f);
+    for (double t : {0.3, 1.0, 1.7}) {
+        amraam.body.tof = t;
+        assert(doors(0).right == 1.0f);
+    }
+    amraam.body.tof = 2.0;
+    assert(doors(0).right > 0.0f && doors(0).right < 1.0f);
+    amraam.body.tof = 2.5;
+    assert(doors(0).right == 0.0f);
+    // Another jet's missile, or one gone, opens nothing here.
+    amraam.body.tof = 1.0;
+    assert(doors(1).right == 0.0f && doors(1).left == 0.0f);
+    amraam.active = false;
+    assert(doors(0).right == 0.0f);
+    // The next launch, in the next slot, comes from the other bay.
+    amraam.active = true;
+    sim::Missile& second = missiles[1];
+    second = amraam;
+    second.body.tof = 0.5;
+    assert(doors(0).right == 1.0f && doors(0).left == 1.0f);
+    // An AIM-9X leaves its external rail: the bays stay shut.
+    amraam.active = second.active = false;
+    sim::Missile& sidewinder = missiles[2];
+    sidewinder.active = true;
+    sidewinder.shooter = 0;
+    sidewinder.spec = sim::missile_specs::aim9x();
+    sidewinder.body.tof = 0.5;
+    assert(doors(0).right == 0.0f && doors(0).left == 0.0f);
+    std::cout << "PASS\n";
+}
+
 } // namespace
 
 int main() {
@@ -307,6 +434,8 @@ int main() {
     test_typhoon_layout();
     test_f35b_layout();
     test_f35b_lift_system_pose();
+    test_f35b_weapon_bay_doors();
+    test_f35b_weapon_bay_cycle();
     std::cout << "All jet cockpit tests passed.\n";
     return 0;
 }

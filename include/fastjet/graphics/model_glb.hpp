@@ -112,7 +112,7 @@ struct ProceduralPart {
 /// airframe's own axes (each maps the part from where it was built to where
 /// it is now). Unused entries are identity.
 struct JointPose {
-    static constexpr int kMax = 12;
+    static constexpr int kMax = 16;
     std::array<Mat4, kMax> m{};
     int count = 0;
 };
