@@ -839,6 +839,8 @@ public:
             draw_text(buf, right ? x + 0.06f : x - 0.06f, y - 0.10f, 0.062f, c, right ? -1 : 1);
         }
 
+        if (tel.combat.maws_threat) draw_maws_cue(tel.combat, CX, CY, R, s.range_scale_nm, tel.radar.blink);
+
         // Ownship: a small jet in the middle, nose up.
         add_tri(CX, CY + 0.055f, CX - 0.018f, CY - 0.01f, CX + 0.018f, CY - 0.01f, Color4::white());
         add_bar(CX - 0.05f, CY - 0.005f, CX + 0.05f, CY - 0.005f, 0.014f, Color4::white());
@@ -868,6 +870,50 @@ public:
         } else {
             draw_text("NO CONTACTS", 0.0f, -0.935f, TS, dim, 0);
         }
+    }
+
+    /// @brief The MAWS threat on the sweep display (scope centre @p cx, @p cy,
+    /// radius @p r): a flashing red arrowhead on the rim at the most urgent
+    /// missile's bearing, pointing in, with its line of approach toward the
+    /// ownship. A pulse-doppler MAW measures range, so its missile also gets a
+    /// ring at that range. The top line names it: clock, range (if measured),
+    /// time to go and how many more are inbound.
+    void draw_maws_cue(const CombatTelemetry& c, float cx, float cy, float r, float range_scale_nm, bool blink) {
+        const Color4 red{1.0f, 0.12f, 0.10f, blink ? 1.0f : 0.45f};
+        const auto at = [&](float bearing_deg, float rho, float& x, float& y) {
+            const float a = bearing_deg * kPi / 180.0f;
+            x = cx + rho * std::sin(a);
+            y = cy + rho * std::cos(a);
+        };
+        const float b = static_cast<float>(c.maws_bearing_deg);
+        float tx, ty, lx, ly, rx, ry, ix, iy;
+        at(b, r * 0.80f, tx, ty);
+        at(b - 6.0f, r * 0.98f, lx, ly);
+        at(b + 6.0f, r * 0.98f, rx, ry);
+        add_tri(tx, ty, lx, ly, rx, ry, red);
+        at(b, r * 0.30f, ix, iy);
+        add_bar(tx, ty, ix, iy, 0.008f, red);
+        if (c.maws_range_valid && range_scale_nm > 0.0f) {
+            const float nm = static_cast<float>(c.maws_range_m / 1852.0);
+            float mx, my;
+            at(b, r * std::min(nm / range_scale_nm, 1.0f), mx, my);
+            add_circle_outline(mx, my, 0.045f, red, 16);
+        }
+
+        char buf[48];
+        char more[8] = "";
+        if (c.maws_threat_count > 1) std::snprintf(more, sizeof(more), "  +%d", std::min(c.maws_threat_count - 1, 9));
+        const int ttg = static_cast<int>(std::lround(std::clamp(c.maws_time_to_go_s, 0.0, 99.0)));
+        if (c.maws_range_valid) {
+            std::snprintf(buf, sizeof(buf), "MISSILE %d  %.1f NM  %d S%s", std::clamp(c.maws_clock, 1, 12),
+                          c.maws_range_m / 1852.0, ttg, more);
+        } else {
+            std::snprintf(buf, sizeof(buf), "MISSILE %d  %d S%s", std::clamp(c.maws_clock, 1, 12), ttg, more);
+        }
+        // Between the SWEEP legend and the range scale.
+        float ts = 0.072f;
+        while (text_width(buf, ts) > 1.2f && ts > 0.04f) ts *= 0.9f;
+        draw_text(buf, 0.0f, 0.875f, ts, Color4{1.0f, 0.12f, 0.10f, 1.0f}, 0);
     }
 
     // =========================================================================

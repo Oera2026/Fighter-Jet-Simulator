@@ -764,6 +764,8 @@ public:
         // All symbology is masked cleanly within the combiner glass aperture
         masked_vertex_count_ = lines_.size();
         if (hmd_ && !is_crashed) build_helmet_fixed(state, imu, tel, hud_col, D);
+        // The missile warning goes in the helmet's own frame too: the pilot may be looking at it.
+        if (hmd_ && !is_crashed && tel.combat.active) build_maws(tel.combat, D * std::tan(0.17f), D * 0.011f, D);
 
         // Upload buffer to GPU
         glBindBuffer(GL_ARRAY_BUFFER, vbo_);
@@ -931,6 +933,7 @@ public:
             }
         }
         if (c.rwr_active) build_rwr(c, hud_col, D);
+        build_maws(c, D * 0.069f, D * 0.009f, D);
 
         // Energy readouts under the G-meter: turn rate [deg/s] and Ps [ft/s].
         const float lx = -D * std::tan(0.082f) - D * 0.019f;
@@ -977,6 +980,21 @@ public:
         char buf[24];
         std::snprintf(buf, sizeof(buf), "%s %d", launch ? "LAUNCH" : "LOCK", clock);
         draw_string_centered(buf, 0.0f, D * 0.084f, D * 0.009f, -D, launch ? Color4::red() : Color4::amber());
+    }
+
+    /// @brief Missile approach warning: "MISSILE 6" in red, the clock position
+    /// of the most urgent missile the MAWS sees closing, with "HI" or "LO"
+    /// when it is more than 30 deg off the wing plane. Steady, so it reads
+    /// apart from the RWR's flashing LAUNCH line above it, and centred on
+    /// @p y: under that line on the HUD, high in the helmet's own frame.
+    /// The longest form ("MISSILE 12 LO") stays clear of the airspeed and
+    /// altitude boxes on either side.
+    void build_maws(const CombatTelemetry& c, float y, float scale, float D) {
+        if (!c.maws_threat) return;
+        const char* level = c.maws_elevation_deg > 30.0 ? " HI" : c.maws_elevation_deg < -30.0 ? " LO" : "";
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), "MISSILE %d%s", std::clamp(c.maws_clock, 1, 12), level);
+        draw_string_centered(buf, 0.0f, y, scale, -D, Color4::red());
     }
 
     /// @brief Height of the F-35B's wheels below its CG [m]: the radar

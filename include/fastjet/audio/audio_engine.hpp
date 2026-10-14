@@ -39,6 +39,12 @@ struct AudioSample {
 /// recordings. New emitter: three short chirps. Lock: a steady pulsed beep.
 /// Missile launch: a fast two-tone warble that holds while the missile is guided.
 ///
+/// The missile approach warner (MAWS) has its own sound, so the pilot can tell
+/// "a radar missile is guiding on me" (RWR) from "I can see a missile coming"
+/// (MAWS, which also sees heat seekers): falling sweeps, which no RWR tone
+/// makes. Three fast high sweeps once for each new missile declared, then a
+/// slower sweep that repeats faster as the time to go runs out.
+///
 /// The F-35B lift system is synthesised as well (no LiftFan recording ships
 /// with the sim): broadband jet roar plus the fan's blade-passing whine, both
 /// following LiftFan thrust, a hydraulic clunk as the doors start or finish
@@ -89,6 +95,16 @@ private:
     double rwr_phase_ = 0.0;      // Oscillator phase [cycles]
     float rwr_env_ = 0.0f;        // Click-free on/off envelope
     int prev_rwr_level_ = 0;
+
+    // MAWS tone generator (audio thread reads, main thread sets under the stream lock)
+    static constexpr double kMawsLaunchS = 0.45; // Launch alert: three 0.15 s sweeps
+    bool maws_on_ = false;               // A declared missile is closing
+    double maws_period_s_ = 0.6;         // Inbound sweep repetition [s]
+    double maws_launch_left_s_ = 0.0;    // Launch alert still to play [s]
+    double maws_clock_ = 0.0;            // Seconds into the inbound pattern
+    double maws_phase_ = 0.0;            // Oscillator phase [cycles]
+    float maws_env_ = 0.0f;              // Click-free on/off envelope
+    unsigned prev_maws_launches_ = 0;
 
     // STOVL lift system synthesis (audio thread reads, main thread sets under the stream lock)
     float lift_fan_level_ = 0.0f;  // Target loudness 0..1 from LiftFan thrust
@@ -260,6 +276,7 @@ public:
         if (!initialized_ || !enabled_) return;
 
         update_rwr(tel);
+        update_maws(tel);
         update_stovl(tel);
         update_combat(tel);
 
@@ -359,6 +376,56 @@ private:
         }
         if (level == 0) rwr_chirps_left_ = 0;
         prev_rwr_level_ = level;
+    }
+
+    /// @brief MAWS tones from the combat telemetry: the launch alert once
+    /// whenever the count of declared missiles rises, and the inbound sweep
+    /// while one is closing, repeating every 0.6 s far out and every 0.25 s
+    /// in the last few seconds.
+    void update_maws(const graphics::AvionicsTelemetry& tel) noexcept {
+        const graphics::CombatTelemetry& c = tel.combat;
+        const bool live = c.active && c.maws_fitted && !tel.is_crashed && !tel.pilot_ejected;
+        StreamLock lock(stream_);
+        const bool on = live && c.maws_threat;
+        if (on && !maws_on_) maws_clock_ = 0.0;
+        maws_on_ = on;
+        maws_period_s_ = std::clamp(0.2 + 0.04 * c.maws_time_to_go_s, 0.25, 0.6);
+        if (live && c.maws_launch_count > prev_maws_launches_) maws_launch_left_s_ = kMawsLaunchS;
+        prev_maws_launches_ = c.maws_launch_count;
+    }
+
+    /// @brief Synthesise the MAWS tones into @p out (audio thread).
+    void mix_maws(float* out, int num_samples) noexcept {
+        constexpr double DT = 1.0 / SAMPLE_RATE;
+        constexpr float GAIN = 0.20f;
+        if (!maws_on_ && maws_launch_left_s_ <= 0.0 && maws_env_ <= 0.0f) return;
+        for (int i = 0; i < num_samples; ++i) {
+            double freq = 0.0;
+            bool on = false;
+            if (maws_launch_left_s_ > 0.0) {
+                // Launch: three fast sweeps, 2.6 down to 1.2 kHz in 0.11 s.
+                const double cyc = std::fmod(kMawsLaunchS - maws_launch_left_s_, 0.15);
+                on = cyc < 0.11;
+                freq = 2600.0 - 1400.0 * std::min(cyc / 0.11, 1.0);
+                maws_launch_left_s_ -= DT;
+            } else if (maws_on_) {
+                // Inbound: 1.5 down to 0.8 kHz in 0.16 s, once a period.
+                const double cyc = std::fmod(maws_clock_, maws_period_s_);
+                on = cyc < 0.16;
+                freq = 1500.0 - 700.0 * std::min(cyc / 0.16, 1.0);
+                maws_clock_ += DT;
+            }
+            // 3 ms attack/release, as the RWR's.
+            const float target = on ? 1.0f : 0.0f;
+            maws_env_ += (target - maws_env_) * 0.0075f;
+            if (!on && maws_env_ < 1e-4f) maws_env_ = 0.0f;
+            if (freq > 0.0) maws_phase_ = std::fmod(maws_phase_ + freq * DT, 1.0);
+            const double ph = 2.0 * M_PI * maws_phase_;
+            const float v = static_cast<float>(std::sin(ph) + 0.2 * std::sin(2.0 * ph)) * maws_env_ * GAIN *
+                            alerts_bus_gain_;
+            out[i * 2 + 0] = std::clamp(out[i * 2 + 0] + v, -1.0f, 1.0f);
+            out[i * 2 + 1] = std::clamp(out[i * 2 + 1] + v, -1.0f, 1.0f);
+        }
     }
 
     /// @brief LiftFan loudness from its thrust; a clunk on every lift-system
@@ -619,6 +686,7 @@ private:
             }
         }
         mix_rwr(out, num_samples);
+        mix_maws(out, num_samples);
         mix_stovl(out, num_samples);
         mix_combat(out, num_samples);
     }
