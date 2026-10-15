@@ -49,7 +49,7 @@ void test_stabilator_rate_and_deflection_limits() {
 }
 
 void test_flaperon_and_rudder_actuators() {
-    std::cout << "[Test] Flaperon (52 deg/s, [-20, +20]) & Rudder (120 deg/s, [-30, +30])... " << std::flush;
+    std::cout << "[Test] Roll surface (80 deg/s, [-20, +20]) & Rudder (120 deg/s, [-30, +30])... " << std::flush;
 
     constexpr double DT = 0.005;
 
@@ -59,10 +59,10 @@ void test_flaperon_and_rudder_actuators() {
     for (int i = 0; i < 200; ++i) {
         flap.step(30.0, DT); // Command beyond +20 limit
         if (flap.rate > flap_max_rate) flap_max_rate = flap.rate;
-        assert(flap.rate <= 52.0001);
+        assert(flap.rate <= 80.0001);
     }
     assert(std::abs(flap.position - 20.0) < 1e-6);
-    assert(std::abs(flap_max_rate - 52.0) < 1e-3);
+    assert(std::abs(flap_max_rate - 80.0) < 1e-3);
 
     // Rudder
     Actuator rud = Actuator::create_rudder(0.0);

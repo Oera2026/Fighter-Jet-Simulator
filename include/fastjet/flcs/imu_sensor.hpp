@@ -26,6 +26,7 @@ struct IMUData {
     double airspeed{0.0};     // True airspeed [m/s]
     double altitude{0.0};     // Geometric altitude [m]
     double gz{1.0};           // Gravity along body z (down), cos(theta) cos(phi) [G]: 1 wings level, -1 inverted
+    double gy{0.0};           // Gravity along body y (right), cos(theta) sin(phi) [G]
 
     static IMUData read(
         const fdm::FlightState& state,
@@ -45,7 +46,9 @@ struct IMUData {
         data.q_deg = state.omega_b.y * RAD_TO_DEG;
         data.r_deg = state.omega_b.z * RAD_TO_DEG;
 
-        data.gz = state.q_att.rotate_ned_to_body(math::Vector3(0.0, 0.0, 1.0)).z;
+        const math::Vector3 g_b = state.q_att.rotate_ned_to_body(math::Vector3(0.0, 0.0, 1.0));
+        data.gz = g_b.z;
+        data.gy = g_b.y;
 
         data.alpha_deg = state.alpha() * RAD_TO_DEG;
         data.beta_deg  = state.beta()  * RAD_TO_DEG;
