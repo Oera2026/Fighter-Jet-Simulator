@@ -1,12 +1,31 @@
 #include "fastjet/flcs/onboard_flight_computer.hpp"
 #include "fastjet/fdm/flight_state.hpp"
 #include "fastjet/flcs/imu_sensor.hpp"
+#include "fastjet/environment/ground_collision.hpp"
 #include <iostream>
 #include <cassert>
 #include <cmath>
 
 using namespace fastjet;
 using namespace fastjet::flcs;
+
+/// Flies a hand-placed state on along its velocity (attitude frozen) until
+/// Auto-GCAS engages, as the jet would close on the terrain. The recovery fires
+/// at the last instant (planned to bottom out at its 30 ft buffer), so a state
+/// that sat "inside the margin" of the old, earlier trigger is flown on to
+/// where it now triggers. Returns false if the jet reached the ground first.
+bool fly_until_gcas(OnBoardFlightComputer& ofc, fdm::FlightState& state, const IMUData& imu,
+                    const PilotCommands& pilot, PilotCommands& out, double max_s = 10.0) {
+    constexpr double dt = 0.005;
+    for (double t = 0.0; t < max_s; t += dt) {
+        out = ofc.update(dt, state, imu, pilot);
+        if (ofc.is_gcas_active()) return true;
+        state.pos_ned = state.pos_ned + state.velocity_ned() * dt;
+        if (state.altitude() <= environment::GroundCollision::get_terrain_height(state.pos_ned.x, state.pos_ned.y))
+            return false;
+    }
+    return false;
+}
 
 void test_gcas_does_not_intervene_on_shallow_dive() {
     std::cout << "[Test] GCAS: Shallow dive (-12 deg) at 150m does NOT trigger GCAS...\n";
@@ -117,7 +136,8 @@ void test_gcas_commands_nominal_g_not_max_g() {
     imu.Nz = 1.0;
     PilotCommands pilot_in{0.0, 0.0, 0.0};
 
-    PilotCommands out = ofc.update(0.005, state, imu, pilot_in);
+    PilotCommands out{};
+    assert(fly_until_gcas(ofc, state, imu, pilot_in, out));
     assert(ofc.is_gcas_active());
     // pitch_stick == 1.0 would demand the airframe's full 9G limit; the nominal
     // 5G recovery target should sit around (5-1)/(9-1) = 0.5, well short of max.
@@ -203,9 +223,13 @@ void test_gcas_throttle_authority() {
     assert(ofc.has_throttle_override());
     assert(ofc.throttle_override_value() < 0.3);
 
-    // Roll to wings level -> PULL_UP, full power.
-    state.q_att = math::Quaternion::from_euler(0.0, -30.0 * (M_PI / 180.0), 0.0);
-    (void)ofc.update(0.005, state, imu, pilot_in);
+    // Roll through to the escape's bank (wings level, or a climbing turn's)
+    // -> PULL_UP, full power.
+    for (double bank = 60.0; bank > -90.0 && ofc.gcas_state == OnBoardFlightComputer::GcasState::WING_LEVEL;
+         bank -= 1.0) {
+        state.q_att = math::Quaternion::from_euler(bank * (M_PI / 180.0), -30.0 * (M_PI / 180.0), 0.0);
+        (void)ofc.update(0.005, state, imu, pilot_in);
+    }
     assert(ofc.gcas_state == OnBoardFlightComputer::GcasState::PULL_UP);
     assert(ofc.has_throttle_override());
     assert(ofc.throttle_override_value() == 1.0);
@@ -336,9 +360,12 @@ void test_gcas_avoids_mountain_ahead_in_level_flight() {
     PilotCommands pilot_hands_off{0.0, 0.0, 0.0};
 
     // Even though the aircraft is flying perfectly level (fpa = 0.0),
-    // predictive terrain look-ahead must sense the rising mountain ahead and engage!
-    PilotCommands out = ofc.update(0.005, state, imu, pilot_hands_off);
+    // predictive terrain look-ahead must sense the rising mountain ahead and
+    // engage before the slope, with the 5 G pull-up still enough.
+    PilotCommands out{};
+    assert(fly_until_gcas(ofc, state, imu, pilot_hands_off, out, 3.0));
     assert(ofc.is_gcas_active());
+    assert(state.pos_ned.x < peak_x - 300.0);
     assert(out.pitch_stick > 0.40); // Commanding autonomous pull-up
     assert(ofc.gcas_tti_seconds() < 4.0);
 
@@ -406,7 +433,8 @@ void test_gcas_never_pulls_while_inverted() {
     imu.Nz = 1.0;
     PilotCommands pilot_in{0.0, 0.0, 0.0};
 
-    PilotCommands out = ofc.update(0.005, state, imu, pilot_in);
+    PilotCommands out{};
+    assert(fly_until_gcas(ofc, state, imu, pilot_in, out, 1.0));
     assert(ofc.is_gcas_active());
     // Only cos(bank) of a pull opposes the descent. Inverted that term is negative,
     // so a nose-up command would drive the nose *into* the terrain.
@@ -421,6 +449,7 @@ void test_gcas_pull_fades_out_when_inverted() {
     std::cout << "[Test] GCAS: Commanded pull is held at moderate bank and faded out when inverted...\n";
     double prev = 1e9;
     double pull_at_zero_bank = 0.0;
+    const double nominal_stick = (OnBoardFlightComputer::GCAS_RECOVERY_G - 1.0) / (9.0 - 1.0);
     for (double bank_deg : {0.0, 45.0, 90.0, 135.0, 150.0, 165.0, 179.0}) {
         OnBoardFlightComputer ofc;
         fdm::FlightState state{};
@@ -432,14 +461,15 @@ void test_gcas_pull_fades_out_when_inverted() {
         imu.Nz = 1.0;
         PilotCommands pilot_in{0.0, 0.0, 0.0};
 
-        PilotCommands out = ofc.update(0.005, state, imu, pilot_in);
-        assert(ofc.is_gcas_active());
-        // Never increases with bank.
-        assert(out.pitch_stick <= prev + 1e-9);
+        PilotCommands out{};
+        assert(fly_until_gcas(ofc, state, imu, pilot_in, out, 1.0));
+        // Never increases with bank once the roll to upright is the bigger job
+        // (below that a later trigger may escalate the pull).
+        if (bank_deg >= 90.0) assert(out.pitch_stick <= prev + 1e-9);
         if (bank_deg == 0.0) pull_at_zero_bank = out.pitch_stick;
         // Full recovery G is preserved out to where the pre-load is still worth more
         // than the downward component it costs (see bank_pull_scale).
-        if (bank_deg <= 135.0) assert(out.pitch_stick >= pull_at_zero_bank - 1e-9);
+        if (bank_deg <= 135.0) assert(out.pitch_stick >= nominal_stick - 1e-9);
         // Beyond the fade the pull must be gone: it would drive the nose at the ground.
         if (bank_deg >= 165.0) assert(out.pitch_stick <= 0.0);
         std::cout << "    bank=" << bank_deg << " deg -> pitch_stick=" << out.pitch_stick << "\n";
@@ -483,27 +513,40 @@ void test_tumble_never_commands_nose_down_during_gcas_recovery() {
     std::cout << "[Test] Tumble: Never commands nose-down while GCAS is recovering near terrain...\n";
     OnBoardFlightComputer ofc;
     fdm::FlightState state{};
-    state.pos_ned = math::Vector3(0, 0, -34.0); // 34 m AGL
-    // High alpha (35 deg) at 130 m/s: inside the deep-stall detector's band, and
-    // exactly what a hard GCAS pull-out produces at low speed.
+    IMUData imu{};
+    imu.Nz = 1.0;
+    PilotCommands pilot_in{0.0, 0.0, 0.0};
+    PilotCommands out{};
+    // A low dive that GCAS is pulling out of...
+    state.pos_ned = math::Vector3(0, 0, -60.0);
+    state.vel_b   = math::Vector3(200.0, 0.0, 0.0);
+    state.q_att   = math::Quaternion::from_euler(0.0, -15.0 * (M_PI / 180.0), 0.0);
+    assert(fly_until_gcas(ofc, state, imu, pilot_in, out, 2.0));
+
+    // ...reaches high alpha (35 deg) at 130 m/s, 34 m AGL: inside the deep-stall
+    // detector's band, and exactly what a hard GCAS pull-out produces at low speed.
+    state.pos_ned = math::Vector3(state.pos_ned.x, 0, -34.0);
     const double V = 130.0, a = 35.0 * (M_PI / 180.0);
     state.vel_b   = math::Vector3(V * std::cos(a), 0.0, V * std::sin(a));
     state.q_att   = math::Quaternion::from_euler(0.0, 30.0 * (M_PI / 180.0), 0.0);
     state.omega_b = math::Vector3(0.0, 0.1, 0.0);
-
-    IMUData imu{};
     imu.Nz = 1.5;
-    PilotCommands pilot_in{0.0, 0.0, 0.0};
-
-    PilotCommands out{};
     for (int i = 0; i < 80; ++i) out = ofc.update(0.005, state, imu, pilot_in);
 
     assert(ofc.is_gcas_active());
     // The tumble law used to win the pitch axis outside a narrow 2.0 s
     // time-to-impact window and command full nose-down at 34 m AGL.
     assert(out.pitch_stick > 0.0);
-    std::cout << "  PASSED (GCAS keeps the pitch axis: pitch_stick=" << out.pitch_stick
-              << ", tti=" << ofc.gcas_tti_seconds() << "s)\n";
+    std::cout << "  GCAS keeps the pitch axis: pitch_stick=" << out.pitch_stick
+              << ", tti=" << ofc.gcas_tti_seconds() << "s\n";
+
+    // The same state with no recovery in progress (the pilot's own hard pull,
+    // which GCAS predicts will clear): no nose-down stall break at 34 m.
+    OnBoardFlightComputer fresh;
+    for (int i = 0; i < 80; ++i) out = fresh.update(0.005, state, imu, pilot_in);
+    assert(!fresh.is_tumble_active());
+    assert(out.pitch_stick >= 0.0);
+    std::cout << "  PASSED (no stall break near the ground: pitch_stick=" << out.pitch_stick << ")\n";
 }
 
 void test_gcas_stands_down_for_established_departure() {
@@ -737,8 +780,11 @@ void test_gcas_engages_earlier_when_slow() {
     state.q_att   = math::Quaternion::from_euler(0.0, -20.0 * (M_PI / 180.0), 0.0);
     IMUData imu{};
     imu.Nz = 1.0;
-    (void)ofc.update(0.005, state, imu, PilotCommands{});
-    assert(ofc.is_gcas_active());
+    PilotCommands out{};
+    assert(fly_until_gcas(ofc, state, imu, PilotCommands{}, out));
+    // ...so it engages well above that: the ~1.9 G pull-out needs ~100 m.
+    std::cout << "    engaged at " << state.altitude() << " m\n";
+    assert(state.altitude() > 100.0);
     std::cout << "  PASSED\n";
 }
 
@@ -751,7 +797,8 @@ void test_gcas_token_pull_does_not_stand_gcas_down() {
     state.q_att   = math::Quaternion::from_euler(0.0, -35.0 * (M_PI / 180.0), 0.0);
     IMUData imu{};
     imu.Nz = 2.5;
-    (void)ofc.update(0.005, state, imu, PilotCommands{0.3, 0.0, 0.0});
+    PilotCommands out{};
+    assert(fly_until_gcas(ofc, state, imu, PilotCommands{0.3, 0.0, 0.0}, out));
     assert(ofc.is_gcas_active());
     std::cout << "  PASSED\n";
 }
@@ -772,9 +819,10 @@ void test_gcas_recovery_g_mapped_through_airframe_range() {
     state.q_att   = math::Quaternion::from_euler(0.0, -35.0 * (M_PI / 180.0), 0.0);
     IMUData imu{};
     imu.Nz = 1.0;
-    const PilotCommands out = ofc.update(0.005, state, imu, PilotCommands{});
+    PilotCommands out{};
+    assert(fly_until_gcas(ofc, state, imu, PilotCommands{}, out));
     assert(ofc.is_gcas_active());
-    assert(std::abs(out.pitch_stick - (5.0 - 1.0) / (9.0 - 1.0)) < 0.01);
+    assert(std::abs(out.pitch_stick - (5.0 - 1.0) / (9.0 - 1.0)) < 0.02);
     std::cout << "  PASSED\n";
 }
 

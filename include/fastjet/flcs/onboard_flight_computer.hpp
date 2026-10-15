@@ -281,6 +281,9 @@ public:
     /// altitude AGL. Enforced unconditionally alongside (not instead of) the
     /// predicted recovery, as a last-resort backstop [m] (= 30 ft).
     static constexpr double GCAS_HARD_DECK_M      = 30.0 * 0.3048;
+    /// Below this height AGL [m] (~1,000 ft) a deep stall is not broken
+    /// nose-down: the dive that follows a stall break needs more than is left.
+    static constexpr double TUMBLE_STALL_BREAK_FLOOR_M = 300.0;
     /// Throttle commanded while rolling to wings-level during a recovery: cut back
     /// toward idle so the dive doesn't keep accelerating into the ground while the
     /// jet is still banked and can't yet pull effectively.
@@ -377,6 +380,8 @@ public:
     int gcas_escape_hint{0};
     /// Ticks left before the escapes are re-predicted while armed and far from terrain.
     int gcas_eval_skip{0};
+    /// Where the escapes were last predicted from [m, NED].
+    math::Vector3 gcas_eval_pos{};
     /// The recovery in progress has reached its pull: full power from here on.
     bool gcas_pulled{false};
     /// The recovery in progress is a last-ditch save (no breakout).
@@ -1488,7 +1493,10 @@ private:
                 } else {
                     const double trigger_level = buffer;
                     const bool hard_deck = local_agl < GCAS_HARD_DECK_M && vert_speed > 0.0;
-                    if (gcas_eval_skip > 0 && !hard_deck) {
+                    // A jet that has moved further than flight allows since the last
+                    // prediction (repositioned without a reset) is re-predicted at once.
+                    const bool moved = (state.pos_ned - gcas_eval_pos).norm() > 0.25 * gcas_margin_m;
+                    if (gcas_eval_skip > 0 && !hard_deck && !moved) {
                         // Far from needing a recovery: re-predicted only every few
                         // ticks (the margin cannot close in the meantime).
                         --gcas_eval_skip;
@@ -1497,6 +1505,7 @@ private:
                         choice = best_escape(seed, g_pull, airframe.gcas_reaction_s, trigger_level + 1.0);
                         gcas_escape_hint = std::max(0, choice.index);
                         gcas_margin_m = choice.clearance - buffer;
+                        gcas_eval_pos = state.pos_ned;
                         trigger = choice.clearance <= trigger_level || hard_deck;
                         gcas_eval_skip = (gcas_margin_m > GCAS_SKIP_FAR_M) ? GCAS_SKIP_FAR_TICKS
                                        : (gcas_margin_m > GCAS_SKIP_NEAR_M) ? GCAS_SKIP_NEAR_TICKS : 0;
@@ -1777,6 +1786,13 @@ private:
         // Departure conditions:
         // 1. Deep stall: alpha well past the airframe's limit (or < -20 deg) with low airspeed
         const bool is_deep_stall = (alpha_deg > deep_stall_alpha || alpha_deg < -20.0) && (V < 140.0);
+        // Near the ground a stall is not broken nose-down: the dive that follows
+        // needs more height than is left, and a hard pull-out at low speed (the
+        // pilot's or Auto-GCAS's own) puts the jet in this alpha band anyway.
+        // There the pilot and Auto-GCAS keep the jet; a spin or tumble still counts.
+        const double agl = state.altitude() - environment::GroundCollision::get_terrain_height(
+                                                  state.pos_ned.x, state.pos_ned.y);
+        const bool stall_near_ground = agl < TUMBLE_STALL_BREAK_FLOOR_M;
         // 2. Flat / steep spin: high yaw rate (> 40 deg/s) + sideslip (> 14 deg)
         const bool is_spin = (r_dps > 40.0 && std::abs(beta_deg) > 14.0);
         // 3. Violent out-of-control tumble: pitch & yaw multi-axis rates exceed safe envelope
@@ -1786,7 +1802,7 @@ private:
 
         departure_rotation = is_spin || is_tumble;
 
-        if (is_deep_stall || is_spin || is_tumble) {
+        if ((is_deep_stall && !stall_near_ground) || is_spin || is_tumble) {
             tumble_persist_timer += dt;
         } else {
             tumble_persist_timer = std::max(0.0, tumble_persist_timer - dt * 2.0);
@@ -1836,8 +1852,10 @@ private:
 
             // 3. Deep stall breakout pitch command:
             if (alpha_deg > stall_break_alpha) {
-                // Positive deep stall: full nose-down pitch to break stall & restore attached flow
-                effective.pitch_stick = -1.0;
+                // Positive deep stall: full nose-down pitch to break stall & restore
+                // attached flow, but never into the ground (see stall_near_ground).
+                effective.pitch_stick = (stall_near_ground && !departure_rotation)
+                                      ? std::max(effective.pitch_stick, 0.0) : -1.0;
             } else if (alpha_deg < -12.0) {
                 // Inverted stall: pull nose up toward relative wind
                 effective.pitch_stick = 1.0;
