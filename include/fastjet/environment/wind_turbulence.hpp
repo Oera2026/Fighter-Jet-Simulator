@@ -19,6 +19,10 @@ public:
     double base_wind_speed_mps = 5.0;   // ~10 knots moderate breeze
     double wind_heading_rad    = 0.785; // 045 degrees (crosswind relative to runway 000)
     bool turbulence_enabled    = true;
+    /// Off: still air with the gusts kept (their intensity still follows
+    /// base_wind_speed_mps). An air combat runs in still air because its
+    /// missiles and rounds fly in still air.
+    bool mean_wind_enabled     = true;
 
 private:
     // Internal turbulence filter states (first-order low-pass shaping of white noise)
@@ -83,6 +87,7 @@ public:
     /// Incorporates logarithmic atmospheric boundary layer wind shear
     /// @param altitude_m Altitude above ground [m]
     math::Vector3 compute_mean_wind_ned(double altitude_m) const noexcept {
+        if (!mean_wind_enabled) return math::Vector3(0.0, 0.0, 0.0);
         // Logarithmic wind profile: V(z) = V_ref * ln(z / z0) / ln(z_ref / z0)
         // z0 ~ 0.05m (airport runway / open terrain)
         constexpr double z0 = 0.05;

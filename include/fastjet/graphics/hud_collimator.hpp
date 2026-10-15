@@ -801,7 +801,10 @@ public:
         if (c.target_valid) {
             float tx = 0.0f, ty = 0.0f;
             const bool front = to_hud(c.target_dir_b, tx, ty);
-            if (front && std::hypot(tx, ty) < hud_r) {
+            // The helmet's virtual HUD reaches as far as the seeker reticle
+            // does: the box stays on the bandit wherever the diamond can.
+            const float box_r = hmd_ ? hud_r * 1.4f : hud_r;
+            if (front && std::hypot(tx, ty) < box_r) {
                 const float h = D * 0.007f;
                 add_rect(tx, ty, 2.0f * h, 2.0f * h, -D, hud_col);
                 if (c.hit_cue_s > 0.0) draw_string_centered("HIT", tx, ty + h + D * 0.006f, D * 0.008f, -D, hud_col);
@@ -906,10 +909,13 @@ public:
             add_line(dlz_x - D * 0.004f, tgt_y - D * 0.002f, -D, dlz_x - D * 0.004f, tgt_y + D * 0.002f, -D, hud_col);
         }
 
-        // Missile cues, centre low: a flashing SHOOT when locked inside the
-        // launch zone, otherwise a flashing NO LOCK (amber) after a pickle
-        // that found nothing to shoot at, or a steady LOCK.
-        const float cue_y = -D * std::tan(0.015f);
+        // Missile cues, centred 2 deg above the boresight: a flashing SHOOT
+        // when locked inside the launch zone, otherwise a flashing NO LOCK
+        // (amber) after a pickle that found nothing to shoot at, or a steady
+        // LOCK. Clear of the seeker circle and gun cross below and the
+        // airspeed and altitude boxes above; below the boresight it sat on the
+        // horizon line and the flight path marker in level flight.
+        const float cue_y = D * std::tan(0.035f);
         if (c.shoot_cue) {
             if (c.blink) draw_string_centered("SHOOT", 0.0f, cue_y, D * 0.012f, -D, hud_col);
         } else if (c.selected_weapon > 0 && c.weapon_cue[0] && c.weapon_cue_s > 0.0) {

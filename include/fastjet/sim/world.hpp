@@ -105,6 +105,7 @@ public:
         prev_pickle_.fill(false);
         for (auto& s : seats) s.reset();
         event_count_ = 0;
+        seed_ = seed;
         rng_.state = seed ? seed : 1u;
         last_hit_by_.fill(-1);
         last_hit_time_.fill(-1e9);
@@ -119,9 +120,7 @@ public:
         Aircraft& a = aircraft[static_cast<size_t>(i)];
         if (a.type != type) a.configure(type);
         a.reset(start); // full tanks, systems reset, undamaged
-        // The first jet keeps the default gust stream (identical to the
-        // single-aircraft viewer); the others get their own.
-        a.seed_turbulence(i == 0 ? 0u : 0x2545F491u * static_cast<uint32_t>(i + 1));
+        a.seed_turbulence(turbulence_seed(seed_, i));
         was_crashed_[static_cast<size_t>(i)] = false;
         was_alive_[static_cast<size_t>(i)] = true;
         radars[static_cast<size_t>(i)].configure(type);
@@ -145,6 +144,16 @@ public:
         check_midairs();
         check_ground_impacts();
         check_mission_kills();
+    }
+
+    /**
+     * @brief Gust stream of jet @p index in a sky cleared with @p seed: its
+     * own for each jet and each fight. The first jet of the default sky
+     * (seed 1) keeps the default stream (0), so a single jet flies exactly
+     * as the single-aircraft viewer always has.
+     */
+    [[nodiscard]] static constexpr uint32_t turbulence_seed(uint32_t seed, int index) noexcept {
+        return (seed - 1u) * 0x9E3779B1u + static_cast<uint32_t>(index) * 0x2545F491u;
     }
 
     // ---------------------------------------------------------------------
@@ -337,6 +346,7 @@ private:
     std::array<CombatEvent, kMaxEvents> events_{};
     int event_count_{0};
     int next_round_{0};
+    uint32_t seed_{1};
     DamageRng rng_{};
     std::array<int, kMaxAircraft> last_hit_by_{};
     std::array<double, kMaxAircraft> last_hit_time_{};
@@ -547,11 +557,16 @@ private:
     }
 
     void step_missiles(double dt) noexcept {
+        // Who could guide a missile is settled at the start of the step: two
+        // missiles fuzing in the same step each keep their uplink, whichever
+        // slot comes first.
+        std::array<bool, kMaxAircraft> alive_at_start{};
+        for (int i = 0; i < count; ++i) alive_at_start[static_cast<size_t>(i)] = aircraft[static_cast<size_t>(i)].alive();
         for (auto& m : missiles) {
             if (!m.active) continue;
             const Aircraft& tgt = aircraft[static_cast<size_t>(m.target)];
             const auto& radar = radars[static_cast<size_t>(m.shooter)];
-            const bool uplink = aircraft[static_cast<size_t>(m.shooter)].alive() && radar.target == m.target &&
+            const bool uplink = alive_at_start[static_cast<size_t>(m.shooter)] && radar.target == m.target &&
                                 radar.track_fresh();
             const math::Vector3 p0 = m.body.pos;
             const double sig = m.spec.infrared() ? ir_signature(tgt, m.body.pos) : 1.0;
