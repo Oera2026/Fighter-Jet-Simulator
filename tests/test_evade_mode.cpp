@@ -120,7 +120,7 @@ void test_setup_every_level() {
         // Off the tail by up to off_tail_deg in azimuth, plus his height advantage.
         const double elevation = std::atan2(p.altitude_advantage_m, p.start_range_m) * 180.0 / M_PI;
         assert(behind > 180.0 - p.off_tail_deg - elevation - 1.0);
-        assert(e->world.missile_load[sim::Engagement::BANDIT] == p.missiles);
+        assert(e->world.stores[sim::Engagement::BANDIT].mrm.count == p.missiles);
         assert(e->world.radars[sim::Engagement::BANDIT].mode == sim::FireControlRadar::Mode::SEARCH);
         assert(e->setup_data.time_limit_s == p.survive_s);
         assert(bandit.velocity().norm() > own.velocity().norm() - 1e-6);
@@ -140,7 +140,7 @@ void test_setup_every_level() {
     s.bandit_type = aircraft::AircraftType::A10_THUNDERBOLT;
     auto e = std::make_unique<sim::Engagement>();
     e->setup(s);
-    assert(e->world.missile_load[sim::Engagement::BANDIT] == 0);
+    assert(e->world.stores[sim::Engagement::BANDIT].missiles() == 0);
     assert(e->shooter.doctrine == sim::LaunchDoctrine::NONE);
     std::cout << "  -> PASSED\n";
 }
@@ -238,7 +238,7 @@ void test_end_rules() {
     {   // Winchester: nothing left to shoot with.
         auto e = std::make_unique<sim::Engagement>();
         e->setup(evade(EvadeDifficulty::MEDIUM, 1));
-        e->world.missile_load[sim::Engagement::BANDIT] = 0;
+        e->world.stores[sim::Engagement::BANDIT].mrm.count = 0;
         e->world.aircraft[sim::Engagement::BANDIT].gun.ammo = 0;
         LevelFlight pilot{0.8};
         e->step(DT, pilot.update(e->own()));

@@ -801,7 +801,10 @@ public:
         if (c.target_valid) {
             float tx = 0.0f, ty = 0.0f;
             const bool front = to_hud(c.target_dir_b, tx, ty);
-            if (front && std::hypot(tx, ty) < hud_r) {
+            // The helmet's virtual HUD reaches as far as the seeker reticle
+            // does: the box stays on the bandit wherever the diamond can.
+            const float box_r = hmd_ ? hud_r * 1.4f : hud_r;
+            if (front && std::hypot(tx, ty) < box_r) {
                 const float h = D * 0.007f;
                 add_rect(tx, ty, 2.0f * h, 2.0f * h, -D, hud_col);
                 if (c.hit_cue_s > 0.0) draw_string_centered("HIT", tx, ty + h + D * 0.006f, D * 0.008f, -D, hud_col);
@@ -853,7 +856,8 @@ public:
             ry -= line;
         }
 
-        // Armament selection: Gun vs Missile (AIM-9X / AIM-120C)
+        // Armament: the gun, or the selected missile store's legend and count
+        // ("9X 2", "120D 4"). Its lock state is cued under the pipper with SHOOT.
         if (c.selected_weapon == 0) {
             std::snprintf(buf, sizeof(buf), "%s %d", c.gun_name, c.ammo);
             draw_string(buf, rx, ry, D * 0.008f, -D, c.ammo > 0 ? hud_col : amber);
@@ -861,7 +865,6 @@ public:
         } else {
             std::snprintf(buf, sizeof(buf), "%s %d", c.weapon_name, c.missiles_remaining);
             draw_string(buf, rx, ry, D * 0.008f, -D, c.missiles_remaining > 0 ? hud_col : amber);
-            if (c.missile_locked) draw_string("LOCK", rx + D * 0.052f, ry, D * 0.008f, -D, hud_col);
         }
 
         if (c.chaff >= 0) {
@@ -906,9 +909,19 @@ public:
             add_line(dlz_x - D * 0.004f, tgt_y - D * 0.002f, -D, dlz_x - D * 0.004f, tgt_y + D * 0.002f, -D, hud_col);
         }
 
-        // Flashing SHOOT cue when target is within parameters
-        if (c.shoot_cue && c.blink) {
-            draw_string_centered("SHOOT", 0.0f, -D * std::tan(0.015f), D * 0.012f, -D, hud_col);
+        // Missile cues, centred 2 deg above the boresight: a flashing SHOOT
+        // when locked inside the launch zone, otherwise a flashing NO LOCK
+        // (amber) after a pickle that found nothing to shoot at, or a steady
+        // LOCK. Clear of the seeker circle and gun cross below and the
+        // airspeed and altitude boxes above; below the boresight it sat on the
+        // horizon line and the flight path marker in level flight.
+        const float cue_y = D * std::tan(0.035f);
+        if (c.shoot_cue) {
+            if (c.blink) draw_string_centered("SHOOT", 0.0f, cue_y, D * 0.012f, -D, hud_col);
+        } else if (c.selected_weapon > 0 && c.weapon_cue[0] && c.weapon_cue_s > 0.0) {
+            if (c.blink) draw_string_centered(c.weapon_cue, 0.0f, cue_y, D * 0.010f, -D, amber);
+        } else if (c.selected_weapon > 0 && c.missile_locked) {
+            draw_string_centered("LOCK", 0.0f, cue_y, D * 0.009f, -D, hud_col);
         }
 
         // Heat seeker reticle (AIM-9X / ASRAAM / AIM-9M)

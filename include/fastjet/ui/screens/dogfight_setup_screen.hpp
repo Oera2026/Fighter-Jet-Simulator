@@ -81,9 +81,9 @@ struct DogfightLoadoutInfo {
 inline constexpr std::array<DogfightLoadoutInfo, 3> kDogfightLoadouts = {{
     {"GUNS ONLY", "M61A1 / BK-27 Cannon", "Internal Cannon Only",
      "Pure BFM dogfight: maneuver for gun lead and gun solution inside 800 meters."},
-    {"GUNS & HEAT-SEEKERS", "AIM-9X / ASRAAM + Cannon + Flares", "2x IR Missiles + Cannon + 60 Flares",
+    {"GUNS & HEAT-SEEKERS", "AIM-9X / IRIS-T / AIM-9M + Cannon", "The jet's IR Missiles + Cannon + 60 Flares",
      "High off-boresight dogfight: uncage the heat seeker, listen for growl, and dump flares to evade."},
-    {"FULL COMBAT LOADOUT", "AIM-120C + AIM-9X + Cannon + Chaff/Flares", "2x BVR + 2x WVR + Gun + Full Countermeasures",
+    {"FULL COMBAT LOADOUT", "AMRAAM / Meteor + IR Missiles + Cannon", "The jet's BVR + WVR Missiles + Gun + Chaff/Flares",
      "Complete air-to-air suite: radar Fox-3 BVR shots, DLZ cues, IR dogfight missiles, and chaff/flares."},
 }};
 

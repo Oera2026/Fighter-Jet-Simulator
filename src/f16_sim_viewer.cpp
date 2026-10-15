@@ -109,6 +109,7 @@ int main(int argc, char* argv[]) {
     std::cout << "  S:                      F-35B STOVL/HOOK button: convert / reconvert (50% throttle detent holds speed)\n";
     std::cout << "  Esc / Gamepad Start:    Pause menu (settings, credits, quit)\n";
     std::cout << "  F:                      Fire gun (dogfight / evade)\n";
+    std::cout << "  Q / Enter / X:          Weapon select (GUN, heat seeker, radar missile) / fire missile / flares\n";
     std::cout << "  C:                      Dispense chaff (2 bundles per press)\n";
     std::cout << "  L:                      Radar lock / unlock (FCR page, left MFD)\n";
     std::cout << "  K:                      Radar mode: CRM (long-range search) / ACM (dogfight auto-lock)\n";
@@ -120,6 +121,7 @@ int main(int argc, char* argv[]) {
     std::cout << "  F11:                    Cycle bandit skill (dogfight) or difficulty (evade)\n";
     std::cout << "  (Flight keys can be rebound in Settings > Controls.)\n";
     std::cout << "  --dogfight [merge|offensive|defensive|range] --skill [novice|veteran|ace] --bandit TYPE\n";
+    std::cout << "  --loadout [guns|ir|full]: dogfight weapons (Q selects GUN / heat seeker / radar missile)\n";
     std::cout << "  --evade [easy|medium|hard|expert]: survive a bandit with radar missiles in your six\n";
     std::cout << "  --canyon:               Start airborne at the canyon mouth (east of the field), lined up to fly it\n";
     std::cout << "  --hover:                F-35B converted, hovering 50 ft over the runway at vertical-landing weight\n";
@@ -149,6 +151,7 @@ int main(int argc, char* argv[]) {
     std::string settings_arg;        // --settings PATH
     bool start_dogfight = false;     // --dogfight: straight into a 1v1
     sim::EngagementSetup dogfight_setup{};
+    sim::WeaponSel start_weapon = sim::WeaponSel::GUN; // --weapon: store selected when a fight starts
     bool bandit_type_set = false;
     ui::ScreenId boot_screen = ui::ScreenId::MAIN;
     std::optional<ui::SettingsSection> boot_tab;
@@ -217,6 +220,16 @@ int main(int argc, char* argv[]) {
             }
         }
         if (arg == "--watch") dogfight_setup.own_is_ai = true; // AI flies your jet too (demo)
+        if (arg == "--loadout" && i + 1 < argc) {
+            const std::string l = argv[++i];
+            dogfight_setup.loadout = l == "full" ? sim::WeaponsLoadout::FULL_LOADOUT
+                                   : l == "ir"   ? sim::WeaponsLoadout::GUNS_AND_IR
+                                                 : sim::WeaponsLoadout::GUNS_ONLY;
+        }
+        if (arg == "--weapon" && i + 1 < argc) { // Tooling: start the fight with this store selected
+            const std::string k = argv[++i];
+            start_weapon = k == "srm" ? sim::WeaponSel::SRM : k == "mrm" ? sim::WeaponSel::MRM : sim::WeaponSel::GUN;
+        }
         if (arg == "--skill" && i + 1 < argc) {
             const std::string k = argv[++i];
             dogfight_setup.skill = k == "novice" ? sim::AiSkill::NOVICE
@@ -463,7 +476,19 @@ int main(int argc, char* argv[]) {
     auto free_world = std::make_unique<sim::World>();
     auto dogfight = std::make_unique<sim::Engagement>();
     bool dogfight_active = false;
-    int player_selected_weapon = 0; // 0: Gun, 1: AIM-9X, 2: AIM-120C
+    // Weapons: the selected store lives in the world (World::stores[0]). The
+    // launch zone flies the missile out a few dozen times (~10 ms for a
+    // radar missile), so the solver does a few flyouts per frame and starts
+    // again a few times a second; the HUD shows the last complete zone.
+    constexpr double DLZ_REFRESH_S = 0.25;
+    constexpr int DLZ_FLYOUTS_PER_FRAME = 4;
+    sim::LaunchZoneSolver dlz_solver;
+    sim::DynamicLaunchZone own_dlz{};
+    double dlz_timer = 0.0;
+    int dlz_selected = -1;              // Store the launch zone was computed for
+    int pickle_presses_seen = 0;        // World::pickle_presses[0] already reported
+    double weapon_cue_timer = 0.0;      // "NO LOCK" / "NO MSL" flash time left
+    const char* weapon_cue = "";
     bool gear_down = true;
     free_world->clear();
     free_world->add(selected_aircraft, reset_flight_state());
@@ -507,6 +532,7 @@ int main(int argc, char* argv[]) {
         if (!bandit_type_set) dogfight_setup.bandit_type = selected_aircraft;
         dogfight_setup.seed = static_cast<uint32_t>(SDL_GetTicks()) | 1u;
         dogfight->setup(dogfight_setup);
+        dogfight->world.stores[0].select(start_weapon);
         dogfight_active = true;
         own = &dogfight->world.aircraft[0];
         stovl_selected = false;
@@ -514,6 +540,9 @@ int main(int argc, char* argv[]) {
         throttle = 0.9;
         hit_cue_timer = 0.0;
         dogfight_events_read = 0;
+        pickle_presses_seen = 0;
+        weapon_cue_timer = 0.0;
+        dlz_selected = -1;
         renderer.camera_rig().reset();
         // Dogfight switch: a visual fight starts with the radar in ACM, which
         // finds and locks the bandit by itself; RWS search cannot hold a jet
@@ -890,9 +919,16 @@ int main(int argc, char* argv[]) {
                               << (renderer.camera_rig().mode() == fastjet::graphics::CameraMode::PADLOCK ? "ENABLED" : "DISABLED") << "\n";
                 }
                 if (bound(ui::InputAction::WEAPON_SELECT, ev.key.scancode) && !ev.key.repeat) {
-                    player_selected_weapon = (player_selected_weapon + 1) % 3;
-                    const char* w_names[] = {"M61A1 Vulcan Cannon", "AIM-9X Sidewinder (IR)", "AIM-120C AMRAAM (Radar BVR)"};
-                    std::cout << "[WEAPON] Selected: " << w_names[player_selected_weapon] << "\n";
+                    // GUN -> SRM -> MRM, skipping stores this jet doesn't carry or has emptied.
+                    sim::WeaponStores& stores = active_world().stores[0];
+                    stores.cycle();
+                    if (const sim::MissileStore* ms = stores.selected_store()) {
+                        std::cout << "[WEAPON] Selected: " << ms->spec.name << " x" << ms->count
+                                  << (ms->spec.infrared() ? " (heat seeker: lock it on the nose, or slave it to a radar lock)"
+                                                          : " (radar missile: needs a radar lock)") << "\n";
+                    } else {
+                        std::cout << "[WEAPON] Selected: " << own->gun.spec.name << " gun\n";
+                    }
                 }
                 if (bound(ui::InputAction::RESET_FLIGHT, ev.key.scancode) && !ev.key.repeat && dogfight_active) {
                     // In a dogfight, reset means a fresh fight from the same set-up.
@@ -1409,10 +1445,33 @@ int main(int argc, char* argv[]) {
                 if (e.kind == sim::CombatEvent::Kind::EJECTION && e.victim != sim::Engagement::OWN) {
                     std::cout << "[DOGFIGHT] Bandit ejected - good chute.\n";
                 }
+                // Launch and warhead cues. (These used to sit in a second
+                // event loop that never ran: this one had already read them.)
+                const char* launched = nullptr;
+                if (e.kind == sim::CombatEvent::Kind::MISSILE_LAUNCH) {
+                    audio_engine.cue_missile_launch();
+                    // The event names no missile: the youngest of the shooter's at the victim is it.
+                    double youngest = 1e9;
+                    for (const sim::Missile& m : w.missiles) {
+                        if (m.active && m.shooter == e.shooter && m.target == e.victim && m.body.tof < youngest) {
+                            youngest = m.body.tof;
+                            launched = m.spec.name;
+                        }
+                    }
+                    if (e.shooter == sim::Engagement::OWN) {
+                        std::cout << "[WEAPON] " << (launched ? launched : "Missile") << " away.\n";
+                    }
+                } else if (e.kind == sim::CombatEvent::Kind::MISSILE_DETONATION) {
+                    audio_engine.cue_explosion(e.miss_m);
+                    if (e.victim >= 0 && e.victim < w.count) {
+                        renderer.trigger_explosion(w.aircraft[static_cast<size_t>(e.victim)].position());
+                    }
+                }
                 if (e.victim != sim::Engagement::OWN) continue;
                 switch (e.kind) {
                     case sim::CombatEvent::Kind::MISSILE_LAUNCH:
-                        std::cout << "[EVADE] Missile launch! Bandit fired an AIM-120.\n";
+                        std::cout << "[" << (dogfight->evade_mode() ? "EVADE" : "DOGFIGHT") << "] Missile launch! Bandit fired "
+                                  << (launched ? launched : "a missile") << ".\n";
                         break;
                     case sim::CombatEvent::Kind::MISSILE_DEFEATED:
                         std::cout << "[EVADE] Missile defeated.\n";
@@ -1467,51 +1526,64 @@ int main(int argc, char* argv[]) {
             c.engine_fire = dmg.engine_fire;
             c.fuel_leak = dmg.fuel_leak_kgs > 0.0;
             c.control_damage = dmg.wing_left < 1.0 || dmg.wing_right < 1.0 || dmg.tail < 1.0;
-            c.selected_weapon = player_selected_weapon;
-            if (player_selected_weapon == 0) {
-                std::snprintf(c.weapon_name, sizeof(c.weapon_name), "%s", "GUN");
-                c.ir_seeker_active = false;
-            } else if (player_selected_weapon == 1) {
-                std::snprintf(c.weapon_name, sizeof(c.weapon_name), "%s", "AIM-9X");
-                c.ir_seeker_active = true;
-            } else {
-                std::snprintf(c.weapon_name, sizeof(c.weapon_name), "%s", "AIM-120C");
-                c.ir_seeker_active = false;
-            }
-            c.missiles_remaining = w.missile_load[sim::Engagement::OWN];
-            c.flares = w.flare_load[sim::Engagement::OWN];
+            // Weapons: the selected store, its seeker or radar lock, and its launch zone.
+            {
+                constexpr int OWN = sim::Engagement::OWN;
+                const sim::WeaponStores& stores = w.stores[OWN];
+                const sim::MissileStore* store = stores.selected_store();
+                const sim::IrSeeker& seeker = w.seekers[OWN];
+                const sim::FireControlRadar& fcr = w.radars[OWN];
+                c.selected_weapon = static_cast<int>(stores.selected);
+                std::snprintf(c.weapon_name, sizeof(c.weapon_name), "%s", store ? store->spec.short_name : "GUN");
+                c.missiles_remaining = store ? store->count : 0;
+                c.flares = w.flare_load[OWN];
+                c.ir_seeker_active = seeker.active;
+                c.ir_seeker_locked = seeker.locked;
+                const math::Vector3 sd = own->state.q_att.rotate_ned_to_body(seeker.dir_ned);
+                c.ir_seeker_dir_b[0] = sd.x; c.ir_seeker_dir_b[1] = sd.y; c.ir_seeker_dir_b[2] = sd.z;
+                const bool radar_lock = fcr.locked() && fcr.target == sim::Engagement::BANDIT;
+                c.missile_locked = store && store->count > 0 && (store->spec.infrared() ? seeker.locked : radar_lock);
 
-            if (w.count > 1 && bandit.alive()) {
-                const math::Vector3 rel = bandit.position() - own->position();
-                const double target_range = rel.norm();
-                c.target_range_m = target_range;
-                const auto spec = (player_selected_weapon == 2) ? sim::missile_specs::aim120c() : sim::missile_specs::aim9x();
-                const auto dlz = sim::DynamicLaunchZone::compute(own->state, bandit.state, spec);
-                c.dlz_rmax_m = dlz.rmax_m;
-                c.dlz_rne_m = dlz.rne_m;
-                c.dlz_rmin_m = dlz.rmin_m;
-                c.shoot_cue = dlz.in_envelope(target_range);
-
-                if (player_selected_weapon == 1) {
-                    const math::Vector3 los_b = own->state.q_att.rotate_ned_to_body(rel.normalized());
-                    const double off_bore = std::acos(std::clamp(los_b.x, -1.0, 1.0));
-                    c.ir_seeker_locked = (off_bore < 40.0 * M_PI / 180.0) && (target_range < dlz.rmax_m);
-                    c.ir_seeker_dir_b[0] = los_b.x;
-                    c.ir_seeker_dir_b[1] = los_b.y;
-                    c.ir_seeker_dir_b[2] = los_b.z;
+                // Launch zone of the selected store against the bandit, a few times a second.
+                dlz_timer -= frame_dt;
+                if (store == nullptr || !bandit.alive() || w.count < 2) {
+                    own_dlz = {};
+                    dlz_selected = -1;
+                } else {
+                    if (dlz_selected != c.selected_weapon) {
+                        own_dlz = {}; // Another store's zone means nothing for this one
+                        dlz_solver.begin(own->state, bandit.state, store->spec);
+                        dlz_timer = DLZ_REFRESH_S;
+                        dlz_selected = c.selected_weapon;
+                    } else if (dlz_solver.done() && dlz_timer <= 0.0) {
+                        dlz_solver.begin(own->state, bandit.state, store->spec);
+                        dlz_timer = DLZ_REFRESH_S;
+                    }
+                    if (!dlz_solver.done() && dlz_solver.advance(DLZ_FLYOUTS_PER_FRAME)) own_dlz = dlz_solver.zone();
                 }
-            }
+                c.dlz_rmax_m = own_dlz.rmax_m;
+                c.dlz_rne_m = own_dlz.rne_m;
+                c.dlz_rmin_m = own_dlz.rmin_m;
+                c.shoot_cue = c.missile_locked && own_dlz.in_envelope(geo.range);
+                c.blink = (SDL_GetTicks() / 160) % 2 == 0;
 
-            for (; dogfight_events_read < w.event_count(); ++dogfight_events_read) {
-                const auto& ev = w.event(dogfight_events_read);
-                if (ev.kind == sim::CombatEvent::Kind::MISSILE_LAUNCH) {
-                    audio_engine.cue_missile_launch();
-                } else if (ev.kind == sim::CombatEvent::Kind::MISSILE_DETONATION) {
-                    audio_engine.cue_explosion(ev.miss_m);
-                    if (ev.victim >= 0 && ev.victim < w.count) {
-                        renderer.trigger_explosion(w.aircraft[ev.victim].position());
+                // A pickle press that found no lock (or no missile) flashes on the HUD.
+                if (w.pickle_presses[OWN] != pickle_presses_seen) {
+                    pickle_presses_seen = w.pickle_presses[OWN];
+                    const auto cue = w.launch_cue[OWN];
+                    if (cue == sim::World::LaunchCue::NO_LOCK || cue == sim::World::LaunchCue::EMPTY) {
+                        weapon_cue = cue == sim::World::LaunchCue::NO_LOCK ? "NO LOCK" : "NO MSL";
+                        weapon_cue_timer = 1.5;
+                        std::cout << "[WEAPON] " << weapon_cue
+                                  << (cue == sim::World::LaunchCue::EMPTY ? ""
+                                      : store && store->spec.infrared() ? ": the seeker has no tone"
+                                                                        : ": the radar holds no track (STT)")
+                                  << "\n";
                     }
                 }
+                weapon_cue_timer = (std::max)(0.0, weapon_cue_timer - frame_dt);
+                std::snprintf(c.weapon_cue, sizeof(c.weapon_cue), "%s", weapon_cue_timer > 0.0 ? weapon_cue : "");
+                c.weapon_cue_s = weapon_cue_timer;
             }
 
             const auto bandit_name = aircraft::to_short_string(dogfight_setup.bandit_type);

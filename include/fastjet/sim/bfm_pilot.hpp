@@ -50,6 +50,38 @@ struct PilotSkill {
     }
 };
 
+/**
+ * @brief A missile the pilot knows is coming at him. Engagement::detect_missile_threat()
+ * is the one place that decides what an AI pilot knows about missiles: his
+ * RWR, what he can see, and his own jet's missile approach warner (MAWS).
+ *
+ * What it is decides the countermeasure: chaff against a radar missile
+ * (heard on the RWR), flares against a heat seeker (seen by the MAWS, silent
+ * on the RWR), both when the MAWS and the RWR both have it or when it was
+ * only seen and its type is unknown.
+ */
+struct MissileThreat {
+    bool inbound{false};
+    bool radar_guided{false}; ///< Heard on the RWR: a radar missile.
+    bool maws{false};         ///< The MAWS has it (or a passive set had it until its motor burnt out)
+    bool held{false};         ///< ...had it: a passive set lost it at burnout, and its last time to go is counting down
+    bool heat_seeker{false};  ///< The MAWS has it and the RWR is silent: treated as a heat seeker
+    bool launch{false};       ///< The MAWS declared a new missile this step
+    math::Vector3 pos{};      ///< Where the missile is [m, NED] (MAWS only: on its line of sight, at an estimated range)
+    double range_m{0.0};
+    double closure_mps{0.0};
+    double tgo_s{-1.0};       ///< The MAWS's time to go (allows for a boosting missile); negative if none
+
+    [[nodiscard]] double time_to_go() const noexcept {
+        if (tgo_s >= 0.0) return tgo_s;
+        return closure_mps > 50.0 ? range_m / closure_mps : 1e9;
+    }
+    /// @brief Chaff decoys a radar missile, or one whose type is unknown.
+    [[nodiscard]] bool wants_chaff() const noexcept { return inbound && !heat_seeker; }
+    /// @brief Flares decoy a heat seeker, or one whose type is unknown or that the MAWS sees too.
+    [[nodiscard]] bool wants_flares() const noexcept { return inbound && (!radar_guided || maws); }
+};
+
 /// @brief What an AI pilot knows about a bandit (a delayed track, not the truth).
 struct TrackSample {
     math::Vector3 pos{};
@@ -78,7 +110,10 @@ struct TrackSample {
 class BfmPilot {
 public:
     enum class Situation : uint8_t { NEUTRAL, OFFENSIVE, DEFENSIVE };
-    enum class Maneuver : uint8_t { PURE_PURSUIT, LEAD_PURSUIT, LAG_PURSUIT, BREAK, JINK, EXTEND, HARD_DECK, MERGE };
+    enum class Maneuver : uint8_t {
+        PURE_PURSUIT, LEAD_PURSUIT, LAG_PURSUIT, BREAK, JINK, EXTEND, HARD_DECK, MERGE,
+        DEFEND_MISSILE, ///< Turning cold on, or beaming, a missile he knows is inbound
+    };
 
     PilotSkill skill{PilotSkill::of(AiSkill::VETERAN)};
     double hard_deck_agl_m{1000.0};
@@ -116,6 +151,11 @@ public:
         solution_ = {};
         solution_timer_ = 0.0;
         g_easing_ = false;
+        threat_cm_timer_ = 0.0;
+        salvo_left_ = 0;
+        salvo_armed_ = true;
+        flare_out_ = false;
+        beam_side_ = 0.0;
         roll_stick_ = 0.0;
         rudder_int_ = 0.0;
         g_cmd = 1.0;
@@ -125,8 +165,10 @@ public:
         maneuver = Maneuver::PURE_PURSUIT;
     }
 
-    /// @brief Fly one step against @p bandit. Call every physics step.
-    [[nodiscard]] AircraftControls update(double dt, const Aircraft& self, const Aircraft& bandit) noexcept {
+    /// @brief Fly one step against @p bandit, defending against @p threat if
+    /// one is inbound. Call every physics step.
+    [[nodiscard]] AircraftControls update(double dt, const Aircraft& self, const Aircraft& bandit,
+                                          const MissileThreat& threat = {}) noexcept {
         time_ += dt;
         record_track(bandit);
         AircraftControls out{};
@@ -231,6 +273,55 @@ public:
             }
         }
 
+        // Missile defence: a missile he knows about comes before the bandit.
+        //
+        // His MAWS calls the launch, and gives its line of sight and time to
+        // go: a trained pilot with time in hand turns cold while the time to
+        // go is long (missile at 6 o'clock: make it chase), then beams it
+        // (missile at 3 or 9), where its closure is least and its line of
+        // sight turns fastest. With only a few seconds left, or untrained, he
+        // turns hard into it. A second or two before impact, a maximum-G break
+        // perpendicular to its line of sight, so all of the pull turns the
+        // line of sight: the missile has to follow with the G it has left.
+        //
+        // Without the MAWS (a missile heard on the RWR, or one he has seen) he
+        // fights on and breaks hard into it a second or two before impact,
+        // across its line of sight.
+        const double tgo = threat.inbound ? threat.time_to_go() : 1e9;
+        const bool endgame = threat.inbound && tgo < MISSILE_BREAK_TGO_S + skill.reaction_s;
+        if (threat.inbound && !threat.maws) {
+            if (endgame) {
+                maneuver = Maneuver::BREAK;
+                const math::Vector3 v_dir = self.state.velocity_ned().normalized();
+                const math::Vector3 to_m = threat.pos - self.state.pos_ned;
+                math::Vector3 across = to_m - v_dir * to_m.dot(v_dir);
+                if (across.norm() < 1.0) across = self.state.q_att.rotate_body_to_ned(math::Vector3(0.0, 0.0, -1.0));
+                aim = self.state.pos_ned + v_dir * 300.0 + across.normalized() * 1000.0;
+                g_ceiling = g_max;
+            }
+            beam_side_ = 0.0;
+        } else if (threat.inbound) {
+            const math::Vector3 v_dir = self.state.velocity_ned().normalized();
+            const math::Vector3 to_m = threat.pos - self.state.pos_ned;
+            const math::Vector3 los = to_m.norm() > 1.0 ? to_m.normalized() : -v_dir;
+            g_ceiling = g_max;
+            if (endgame) {
+                maneuver = Maneuver::BREAK;
+                aim = self.state.pos_ned + v_dir * 300.0 + break_across(self, v_dir, los) * 1000.0;
+            } else if (skill.uses_energy && tgo > MISSILE_BEAM_TGO_S) {
+                maneuver = Maneuver::DEFEND_MISSILE;
+                aim = self.state.pos_ned + defensive_heading(v_dir, los, tgo) * 1000.0;
+            } else {
+                // Defensive turn: lift vector on the missile.
+                maneuver = Maneuver::DEFEND_MISSILE;
+                math::Vector3 into = los - v_dir * los.dot(v_dir);
+                if (into.norm() < 0.05) into = self.state.q_att.rotate_body_to_ned(math::Vector3(0.0, 0.0, -1.0));
+                aim = self.state.pos_ned + v_dir * 600.0 + into.normalized() * 1000.0;
+            }
+        } else {
+            beam_side_ = 0.0;
+        }
+
         // Overshoot and collision avoidance: nobody presses inside the minimum
         // range or flies toward a collision. The closest point of approach is
         // predicted from the relative motion; if it is too close and coming
@@ -302,10 +393,19 @@ public:
             throttle = std::clamp(1.0 - (V - v_target) / 50.0, 0.05, 1.0);
             speedbrake = speedbrake || V > 1.35 * v_target;
         }
+        // Defending a missile his MAWS has, energy is life: full power, no speedbrake.
+        if (threat.inbound && threat.maws) {
+            throttle = 1.0;
+            speedbrake = false;
+        }
         // Everyone, novice or not, comes off the power rather than ram the bandit.
         if (V > 0.9 * corner || geo.range < 600.0) throttle = std::min(throttle, closure_throttle);
         if (V > v_cap - 0.02 * a_sound) throttle = std::min(throttle, 0.8); // out of reheat
         if (V > v_cap + 0.08 * a_sound) speedbrake = true;
+        // A missile that may be a heat seeker (the MAWS has it and the RWR is
+        // silent, or it was only seen): a trained pilot comes out of reheat,
+        // the brightest thing in its seeker's view.
+        if (threat.inbound && !threat.radar_guided && skill.uses_energy) throttle = std::min(throttle, 0.8);
 
         // Hard deck: blend the aim point up and away from the ground, starting
         // with enough height left to pull out of the current dive. A pull-out
@@ -357,7 +457,9 @@ public:
         out.trigger = trigger;
 
         // ---- Countermeasure employment ----
-        if (situation == Situation::DEFENSIVE) {
+        // Guns-defensive: pre-emptive flares and chaff against a shot he can't
+        // see coming (not while his MAWS has a missile: then it decides).
+        if (situation == Situation::DEFENSIVE && !threat.maws) {
             flare_timer_ -= dt;
             if (flare_timer_ <= 0.0) {
                 out.dispense_flare = true;
@@ -365,15 +467,32 @@ public:
                 flare_timer_ = (skill.uses_energy ? 1.0 : 2.2) + 0.4 * rng_.uniform();
             }
         }
-
-        // ---- Missile employment ----
-        missile_cooldown_ = std::max(0.0, missile_cooldown_ - dt);
-        if (situation == Situation::OFFENSIVE && missile_cooldown_ <= 0.0 && skill.uses_energy) {
-            if (geo.range > 800.0 && geo.range < 12000.0 && geo.ata < 20.0 * DEG) {
-                out.pickle = true;
-                missile_cooldown_ = 4.0;
-            }
+        // A missile inbound, all the way in: chaff against a radar missile,
+        // flares against a heat seeker, both when its type is unknown or the
+        // MAWS and the RWR both have it. A MAWS launch call starts a program
+        // at once.
+        threat_cm_timer_ = std::max(0.0, threat_cm_timer_ - dt);
+        if (threat.inbound && (threat.launch || threat_cm_timer_ <= 0.0)) {
+            out.dispense = threat.wants_chaff();
+            out.dispense_flare = out.dispense_flare || threat.wants_flares();
+            threat_cm_timer_ = skill.uses_energy ? 0.6 : 1.2;
         }
+        // The MAWS-timed endgame break goes with a flare salvo: several
+        // programs back to back, so fresh flares burn in the seeker's view all
+        // through the last second or two. Re-armed once no threat is close.
+        if (endgame && salvo_armed_ && threat.maws && threat.wants_flares()) {
+            salvo_left_ = FLARE_SALVO_PROGRAMS;
+            salvo_armed_ = false;
+        } else if (!threat.inbound || tgo > MISSILE_BREAK_TGO_S + skill.reaction_s + 1.0) {
+            salvo_armed_ = true;
+        }
+        if (salvo_left_ > 0) {
+            // Each program is one press of the switch: release it every other step.
+            out.dispense_flare = !flare_out_;
+            if (out.dispense_flare) --salvo_left_;
+        }
+        flare_out_ = out.dispense_flare;
+        // Missile shots are not the BFM pilot's: see MissileShooter and HeatSeekerShooter.
         return out;
     }
 
@@ -398,6 +517,10 @@ private:
     static constexpr double CPA_HORIZON_S = 4.0;  ///< Look-ahead for collision avoidance
     static constexpr double CPA_MIN_MISS_M = 200.0;
     static constexpr double MAX_SHOT_ASPECT = 120.0 * M_PI / 180.0; ///< No forward-quarter snapshots
+    static constexpr double MISSILE_BREAK_TGO_S = 1.8; ///< Endgame break this long before impact (plus reaction)
+    static constexpr double MISSILE_COLD_TGO_S = 10.0; ///< Turn cold on a missile further out than this; beam it nearer
+    static constexpr double MISSILE_BEAM_TGO_S = 4.0;  ///< ...down to this; then a defensive turn into it
+    static constexpr int FLARE_SALVO_PROGRAMS = 3;     ///< Flare programs fired with the MAWS-timed endgame break
     static constexpr double G_OFFSET_RATE = 12.0; ///< [G/s]
     static constexpr double MAX_CHASE_Q_PA = 75000.0; ///< ~350 m/s at sea level, ~450 m/s at 5 km
     static constexpr double MANOEUVRE_RANGE_M = 6000.0;
@@ -429,7 +552,11 @@ private:
     math::Vector3 los_rate_{};
     bool has_prev_aim_{false};
     double flare_timer_{0.0};
-    double missile_cooldown_{0.0};
+    double threat_cm_timer_{0.0};
+    int salvo_left_{0};        ///< Flare programs still to fire in the endgame salvo
+    bool salvo_armed_{true};
+    bool flare_out_{false};    ///< Flare switch as output last step
+    double beam_side_{0.0};    ///< Beam chosen against the missile: +1 right of its line of sight, -1 left, 0 none
     DamageRng rng_{};
 
     double gaussian() noexcept {
@@ -489,6 +616,49 @@ private:
         if (i_point && geo.aspect < 110.0 * DEG) return Situation::OFFENSIVE;
         if (i_point && geo.range < 1500.0 && !he_points) return Situation::OFFENSIVE;
         return Situation::NEUTRAL;
+    }
+
+    /**
+     * @brief Where to steer, level, against a missile on line of sight
+     * @p los while its time to go @p tgo is still long: straight away from
+     * it (cold) beyond MISSILE_COLD_TGO_S, otherwise onto the beam. The beam
+     * nearer the current heading is chosen once and then held: with the
+     * missile dead ahead or astern the two are equally far, and a pilot who
+     * kept re-choosing would never turn.
+     */
+    [[nodiscard]] math::Vector3 defensive_heading(const math::Vector3& v_dir, const math::Vector3& los,
+                                                  double tgo) noexcept {
+        math::Vector3 h{los.x, los.y, 0.0};
+        if (h.norm() < 1e-3) h = math::Vector3(v_dir.x, v_dir.y, 0.0); // straight above or below
+        if (h.norm() < 1e-3) h = math::Vector3(1.0, 0.0, 0.0);
+        h = h.normalized();
+        if (tgo > MISSILE_COLD_TGO_S) return -h;
+        const math::Vector3 right{-h.y, h.x, 0.0}; // NED: right of the line of sight, level
+        const double d = v_dir.x * right.x + v_dir.y * right.y;
+        constexpr double SWITCH = 0.5; // flips only once well established toward the other beam
+        if (beam_side_ == 0.0) beam_side_ = d >= 0.0 ? 1.0 : -1.0;
+        else if (beam_side_ * d < -SWITCH) beam_side_ = -beam_side_;
+        return right * beam_side_;
+    }
+
+    /**
+     * @brief Direction of the endgame break: perpendicular to both the flight
+     * path and the missile's line of sight @p los, so that all of the pull
+     * turns the line of sight and the missile must match it. Of the two
+     * senses, the one nearer the lift vector (the least roll), but never
+     * downhill near the hard deck. With the missile dead ahead or astern any
+     * pull crosses its line of sight: the lift vector as it is.
+     */
+    [[nodiscard]] math::Vector3 break_across(const Aircraft& self, const math::Vector3& v_dir,
+                                             const math::Vector3& los) const noexcept {
+        const math::Vector3 lift = self.state.q_att.rotate_body_to_ned(math::Vector3(0.0, 0.0, -1.0));
+        math::Vector3 n = v_dir.cross(los);
+        if (n.norm() < 0.05) return lift;
+        n = n.normalized();
+        double sense = n.dot(lift) >= 0.0 ? 1.0 : -1.0;
+        const bool low = environment::GroundCollision::get_agl(self.state) < hard_deck_agl_m + 1500.0;
+        if (low && n.z * sense > 0.3) sense = -sense; // NED: +z is down
+        return n * sense;
     }
 
     /**

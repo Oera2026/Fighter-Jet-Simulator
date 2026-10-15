@@ -14,24 +14,93 @@ struct AirframeMissileLoadout {
     int srm_count{0};
 };
 
+/// @brief A typical air-to-air load for each jet (open-source configurations).
 [[nodiscard]] inline AirframeMissileLoadout airframe_missile_loadout(aircraft::AircraftType type) noexcept {
     using T = aircraft::AircraftType;
     switch (type) {
-        case T::F16_FIGHTING_FALCON:
-            return {missile_specs::aim120c(), 2, missile_specs::aim9x(), 2};
-        case T::F15EX_EAGLE_II:
+        case T::F16_FIGHTING_FALCON: // Wingtips and stations 3/7: AMRAAM; 2/8: Sidewinder
             return {missile_specs::aim120c(), 4, missile_specs::aim9x(), 2};
-        case T::EUROFIGHTER_TYPHOON:
-            return {missile_specs::aim120c(), 4, missile_specs::asraam(), 2};
-        case T::F22_RAPTOR:
-            return {missile_specs::aim120c(), 6, missile_specs::aim9x(), 2};
-        case T::A10_THUNDERBOLT:
+        case T::F15EX_EAGLE_II:      // The Eagle's classic four and four
+            return {missile_specs::aim120d(), 4, missile_specs::aim9x(), 4};
+        case T::EUROFIGHTER_TYPHOON: // Four Meteor under the fuselage, IRIS-T outboard
+            return {missile_specs::meteor(), 4, missile_specs::iris_t(), 2};
+        case T::F22_RAPTOR:          // Main bay six, side bays two
+            return {missile_specs::aim120d(), 6, missile_specs::aim9x(), 2};
+        case T::A10_THUNDERBOLT:     // A self-defence pair on an LAU-105, no radar
             return {MissileSpec{}, 0, missile_specs::aim9m(), 2};
-        case T::F35B_LIGHTNING_II:
-            return {missile_specs::aim120c(), 4, missile_specs::aim9x(), 2};
+        case T::F35B_LIGHTNING_II:   // Four in the bays, two Sidewinders outboard
+            return {missile_specs::aim120d(), 4, missile_specs::aim9x(), 2};
     }
     return {};
 }
+
+/// @brief What the pilot has selected to shoot with.
+enum class WeaponSel : uint8_t {
+    GUN, ///< The gun (the trigger fires it whatever is selected)
+    SRM, ///< Short-range missiles: heat seekers
+    MRM, ///< Medium-range missiles: active radar
+};
+
+[[nodiscard]] constexpr const char* to_string(WeaponSel w) noexcept {
+    switch (w) {
+        case WeaponSel::GUN: return "GUN";
+        case WeaponSel::SRM: return "SRM";
+        case WeaponSel::MRM: return "MRM";
+    }
+    return "?";
+}
+
+/// @brief One kind of missile on the rails.
+struct MissileStore {
+    MissileSpec spec{};
+    int count{0};
+};
+
+/**
+ * @brief A jet's missile stores: a short-range and a medium-range store (either
+ * may be empty) and the selected weapon, which the pickle button fires.
+ */
+struct WeaponStores {
+    MissileStore srm{};
+    MissileStore mrm{};
+    WeaponSel selected{WeaponSel::GUN};
+
+    void clear() noexcept { *this = WeaponStores{}; }
+
+    /// @brief Load what @p l carries: the heat seekers always, the radar
+    /// missiles only if @p with_mrm. The gun is selected.
+    void load(const AirframeMissileLoadout& l, bool with_mrm) noexcept {
+        clear();
+        srm = {l.srm_spec, l.srm_count};
+        if (with_mrm) mrm = {l.mrm_spec, l.mrm_count};
+    }
+
+    [[nodiscard]] MissileStore* store(WeaponSel w) noexcept {
+        return w == WeaponSel::SRM ? &srm : w == WeaponSel::MRM ? &mrm : nullptr;
+    }
+    [[nodiscard]] const MissileStore* store(WeaponSel w) const noexcept {
+        return w == WeaponSel::SRM ? &srm : w == WeaponSel::MRM ? &mrm : nullptr;
+    }
+    /// @brief The selected missile store, or nullptr with the gun selected.
+    [[nodiscard]] const MissileStore* selected_store() const noexcept { return store(selected); }
+    [[nodiscard]] int missiles() const noexcept { return srm.count + mrm.count; }
+
+    /// @brief Select @p w if it is the gun or a store with rounds left.
+    bool select(WeaponSel w) noexcept {
+        const MissileStore* s = store(w);
+        if (s != nullptr && s->count <= 0) return false;
+        selected = w;
+        return true;
+    }
+
+    /// @brief Weapon select: GUN -> SRM -> MRM -> GUN, skipping empty or unfitted stores.
+    WeaponSel cycle() noexcept {
+        for (int k = 1; k <= 3; ++k) {
+            if (select(static_cast<WeaponSel>((static_cast<int>(selected) + k) % 3))) break;
+        }
+        return selected;
+    }
+};
 
 /// @brief Internal gun installation.
 ///

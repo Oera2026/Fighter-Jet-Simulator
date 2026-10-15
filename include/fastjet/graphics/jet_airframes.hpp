@@ -846,6 +846,9 @@ static_assert(kF35bJointCount <= JointPose::kMax);
 
 /// @brief A door lying on the skin, @p proud off it, from x0 to x1 and y0 to
 /// y1: its outside in @p outer, the inside face (@p thick in) in @p inner.
+/// Every face is wound so its normal points out of the door (away from the
+/// fuselage on the outside, into it on the inside), on a dorsal door
+/// (@p top) as on a ventral one, so it is lit as the side it is on.
 template <class SurfaceZ>
 inline void door_panel(Mesh& outer, Mesh& inner, float x0, float x1, float y0, float y1, float proud, float thick,
                        SurfaceZ&& surface_z, bool top) {
@@ -856,19 +859,24 @@ inline void door_panel(Mesh& outer, Mesh& inner, float x0, float x1, float y0, f
         const float y = y0 + (y1 - y0) * static_cast<float>(j) / N;
         return V3{x, y, surface_z(x, y) + out * off};
     };
+    // Wound for a ventral door (+z out); a dorsal door's faces turn the other way.
+    auto face = [top](Mesh& m, V3 a, V3 b, V3 c, V3 d) {
+        if (top) m.quad(a, d, c, b);
+        else m.quad(a, b, c, d);
+    };
     for (int i = 0; i < N; ++i) {
         for (int j = 0; j < N; ++j) {
-            outer.quad(at(i, j, proud), at(i + 1, j, proud), at(i + 1, j + 1, proud), at(i, j + 1, proud));
-            inner.quad(at(i, j, proud - thick), at(i, j + 1, proud - thick), at(i + 1, j + 1, proud - thick),
-                       at(i + 1, j, proud - thick));
+            face(outer, at(i, j, proud), at(i + 1, j, proud), at(i + 1, j + 1, proud), at(i, j + 1, proud));
+            face(inner, at(i, j, proud - thick), at(i, j + 1, proud - thick), at(i + 1, j + 1, proud - thick),
+                 at(i + 1, j, proud - thick));
         }
     }
     // Edges: the door's thickness all round.
     for (int k = 0; k < N; ++k) {
-        outer.quad(at(k, 0, proud), at(k + 1, 0, proud), at(k + 1, 0, proud - thick), at(k, 0, proud - thick));
-        outer.quad(at(k, N, proud), at(k, N, proud - thick), at(k + 1, N, proud - thick), at(k + 1, N, proud));
-        outer.quad(at(0, k, proud), at(0, k, proud - thick), at(0, k + 1, proud - thick), at(0, k + 1, proud));
-        outer.quad(at(N, k, proud), at(N, k + 1, proud), at(N, k + 1, proud - thick), at(N, k, proud - thick));
+        face(outer, at(k, 0, proud), at(k + 1, 0, proud), at(k + 1, 0, proud - thick), at(k, 0, proud - thick));
+        face(outer, at(k, N, proud), at(k, N, proud - thick), at(k + 1, N, proud - thick), at(k + 1, N, proud));
+        face(outer, at(0, k, proud), at(0, k, proud - thick), at(0, k + 1, proud - thick), at(0, k + 1, proud));
+        face(outer, at(N, k, proud), at(N, k + 1, proud), at(N, k + 1, proud - thick), at(N, k, proud - thick));
     }
 }
 
@@ -1139,7 +1147,9 @@ struct F35bRig {
         return moving.back();
     };
     moving.reserve(48); // references from add() stay valid: never more parts than this
-    const ProceduralPart inside = paint(0.36f, 0.37f, 0.38f, 0.55f); // light grey door inner faces
+    // Door inner faces: light grey (docs/f35b-reference.md section 8), pale
+    // enough to read as light grey in the shade as well as in the sun.
+    const ProceduralPart inside = paint(0.52f, 0.53f, 0.55f, 0.55f);
     auto door = [&](int joint, float x0, float x1, float y0, float y1, auto&& surface_z, bool on_top) {
         ProceduralPart& o = add(finish, joint);
         ProceduralPart& i = add(inside, joint);
