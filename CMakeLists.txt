@@ -91,6 +91,7 @@ if(FASTJET_BUILD_TESTS)
         test_flcs_level_flight
         test_flcs_pullup
         test_flcs_review
+        test_flcs_handling
         test_signal_conditioning
         test_force_curves
         test_avionics_controls

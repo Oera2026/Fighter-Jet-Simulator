@@ -6,7 +6,7 @@ SRC_TEST_DIR = tests
 
 TESTS = test_atmosphere test_ballistic test_gyroscopic test_performance \
         test_interpolator test_aero_coefficients test_pitch_divergence \
-        test_actuators test_flcs_level_flight test_flcs_pullup test_flcs_review \
+        test_actuators test_flcs_level_flight test_flcs_pullup test_flcs_review test_flcs_handling \
         test_signal_conditioning test_force_curves test_avionics_controls \
         test_config_persistence test_input_pipeline \
         test_camera_rig test_hud_collimation test_hud_clipping test_flight_instruments \
@@ -69,6 +69,9 @@ test_flcs_pullup: $(BIN_DIR)/test_flcs_pullup
 
 test_flcs_review: $(BIN_DIR)/test_flcs_review
 	./$(BIN_DIR)/test_flcs_review
+
+test_flcs_handling: $(BIN_DIR)/test_flcs_handling
+	./$(BIN_DIR)/test_flcs_handling
 
 test_signal_conditioning: $(BIN_DIR)/test_signal_conditioning
 	./$(BIN_DIR)/test_signal_conditioning
@@ -203,6 +206,7 @@ run_all: all
 	@./$(BIN_DIR)/test_flcs_level_flight
 	@./$(BIN_DIR)/test_flcs_pullup
 	@./$(BIN_DIR)/test_flcs_review
+	@./$(BIN_DIR)/test_flcs_handling
 	@./$(BIN_DIR)/test_signal_conditioning
 	@./$(BIN_DIR)/test_force_curves
 	@./$(BIN_DIR)/test_avionics_controls

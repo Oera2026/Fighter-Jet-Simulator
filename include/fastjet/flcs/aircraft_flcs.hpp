@@ -159,6 +159,23 @@ public:
     /// Nose-down pitch-rate command per degree of alpha beyond the stick's
     /// alpha, in the pitch-rate-command region [deg/s / deg].
     static constexpr double ALPHA_OVER_Q_DPS = 1.0;
+    /// Dynamic pressure band [Pa] over which the stick's alpha past the lift
+    /// peak gives way to the lift peak itself (post_stall_share).
+    static constexpr double Q_POST_STALL_LO_PA = 5000.0;
+    static constexpr double Q_POST_STALL_HI_PA = 12000.0;
+
+    /**
+     * @brief Share [0, 1] of the stick's alpha beyond the lift peak the law
+     * flies when the G is out of reach: all of it when slow (nose pointing,
+     * the F-22's and F-35B's high-alpha capability), none from corner speed
+     * up, where full aft stick wants the most G the wing has. Flown to the
+     * stick's alpha there, a full pull at 190 m/s sat at 50-60 deg alpha and
+     * a third of the G short, and at Mach 1.4 the F-22 overshot to 35 deg
+     * and 9.85 G.
+     */
+    [[nodiscard]] static double post_stall_share(double q_bar) noexcept {
+        return std::clamp((Q_POST_STALL_HI_PA - q_bar) / (Q_POST_STALL_HI_PA - Q_POST_STALL_LO_PA), 0.0, 1.0);
+    }
 
     /**
      * @brief Highest alpha the stick allows [deg]: the hands-off alpha
@@ -254,14 +271,16 @@ public:
         double q_ref = 0.0;
         double de_ff = trim_model.feed_forward(dt, nz_ff, imu, mass_kg, std::min(alpha_cap, TRIM_ALPHA_MAX_DEG),
                                                k.de_limit, q_ref);
-        // The reference alpha: what the model says the G takes, or, when the
-        // wing cannot make that G below the stick's alpha, the stick's alpha
-        // and the G the jet makes there.
+        // The reference alpha: what the model says the G takes. When the wing
+        // cannot make that G below the stick's alpha, the jet flies its lift
+        // peak (or the stick's alpha, if that comes first) and the G it makes
+        // there; slow enough that no G is to be had anyway, the stick's alpha
+        // past the lift peak (see post_stall_share).
         double alpha_ref = trim_model.solved_alpha_deg();
         const bool short_of_g = trim_model.short_of_g();
         if (short_of_g) {
-            alpha_ref = alpha_cap;
-            const double nz_avail = trim_model.nz_at_alpha(alpha_cap, imu, mass_kg);
+            alpha_ref += post_stall_share(q_bar) * std::max(0.0, alpha_cap - alpha_ref);
+            const double nz_avail = trim_model.nz_at_alpha(alpha_ref, imu, mass_kg);
             if (Nz_cmd > nz_avail) {
                 // Trim for the pull the jet will actually fly: solved for the
                 // stick's G, the feed-forward assumed that G's pitch rate and
