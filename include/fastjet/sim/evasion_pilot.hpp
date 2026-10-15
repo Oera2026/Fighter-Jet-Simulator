@@ -88,20 +88,29 @@ public:
             prev_missile_range_ = -1.0;
         }
         // The MAWS times the missile itself (a boosting one too), and may have
-        // one the RWR doesn't.
+        // one the RWR doesn't. Once a passive set has lost it at burnout, its
+        // remembered time to go keeps him beaming but never times the break:
+        // a radar missile coasts for a long time, and the countdown ran out
+        // early, so he broke out of the notch before it got there.
         const bool maws = threat.inbound && threat.maws;
-        const bool maws_only = maws && !rwr.missile_valid;
-        if (maws && (!threat.held || !rwr.missile_valid)) t_go = std::min(t_go, threat.time_to_go());
-        const bool missile_known = rwr.missile_valid || maws;
+        if (maws && !threat.held) t_go = std::min(t_go, threat.time_to_go());
+        // A held track is only its last line of sight, and that goes stale.
+        // Once the RWR has had the missile, he steers by the RWR's memory and
+        // the launcher's emitter instead: beaming the stale line of sight let
+        // a chaff-broken missile reacquire him.
+        const bool maws_steer = maws && (!threat.held || missile_memory_ <= 0.0);
+        const bool maws_only = maws_steer && !rwr.missile_valid;
+        const bool missile_known = rwr.missile_valid || maws_steer;
         const double missile_bearing =
             rwr.missile_valid ? rwr.missile_bearing : RwrStatus::relative_bearing(self.state, threat.pos);
         // Silent on the RWR now and lately: a heat seeker.
         const bool heat_seeker = maws_only && threat.heat_seeker && missile_memory_ <= 0.0;
         const bool flares_wanted = heat_seeker || (maws && threat.wants_flares());
         if (threat.launch) {
-            // MAWS launch call: a program at once; the turn follows below.
+            // MAWS launch call: flares at once; the turn follows below. Chaff
+            // waits for the beam inside 12 km (below): a program at launch
+            // range decoyed nothing and cost the F-35B most EXPERT shots.
             out.dispense_flare = flares_wanted;
-            out.dispense = !heat_seeker;
             flare_timer_ = chaff_interval_s;
         }
 
