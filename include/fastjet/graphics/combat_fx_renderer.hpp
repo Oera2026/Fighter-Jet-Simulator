@@ -38,6 +38,7 @@ public:
         float max_age = 8.0f;
         float density = 1.0f;
         bool is_fire = false;
+        bool active = false;
     };
 
     struct FlareParticle {
@@ -59,7 +60,13 @@ public:
     static constexpr int kMaxExplosions = 16;
     static constexpr int kMaxFlares = 64;
     static constexpr int kMaxChaffClouds = 32;
-    static constexpr int kMaxSmokeNodes = 1024;
+    /// Smoke puffs alive at once: a ring, the oldest overwritten first. A
+    /// trail puff every kTrailSpacingM for a missile's whole burn and its
+    /// eight-second fade fits several missiles at once.
+    static constexpr int kMaxSmokeNodes = 4096;
+    static constexpr int kMaxTrails = 16;            ///< Missile slots followed (World::kMaxMissiles)
+    static constexpr double kTrailSpacingM = 3.0;    ///< Puffs laid along the path flown since the last frame
+    static constexpr int kMaxTrailPuffsPerFrame = 24;
 
     CombatFxRenderer() = default;
     ~CombatFxRenderer() { destroy(); }
@@ -179,8 +186,10 @@ public:
 
         glBindVertexArray(0);
 
-        smoke_pool_.reserve(kMaxSmokeNodes);
-        particle_buffer_.reserve(kMaxSmokeNodes * 6 * 10);
+        smoke_pool_.assign(kMaxSmokeNodes, SmokeNode{});
+        next_smoke_ = 0;
+        trails_.fill(Trail{});
+        particle_buffer_.reserve((kMaxSmokeNodes + kMaxFlares + kMaxChaffClouds + kMaxExplosions + kMaxTrails) * 6 * 10);
 
         initialized_ = true;
         return true;
@@ -211,31 +220,23 @@ public:
         }
         // Spawn initial burst of dense smoke puffs
         for (int i = 0; i < 8; ++i) {
-            if (smoke_pool_.size() >= kMaxSmokeNodes) smoke_pool_.erase(smoke_pool_.begin());
-            SmokeNode puff;
-            puff.pos_ned = pos_ned + math::Vector3((i % 3 - 1) * 3.0, ((i / 3) % 3 - 1) * 3.0, (i * 0.5 - 2.0));
-            puff.radius = 4.0f;
-            puff.age = 0.0f;
-            puff.max_age = 9.0f;
-            puff.density = 1.0f;
-            puff.is_fire = (i < 4);
-            smoke_pool_.push_back(puff);
+            emit_smoke(pos_ned + math::Vector3((i % 3 - 1) * 3.0, ((i / 3) % 3 - 1) * 3.0, (i * 0.5 - 2.0)), 4.0f,
+                       i < 4, 9.0f);
         }
     }
 
     /// @brief Drop a smoke puff behind a missile or damaged engine
     void emit_smoke(const math::Vector3& pos_ned, float radius = 0.6f, bool is_fire = false, float max_age = 7.0f) {
-        if (smoke_pool_.size() >= kMaxSmokeNodes) {
-            smoke_pool_.erase(smoke_pool_.begin());
-        }
-        SmokeNode node;
+        if (smoke_pool_.empty()) return; // not initialised
+        SmokeNode& node = smoke_pool_[static_cast<size_t>(next_smoke_)];
+        next_smoke_ = (next_smoke_ + 1) % kMaxSmokeNodes;
         node.pos_ned = pos_ned;
         node.radius = radius;
         node.age = 0.0f;
         node.max_age = max_age;
         node.density = 1.0f;
         node.is_fire = is_fire;
-        smoke_pool_.push_back(node);
+        node.active = true;
     }
 
     /// @brief Update particles, explosions, and smoke aging
@@ -253,16 +254,16 @@ public:
         }
 
         // 2. Advance smoke nodes
-        for (auto it = smoke_pool_.begin(); it != smoke_pool_.end();) {
-            it->age += static_cast<float>(dt);
-            if (it->age >= it->max_age) {
-                it = smoke_pool_.erase(it);
+        for (auto& node : smoke_pool_) {
+            if (!node.active) continue;
+            node.age += static_cast<float>(dt);
+            if (node.age >= node.max_age) {
+                node.active = false;
             } else {
                 // Expanding radius as smoke disperses in atmosphere
-                it->radius += static_cast<float>(dt * 1.8);
+                node.radius += static_cast<float>(dt * 1.8);
                 // Slight upward thermal buoyancy
-                it->pos_ned.z -= dt * 1.2;
-                ++it;
+                node.pos_ned.z -= dt * 1.2;
             }
         }
     }
@@ -313,38 +314,44 @@ public:
 
                 missile_shader_.set_mat4("uModel", model);
                 glDrawArrays(GL_TRIANGLES, 0, missile_vert_count_);
-
-                // Continuous smoke emission while motor burns
-                if (m.body.motor_burning(m.spec)) {
-                    emit_smoke(m.body.pos - fwd * 1.8, 0.75f, false, 8.0f);
-                }
             }
             glBindVertexArray(0);
         }
+        lay_trails(missiles, missile_count);
 
         // ---------------------------------------------------------------------
-        // 2. Build Billboard Quad Vertices for Smoke, Flares, Chaff, and Explosions
+        // 2. Build Billboard Quad Vertices: the smoke first (blended over the
+        // scene), then everything that glows (added to it).
         // ---------------------------------------------------------------------
         particle_buffer_.clear();
 
-        // (a) Volumetric smoke trail nodes
+        // (a) Smoke: grey puffs that hide what is behind them. Puffs right at
+        // the eye fade out, or one would fill the screen.
         for (const auto& node : smoke_pool_) {
+            if (!node.active || node.is_fire) continue;
             const math::Vector3 rel = node.pos_ned - eye_ned;
             const float life = 1.0f - (node.age / node.max_age);
-            float r, g, b, a;
-            if (node.is_fire) {
-                // Fiery licking flame cooling to soot
-                r = 3.5f * life;
-                g = 1.6f * life * life;
-                b = 0.3f * life * life * life;
-                a = std::clamp(life * 0.9f, 0.0f, 1.0f);
-            } else {
-                // Expanding white-grey smoke ribbon
-                const float grey = 0.85f * (0.4f + 0.6f * life);
-                r = grey; g = grey; b = grey;
-                a = std::clamp(life * 0.65f, 0.0f, 0.75f);
-            }
-            append_billboard_quad(rel, node.radius, r, g, b, a);
+            const float grey = 0.85f * (0.4f + 0.6f * life);
+            const float near = std::clamp((static_cast<float>(rel.norm()) - node.radius) / (3.0f * node.radius), 0.0f, 1.0f);
+            const float a = std::clamp(life * 0.65f, 0.0f, 0.75f) * near;
+            if (a <= 0.002f) continue;
+            append_billboard_quad(rel, node.radius, grey, grey, grey, a);
+        }
+        const size_t smoke_floats = particle_buffer_.size();
+
+        // (a') Fire: licking flame cooling to soot, and each burning motor's plume.
+        for (const auto& node : smoke_pool_) {
+            if (!node.active || !node.is_fire) continue;
+            const math::Vector3 rel = node.pos_ned - eye_ned;
+            const float life = 1.0f - (node.age / node.max_age);
+            append_billboard_quad(rel, node.radius, 3.5f * life, 1.6f * life * life, 0.3f * life * life * life,
+                                  std::clamp(life * 0.9f, 0.0f, 1.0f));
+        }
+        for (size_t i = 0; missiles && i < missile_count; ++i) {
+            const auto& m = missiles[i];
+            if (!m.active || !m.body.motor_burning(m.spec)) continue;
+            const math::Vector3 tail = m.body.pos - m.body.vel.normalized() * 2.0 - eye_ned;
+            append_billboard_quad(tail, 0.5f, 4.0f, 2.4f, 1.0f, 1.0f);
         }
 
         // (b) Pyrotechnic Flares
@@ -353,12 +360,13 @@ public:
                 const auto& f = flares[i];
                 if (!f.active) continue;
                 const math::Vector3 rel = f.pos - eye_ned;
-                // Blinding HDR emission: blooms heavily
+                // Blinding HDR emission: a small white-hot core, the bloom
+                // does the rest (a core metres across filled the screen near the jet).
                 const float heat = static_cast<float>(f.intensity());
-                const float r = 8.0f * heat;
-                const float g = 6.5f * heat;
-                const float b = 3.2f * heat;
-                append_billboard_quad(rel, 1.8f + 1.2f * heat, r, g, b, 1.0f);
+                const float r = 3.6f * heat;
+                const float g = 3.0f * heat;
+                const float b = 1.6f * heat;
+                append_billboard_quad(rel, 0.4f + 0.3f * heat, r, g, b, 1.0f);
             }
         }
 
@@ -409,10 +417,14 @@ public:
                          GL_STREAM_DRAW);
 
             glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE); // Additive/Translucent HDR bloom blend
             glDepthMask(GL_FALSE);
-
-            glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(particle_buffer_.size() / 10));
+            // Smoke over the scene; fire, flares, chaff glints and fireballs added to it.
+            const GLsizei smoke_verts = static_cast<GLsizei>(smoke_floats / 10);
+            const GLsizei all_verts = static_cast<GLsizei>(particle_buffer_.size() / 10);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            if (smoke_verts > 0) glDrawArrays(GL_TRIANGLES, 0, smoke_verts);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            if (all_verts > smoke_verts) glDrawArrays(GL_TRIANGLES, smoke_verts, all_verts - smoke_verts);
 
             glDepthMask(GL_TRUE);
             glDisable(GL_BLEND);
@@ -421,6 +433,42 @@ public:
     }
 
 private:
+    /// @brief Where each missile slot's trail last left a puff.
+    struct Trail {
+        math::Vector3 last{};
+        double tof{-1.0}; ///< Time of flight at the last puff (-1: no trail yet)
+    };
+
+    /// @brief Lay smoke behind every burning motor along the whole path it
+    /// flew since the last frame, a puff every kTrailSpacingM: a missile
+    /// covers tens of metres a frame, and one puff per frame drew a dotted line.
+    void lay_trails(const sim::Missile* missiles, size_t missile_count) {
+        for (size_t i = 0; i < trails_.size(); ++i) {
+            Trail& t = trails_[i];
+            const sim::Missile* m = (missiles && i < missile_count) ? &missiles[i] : nullptr;
+            if (m == nullptr || !m->active || !m->body.motor_burning(m->spec)) {
+                t.tof = -1.0;
+                continue;
+            }
+            const math::Vector3 nozzle = m->body.pos - m->body.vel.normalized() * 1.8;
+            // A new missile in the slot (or the first frame of this one): start here.
+            if (t.tof < 0.0 || m->body.tof < t.tof) {
+                emit_smoke(nozzle, 0.9f, false, 8.0f);
+                t.last = nozzle;
+                t.tof = m->body.tof;
+                continue;
+            }
+            const math::Vector3 path = nozzle - t.last;
+            const double len = path.norm();
+            const int n = std::min(kMaxTrailPuffsPerFrame, static_cast<int>(len / kTrailSpacingM));
+            for (int k = 1; k <= n; ++k) {
+                emit_smoke(t.last + path * (static_cast<double>(k) / n), 0.9f, false, 8.0f);
+            }
+            if (n > 0) t.last = nozzle;
+            t.tof = m->body.tof;
+        }
+    }
+
     void append_billboard_quad(const math::Vector3& center_rel, float size, float r, float g, float b, float a) {
         // Two triangles forming a camera-facing quad: 6 vertices
         static constexpr float kOffsets[6][2] = {
@@ -529,7 +577,9 @@ private:
     bool initialized_ = false;
 
     std::array<ExplosionEffect, kMaxExplosions> explosions_{};
-    std::vector<SmokeNode> smoke_pool_;
+    std::vector<SmokeNode> smoke_pool_; ///< Ring of kMaxSmokeNodes, sized once in init()
+    int next_smoke_ = 0;
+    std::array<Trail, kMaxTrails> trails_{};
     std::vector<float> particle_buffer_;
 };
 
