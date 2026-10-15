@@ -94,7 +94,12 @@ void test_rws_paints_where_the_jet_was() {
     const sim::RadarHit& h = scope.hits[0];
     std::cout << "    brick at az " << h.az_rad / DEG << " deg, " << h.range_m << " m, frame " << h.frame << "\n";
     assert(h.target == 1 && h.frame == 0);
-    assert(std::abs(h.az_rad) < 1.0 * DEG);
+    // On the line of sight, measured from where the ownship points: in the
+    // 5 m/s crosswind a hands-off jet crabs a degree or more into the wind,
+    // so the target is not assumed dead ahead.
+    const math::Vector3 los = w->aircraft[1].state.pos_ned - w->aircraft[0].state.pos_ned;
+    const double bearing = std::remainder(std::atan2(los.y, los.x) - w->aircraft[0].state.yaw(), 2.0 * M_PI);
+    assert(std::abs(h.az_rad - bearing) < 1.0 * DEG);
     assert(h.range_m < 30000.0 && h.range_m > 30000.0 - 500.0 * FRAME_S);
     assert(std::abs(h.alt_m - 5000.0) < 100.0);
 

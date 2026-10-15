@@ -86,11 +86,47 @@ struct FLCSConfig {
         UNIFIED_STOVL         ///< F-35B: G/alpha FBW up-and-away; unified STOVL law once converted
     };
 
+    /**
+     * @brief Gains and handling of a G-command pitch law (AircraftFLCS::g_command_pitch).
+     * The F-16 flies its own TP-1538-scheduled law (PitchController) and does not use these.
+     */
+    struct PitchLaw {
+        double kp{1.0};                 ///< Proportional on the G error [deg / G]
+        double ki{2.0};                 ///< Integral trim [deg / (G s)]
+        double kd{0.6};                 ///< Pitch-rate damper [deg / (deg/s)]
+        double k_alpha{0.5};            ///< Alpha feedback about the reference alpha [deg / deg]
+        double integrator_limit{15.0};  ///< [G s]
+        double aoa_k1{2.0};             ///< AoA limiter push per degree over [deg / deg]
+        double aoa_k2{0.12};            ///< ...and per degree squared
+        double de_limit{25.0};          ///< Stabilator / canard authority [deg]
+        double q_cmd_max_dps{30.0};     ///< Pitch-rate command at full stick, very low q [deg/s]
+        double ref_bandwidth{1.0};      ///< Scale on the G reference model's frequency: below 1 a heavier, slower feel
+        double alpha_hands_off_deg{20.0}; ///< Highest alpha the law holds with the stick centred [deg]
+    };
+
+    /**
+     * @brief Gains of a fly-by-wire roll/yaw law (AircraftFLCS::fbw_roll_law).
+     */
+    struct RollLaw {
+        double kp{0.15};                ///< Roll-rate error to aileron [deg / (deg/s)]
+        double ki{0.30};                ///< Roll-rate trim [deg / deg]
+        double da_limit{25.0};          ///< Aileron authority [deg]
+        double pedal_deg{25.0};         ///< Rudder at full pedal [deg]
+        double k_yaw{0.40};             ///< Sideslip-rate damper [deg / (deg/s)]
+        double k_beta{0.60};            ///< Sideslip feedback [deg / deg]
+        double dr_limit{30.0};          ///< Rudder authority [deg]
+        double atten_start_frac{0.6};   ///< Roll-rate attenuation starts at this share of the alpha limit...
+        double atten_min{0.25};         ///< ...falling to this share of the rated rate at the limit
+        double roll_cmd_tau_s{0.04};    ///< Roll command prefilter [s]: longer is a heavier feel
+    };
+
     LawType law_type{LawType::DIGITAL_FBW_G_ALPHA};
     double max_g_positive{9.0};
     double max_g_negative{-3.0};
     double alpha_limit_deg{25.2};
     double max_roll_rate_dps{308.0};
+    PitchLaw pitch{};
+    RollLaw roll{};
 };
 
 /**
@@ -190,9 +226,12 @@ struct AircraftConfig {
                     0.025, 0.006, -10.0, -0.45, -0.20,
                     1.30, 1.50, 1.00, 1.80, 0.36
                 };
+                // The F-16 flies its own TP-1538 laws (PitchController,
+                // LateralDirectionalController); the generic gains are unused.
                 cfg.flcs = FLCSConfig{
                     FLCSConfig::LawType::DIGITAL_FBW_G_ALPHA,
-                    9.0, -3.0, 25.2, 308.0
+                    9.0, -3.0, 25.2, 308.0,
+                    FLCSConfig::PitchLaw{}, FLCSConfig::RollLaw{}
                 };
                 cfg.gear = LandingGearConfig{
                     math::Vector3(3.60, 0.0, 0.30), 1.03e5, 1.20e4,
@@ -228,10 +267,16 @@ struct AircraftConfig {
                     0.045, 0.008, -12.5, -0.42, -0.22,
                     1.30, 1.50, 1.00, 1.70, 0.30
                 };
-                // Modern Digital Fly-By-Wire system
+                // Modern Digital Fly-By-Wire system: a conventional stable
+                // airframe with a CAS, heavier in pitch and roll than the F-16
+                // (slower G reference, longer roll prefilter).
                 cfg.flcs = FLCSConfig{
                     FLCSConfig::LawType::DIGITAL_FBW_G_ALPHA,
-                    9.0, -3.0, 30.0, 260.0
+                    9.0, -3.0, 30.0, 260.0,
+                    // kp, ki, kd, k_alpha, int limit, AoA k1, k2, de limit, q cmd, ref bandwidth, hands-off alpha
+                    FLCSConfig::PitchLaw{1.60, 3.00, 0.56, 0.40, 25.0, 2.2, 0.15, 25.0, 30.0, 0.85, 20.0},
+                    // kp, ki, da limit, pedal, k yaw, k beta, dr limit, atten start, atten min, roll tau
+                    FLCSConfig::RollLaw{0.20, 0.30, 25.0, 25.0, 0.40, 0.60, 30.0, 0.6, 0.25, 0.06}
                 };
                 // Wheelbase: 5.50m, Track: 2.76m
                 cfg.gear = LandingGearConfig{
@@ -268,10 +313,13 @@ struct AircraftConfig {
                     0.040, 0.005, -9.0, -0.38, -0.18,
                     1.30, 1.60, 1.20, 1.80, 0.30
                 };
-                // Quadruple carefree handling digital FBW
+                // Quadruple carefree handling digital FBW: a quick G reference
+                // and strong alpha feedback on the unstable delta-canard.
                 cfg.flcs = FLCSConfig{
                     FLCSConfig::LawType::CAREFREE_DELTA_CANARD,
-                    9.0, -3.0, 35.0, 270.0
+                    9.0, -3.0, 35.0, 270.0,
+                    FLCSConfig::PitchLaw{1.04, 2.00, 0.70, 0.70, 15.0, 2.0, 0.12, 30.0, 30.0, 1.15, 22.0},
+                    FLCSConfig::RollLaw{0.12, 0.30, 25.0, 28.0, 0.45, 0.60, 30.0, 0.6, 0.25, 0.04}
                 };
                 // Wheelbase: 4.40m, Track: 2.80m
                 cfg.gear = LandingGearConfig{
@@ -312,7 +360,9 @@ struct AircraftConfig {
                 // Integrated FBW + 2D TVC Mixer
                 cfg.flcs = FLCSConfig{
                     FLCSConfig::LawType::FBW_TVC_ALLOCATED,
-                    9.0, -3.0, 65.0, 280.0
+                    9.0, -3.0, 65.0, 280.0,
+                    FLCSConfig::PitchLaw{1.08, 2.00, 0.64, 0.70, 15.0, 1.8, 0.10, 25.0, 32.0, 1.0, 26.0},
+                    FLCSConfig::RollLaw{0.10, 0.30, 22.0, 26.0, 0.40, 0.60, 28.0, 0.6, 0.25, 0.04}
                 };
                 // Wheelbase: 5.40m, Track: 3.40m
                 cfg.gear = LandingGearConfig{
@@ -355,9 +405,11 @@ struct AircraftConfig {
                     1.15, 1.25, 0.60, 1.50, 0.35
                 };
                 // Mechanical linkage with dual Pitch/Yaw Stability Augmentation System (SAS)
+                // (The generic FBW gains are unused: no FBW.)
                 cfg.flcs = FLCSConfig{
                     FLCSConfig::LawType::HYDRO_SAS_AUGMENTED,
-                    7.33, -3.0, 18.0, 130.0
+                    7.33, -3.0, 18.0, 130.0,
+                    FLCSConfig::PitchLaw{}, FLCSConfig::RollLaw{}
                 };
                 // Wide-stance gear. Nose gear offset 0.3m right for GAU-8 cannon!
                 // Wheelbase: 4.60m, Track: 5.24m
@@ -405,7 +457,9 @@ struct AircraftConfig {
                 // F-35B: +7.0 / -3.0 G, 50 deg AoA limiter, ~200 deg/s roll.
                 cfg.flcs = FLCSConfig{
                     FLCSConfig::LawType::UNIFIED_STOVL,
-                    7.0, -3.0, 50.0, 200.0
+                    7.0, -3.0, 50.0, 200.0,
+                    FLCSConfig::PitchLaw{1.30, 2.50, 0.60, 0.60, 20.0, 2.0, 0.12, 25.0, 30.0, 1.0, 25.0},
+                    FLCSConfig::RollLaw{0.15, 0.30, 25.0, 25.0, 0.40, 0.60, 30.0, 0.6, 0.25, 0.04}
                 };
                 // Wheelbase 6.02 m, track 4.34 m, wheels 1.9 m below the CG.
                 cfg.gear = LandingGearConfig{

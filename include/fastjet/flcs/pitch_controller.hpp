@@ -111,6 +111,7 @@ public:
      * @param trim Onboard pitch model for the stabilator feed-forward (none: no feed-forward)
      * @param mass_kg Aircraft mass [kg], for the feed-forward
      * @param lef_schedule Leading-edge flap schedule the feed-forward assumes
+     * @param coupling_moment_nm Inertial pitching moment to cancel [N m] (inertial_pitch_moment)
      * @return double Commanded stabilator deflection [deg]
      */
     double update(
@@ -120,7 +121,8 @@ public:
         bool is_actuator_saturated = false,
         PitchTrimModel* trim = nullptr,
         double mass_kg = 0.0,
-        double (*lef_schedule)(double, double) = nullptr
+        double (*lef_schedule)(double, double) = nullptr,
+        double coupling_moment_nm = 0.0
     ) noexcept {
         const double pitch_in = std::clamp(pilot.pitch_stick, -1.0, 1.0);
 
@@ -211,7 +213,9 @@ public:
         // gain in degrees per degree holds at any speed. The reference alpha
         // stops short of the AoA limiter, which rules above it.
         double de_alpha = 0.0;
+        double de_coupling = 0.0;
         if (trim) {
+            de_coupling = trim->stabilator_for_moment(coupling_moment_nm, imu.q_bar);
             const double alpha_ref = std::min(trim->solved_alpha_deg(), AOA_LIMITER_ONSET_DEG);
             de_alpha = w_Nz * K_alpha_ref * (imu.alpha_deg - alpha_ref);
         }
@@ -264,7 +268,7 @@ public:
         // sustained pull, the integrator had to wind up to overcome it, and it
         // then held the G for seconds after the stick came forward.
         const double over_g = std::max(0.0, imu.Nz - NZ_MAX) - std::max(0.0, NZ_MIN - imu.Nz);
-        double de_cmd = de_ff + de_alpha - k_q * (Kp * error + Ki * integrator) + k_q * Kd * (imu.q_deg - q_ref)
+        double de_cmd = de_ff + de_coupling + de_alpha - k_q * (Kp * error + Ki * integrator) + k_q * Kd * (imu.q_deg - q_ref)
                       + k_q * OVER_G_PUSH * over_g + aoa_override_de;
 
         // Clamp to stabilator physical limits [-25, +25] deg

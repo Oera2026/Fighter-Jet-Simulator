@@ -62,6 +62,19 @@ struct GReferenceModel {
     }
 };
 
+/**
+ * @brief Inertial pitching moment [N m] of a jet rolling and yawing at once,
+ * (Izz - Ixx) p r + Ixz (r^2 - p^2): a flight-path roll at alpha (yaw rate
+ * p tan(alpha)) pitches the nose up with it. Fed forward by the pitch laws,
+ * which otherwise saw it only as a G error to chase (0.8 G up in a full roll
+ * at 140 m/s).
+ */
+[[nodiscard]] inline double inertial_pitch_moment(const IMUData& imu, const fdm::MassProperties& mass) noexcept {
+    constexpr double D2R = M_PI / 180.0;
+    const double p = imu.p_deg * D2R, r = imu.r_deg * D2R;
+    return (mass.Izz - mass.Ixx) * p * r + mass.Ixz * (r * r - p * p);
+}
+
 class PitchTrimModel {
 public:
     aero::AircraftAeroModel aero{};
@@ -80,7 +93,10 @@ public:
         alpha_prev_ = 3.0;
         alpha_rate_ = 0.0;
         primed_ = false;
+        saturated_ = false;
+        short_of_g_ = false;
         solved_once_ = false;
+        cm_de_per_deg_ = 0.0;
     }
 
     /// @brief Feed-forward stabilator [deg] for the reference G @p nz, and
@@ -151,6 +167,7 @@ public:
         constexpr double EA = 0.25, ED = 0.25;
         constexpr double MIN_SLOPE = 0.02;  // [1/deg]: below this, the lift peak
         saturated_ = false;
+        short_of_g_ = false;
         // Warm-started, two steps a tick keep up; cold, solve it out in full
         // so the first tick does not feed forward a guess.
         const int iterations = solved_once_ ? 2 : 12;
@@ -173,11 +190,15 @@ public:
                 alpha_deg_ = std::clamp(alpha_deg_ - std::clamp(f1 / slope, -4.0, 4.0), ALPHA_LO, alpha_max_deg);
             }
             if (alpha_deg_ >= alpha_max_deg || alpha_deg_ <= ALPHA_LO) saturated_ = true;
+            // Out of reach upward: held at the lift peak or the alpha cap
+            // with the normal force still short of the G.
+            short_of_g_ = saturated_ && alpha_deg_ > ALPHA_LO && f1 < 0.0;
 
             double f1d = 0.0, f2d = 0.0;
             residual(alpha_deg_, de_deg_, f1, f2);
             residual(alpha_deg_, de_deg_ + ED, f1d, f2d);
             const double moment_slope = (f2d - f2) / ED;
+            cm_de_per_deg_ = moment_slope;
             if (std::abs(moment_slope) > 1e-9) {
                 de_deg_ = std::clamp(de_deg_ - std::clamp(f2 / moment_slope, -6.0, 6.0), -de_limit_deg, de_limit_deg);
             }
@@ -188,6 +209,40 @@ public:
     [[nodiscard]] double solved_alpha_deg() const noexcept { return alpha_deg_; }
     /// @brief True when the last solve could not reach the G (alpha capped).
     [[nodiscard]] bool saturated() const noexcept { return saturated_; }
+    /// @brief True when the G asked for is beyond the wing below the solve's
+    /// alpha cap (or past its lift peak): more alpha would be needed.
+    [[nodiscard]] bool short_of_g() const noexcept { return short_of_g_; }
+
+    /**
+     * @brief Stabilator increment [deg] whose aerodynamic moment cancels a
+     * pitching moment of @p moment_nm [N m] (nose up positive), at the
+     * stabilator power of the last solve.
+     */
+    [[nodiscard]] double stabilator_for_moment(double moment_nm, double q_bar) const noexcept {
+        const double qsc = q_bar * aero.config.s_ref * aero.config.c_bar;
+        if (q_bar < 300.0 || std::abs(cm_de_per_deg_) < 1e-6) return 0.0;
+        return -moment_nm / qsc / cm_de_per_deg_;
+    }
+
+    /**
+     * @brief Load factor [G] the jet makes in a steady pull at @p alpha_deg,
+     * at the last solved stabilator: the G a pull held at that alpha flies.
+     */
+    [[nodiscard]] double nz_at_alpha(double alpha_deg, const IMUData& imu, double mass_kg,
+                                     double (*lef_schedule)(double, double) = nullptr) const noexcept {
+        constexpr double G0 = 9.80665;
+        constexpr double D2R = M_PI / 180.0;
+        if (imu.q_bar < 300.0 || mass_kg <= 0.0) return 1.0;
+        const double V = std::max(imu.airspeed, 30.0);
+        const double mach = environment::Atmosphere1976::compute(imu.altitude, V).mach_number;
+        fdm::FlightState s{};
+        s.vel_b = math::Vector3(V * std::cos(alpha_deg * D2R), 0.0, V * std::sin(alpha_deg * D2R));
+        const double lef = lef_schedule ? lef_schedule(alpha_deg, imu.q_bar) : 0.0;
+        const auto c = aero.compute_coefficients(s, aero::ControlSurfaces{de_deg_, 0.0, 0.0, lef}, imu.q_bar, mach);
+        const double a = alpha_deg * D2R;
+        const double cn = c.CL * std::cos(a) + c.CD * std::sin(a);
+        return cn * imu.q_bar * aero.config.s_ref / (mass_kg * G0);
+    }
 
     /// Bound on the alpha rate fed into the pitch-rate reference [deg/s].
     static constexpr double ALPHA_RATE_MAX = 20.0;
@@ -199,7 +254,9 @@ private:
     double alpha_rate_{0.0};  ///< Rate of the solved alpha [deg/s]
     bool primed_{false};
     bool saturated_{false};
+    bool short_of_g_{false};
     bool solved_once_{false};
+    double cm_de_per_deg_{0.0};  ///< Stabilator power at the last solve [1/deg]
 };
 
 } // namespace fastjet::flcs
