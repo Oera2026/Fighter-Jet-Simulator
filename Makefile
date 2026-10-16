@@ -16,7 +16,7 @@ TESTS = test_atmosphere test_ballistic test_gyroscopic test_performance \
         test_user_settings test_menu_navigation test_render_fidelity test_thread_pool \
         test_aircraft_entity test_guns test_air_combat_geometry test_bfm_ai \
         test_missiles test_evade_mode test_radar_scope test_flight_realism \
-        test_ejection test_jet_cockpits test_stovl test_missile_warning test_air_combat
+        test_ejection test_jet_cockpits test_stovl test_missile_warning test_air_combat test_intercept_mode
 
 TARGETS = $(addprefix $(BIN_DIR)/, $(TESTS))
 
@@ -169,6 +169,9 @@ test_ejection: $(BIN_DIR)/test_ejection
 test_air_combat: $(BIN_DIR)/test_air_combat
 	./$(BIN_DIR)/test_air_combat
 
+test_intercept_mode: $(BIN_DIR)/test_intercept_mode
+	./$(BIN_DIR)/test_intercept_mode
+
 test_missile_warning: $(BIN_DIR)/test_missile_warning
 	./$(BIN_DIR)/test_missile_warning
 
@@ -251,6 +254,7 @@ run_all: all
 	@./$(BIN_DIR)/test_stovl
 	@./$(BIN_DIR)/test_missile_warning
 	@./$(BIN_DIR)/test_air_combat
+	@./$(BIN_DIR)/test_intercept_mode
 	@echo "================ All Tests Completed Successfully! ================"
 
 clean:

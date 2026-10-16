@@ -89,7 +89,7 @@ private:
         const char* text;
     };
 
-    static constexpr std::array<Entry, 30> kEntries = {{
+    static constexpr std::array<Entry, 34> kEntries = {{
         {Kind::HEADING, "FLIGHT DYNAMICS"},
         {Kind::LINE, "Six-degree-of-freedom rigid-body model"},
         {Kind::DETAIL, "Fourth-order Runge-Kutta integration at 200 Hz"},
@@ -106,6 +106,10 @@ private:
         {Kind::HEADING, "FLIGHT CONTROL"},
         {Kind::LINE, "Digital fly-by-wire control laws"},
         {Kind::DETAIL, "G / AoA limiting, Auto-GCAS and G-LOC protection"},
+        {Kind::GAP, ""},
+        {Kind::HEADING, "3D MODELS"},
+        {Kind::LINE, "F-16, F-15E, Typhoon, F-22 and F-35 \"Fighter Jet - Free\""},
+        {Kind::DETAIL, "by bohmerang on Sketchfab  /  CC BY-NC-SA 4.0"},
         {Kind::GAP, ""},
         {Kind::HEADING, "OPEN-SOURCE LIBRARIES"},
         {Kind::LINE, "SDL 3"},

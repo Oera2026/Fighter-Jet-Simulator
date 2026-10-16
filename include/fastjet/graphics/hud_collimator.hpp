@@ -255,6 +255,18 @@ private:
         draw_string(str, start_x, y, scale, z, col);
     }
 
+    /// @brief Draw string centered at (center_x, y), shrunk if need be so it
+    /// is no wider than @p max_width (a long line would run off the combiner).
+    void draw_string_fit(const char* str, float center_x, float y, float scale, float max_width, float z,
+                         const Color4& col) {
+        if (!str || !*str) return;
+        const float len = static_cast<float>(std::strlen(str));
+        // Width: the advance between characters plus one glyph.
+        const float width = ((len - 1.0f) * 0.82f + 0.7f) * scale;
+        if (width > max_width) scale *= max_width / width;
+        draw_string_centered(str, center_x, y, scale, z, col);
+    }
+
 public:
     /// @brief Heading tape elevation above the boresight [rad] for an airframe.
     [[nodiscard]] static constexpr float tape_elevation(aircraft::AircraftType type) noexcept {
@@ -965,19 +977,25 @@ public:
         if (c.fuel_leak) { draw_string_centered("FUEL LEAK", 0.0f, cy, D * 0.009f, -D, amber); }
 
         // Fight status line and the outcome banner.
-        if (c.status[0]) draw_string_centered(c.status, 0.0f, D * std::tan(0.112f), D * 0.007f, -D, hud_col);
+        // The lines are held to FIGHT_TEXT_W, inside the narrowest combiner (the F-16's).
+        const float text_w = D * FIGHT_TEXT_W;
+        if (c.status[0]) draw_string_fit(c.status, 0.0f, D * std::tan(0.112f), D * 0.007f, text_w, -D, hud_col);
         if (c.banner[0]) {
             const float by = D * std::tan(0.060f);
-            draw_string_centered(c.banner, 0.0f, by, D * 0.015f, -D, amber);
+            draw_string_fit(c.banner, 0.0f, by, D * 0.015f, text_w, -D, amber);
             float dy = D * 0.022f;
-            if (c.debrief[0]) draw_string_centered(c.debrief, 0.0f, by - dy, D * 0.008f, -D, amber);
+            if (c.debrief[0]) draw_string_fit(c.debrief, 0.0f, by - dy, D * 0.008f, text_w, -D, amber);
             if (c.debrief2[0]) {
                 dy += D * 0.013f;
-                draw_string_centered(c.debrief2, 0.0f, by - dy, D * 0.008f, -D, amber);
+                draw_string_fit(c.debrief2, 0.0f, by - dy, D * 0.008f, text_w, -D, amber);
             }
             draw_string_centered("F9 NEW FIGHT", 0.0f, by - dy - D * 0.014f, D * 0.008f, -D, amber);
         }
     }
+
+    /// Widest a fight status or debrief line is drawn, as a share of the HUD's
+    /// focal distance (about +-7.5 deg).
+    static constexpr float FIGHT_TEXT_W = 0.26f;
 
     /// @brief Threat cue under the heading tape: LOCK (steady amber) while a
     /// radar holds you, LAUNCH (flashing red) while a guided missile is inbound,

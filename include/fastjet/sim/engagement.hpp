@@ -3,6 +3,7 @@
 #include "fastjet/sim/bfm_pilot.hpp"
 #include "fastjet/sim/evasion_pilot.hpp"
 #include "fastjet/sim/missile_shooter.hpp"
+#include "fastjet/sim/radar_scope.hpp"
 #include "fastjet/sim/world.hpp"
 #include <array>
 #include <cmath>
@@ -33,8 +34,9 @@ enum class RangeProfile : uint8_t { STRAIGHT_AND_LEVEL, CONSTANT_TURN, WEAVE };
 
 /// @brief Which game is being played.
 enum class EngagementMode : uint8_t {
-    DOGFIGHT, ///< 1v1 guns BFM from a chosen set-up
-    EVADE,    ///< Defensive: a bandit with radar missiles and a gun hunts you from your six
+    DOGFIGHT,  ///< 1v1 guns BFM from a chosen set-up
+    EVADE,     ///< Defensive: a bandit with radar missiles and a gun hunts you from your six
+    INTERCEPT, ///< Offensive: you hunt a bandit who runs, breaks your locks and defeats your missiles
 };
 
 /// @brief Threat level for evade mode.
@@ -88,6 +90,61 @@ struct EvadeProfile {
     }
 };
 
+/// @brief How hard the bandit is to kill in intercept mode.
+enum class InterceptDifficulty : uint8_t { EASY, MEDIUM, HARD, EXPERT };
+
+[[nodiscard]] constexpr const char* to_string(InterceptDifficulty d) noexcept {
+    switch (d) {
+        case InterceptDifficulty::EASY:   return "EASY";
+        case InterceptDifficulty::MEDIUM: return "MEDIUM";
+        case InterceptDifficulty::HARD:   return "HARD";
+        case InterceptDifficulty::EXPERT: return "EXPERT";
+    }
+    return "?";
+}
+
+/**
+ * @brief What an intercept level changes: evade mode the other way round.
+ * You carry your jet's full missile load; the bandit runs for home and
+ * defends with what the level gives him. The physics never changes. What
+ * changes is whether he watches his RWR and how fast he reacts to a lock,
+ * his chaff and flares, whether he turns to fight when you close, how far
+ * ahead, how low and how fast he starts, and how fast he runs.
+ */
+struct InterceptProfile {
+    AiSkill pilot;               ///< His flying and gunnery when he fights back
+    double reaction_s;           ///< Lock held this long before he reacts (< 0: he never looks at his RWR)
+    bool chaff;
+    bool flares;
+    bool fights_back;            ///< Turns into you inside visual range, with the gun and his heat seekers
+    double notch_floor_agl_m;    ///< Height he dives to when notching your radar
+    double start_range_m;        ///< Ahead of you at the start
+    double off_nose_deg;         ///< Up to this far off your nose
+    double altitude_offset_m;    ///< His height relative to yours (+ above)
+    double speed_offset_mps;     ///< His speed relative to yours
+    double home_s;               ///< Time until he reaches friendly cover: kill him before then
+    double run_mach;             ///< Speed he runs at while nothing threatens him
+    const char* summary;
+
+    [[nodiscard]] static constexpr InterceptProfile of(InterceptDifficulty d) noexcept {
+        switch (d) {
+            case InterceptDifficulty::EASY:
+                return {AiSkill::NOVICE, -1.0, false, false, false, 1200.0, 5556.0, 10.0, 0.0, -20.0, 180.0, 0.85,
+                        "NOVICE, NO RWR, NO COUNTERMEASURES"};
+            case InterceptDifficulty::MEDIUM:
+                return {AiSkill::VETERAN, 2.0, true, false, false, 1200.0, 14816.0, 20.0, -300.0, 0.0, 180.0, 0.90,
+                        "VETERAN, NOTCHES AND CHAFFS"};
+            case InterceptDifficulty::HARD:
+                return {AiSkill::ACE, 1.0, true, true, false, 600.0, 22224.0, 30.0, -900.0, 30.0, 210.0, 1.10,
+                        "ACE, CHAFF AND FLARES, LOW AND FAST"};
+            case InterceptDifficulty::EXPERT:
+                return {AiSkill::ACE, 0.5, true, true, true, 600.0, 22224.0, 30.0, -900.0, 40.0, 210.0, 1.20,
+                        "ACE, CHAFF AND FLARES, FIGHTS BACK WITH HEAT SEEKERS"};
+        }
+        return of(InterceptDifficulty::MEDIUM);
+    }
+};
+
 enum class WeaponsLoadout : uint8_t {
     GUNS_ONLY,
     GUNS_AND_IR,
@@ -136,6 +193,7 @@ struct AiMissileDiscipline {
 struct EngagementSetup {
     EngagementMode mode{EngagementMode::DOGFIGHT};
     EvadeDifficulty evade_difficulty{EvadeDifficulty::MEDIUM};
+    InterceptDifficulty intercept_difficulty{InterceptDifficulty::MEDIUM};
     aircraft::AircraftType own_type{aircraft::AircraftType::F16_FIGHTING_FALCON};
     aircraft::AircraftType bandit_type{aircraft::AircraftType::F16_FIGHTING_FALCON};
     AiSkill skill{AiSkill::VETERAN};
@@ -150,7 +208,7 @@ struct EngagementSetup {
     bool own_is_ai{false};    ///< AI flies the player's jet too (tests, attract mode)
 };
 
-enum class EngagementOutcome : uint8_t { IN_PROGRESS, WIN, LOSS, MUTUAL_KILL, TIMEOUT, SURVIVED, ESCAPED };
+enum class EngagementOutcome : uint8_t { IN_PROGRESS, WIN, LOSS, MUTUAL_KILL, TIMEOUT, SURVIVED, ESCAPED, GOT_AWAY };
 
 [[nodiscard]] constexpr const char* to_string(EngagementOutcome o) noexcept {
     switch (o) {
@@ -161,6 +219,7 @@ enum class EngagementOutcome : uint8_t { IN_PROGRESS, WIN, LOSS, MUTUAL_KILL, TI
         case EngagementOutcome::TIMEOUT:     return "KNOCK IT OFF - TIME";
         case EngagementOutcome::SURVIVED:    return "SURVIVED - BANDIT RTB";
         case EngagementOutcome::ESCAPED:     return "ESCAPED - BANDIT LOST CONTACT";
+        case EngagementOutcome::GOT_AWAY:    return "BANDIT GOT AWAY";
     }
     return "?";
 }
@@ -181,6 +240,12 @@ struct EngagementStats {
     int chaff_used{0};
     int locks_broken_by_chaff{0};
     double time_locked_s{0.0};
+    // Intercept mode
+    int missiles_fired{0};
+    int missiles_missed{0};       ///< Your missiles that ran out of energy, time or track without fuzing
+    int locks_he_broke{0};        ///< Your radar locks and missile tracks his chaff or flares stole
+    double time_on_lock_s{0.0};   ///< You held a radar lock on him
+    double first_lock_s{-1.0};    ///< Fight time of your first lock (-1: never)
 };
 
 /**
@@ -255,7 +320,7 @@ public:
     MissileShooter shooter{};    ///< The bandit's missile shot decisions (evade mode)
     std::array<HeatSeekerShooter, World::kMaxAircraft> srm_shooters{}; ///< AI heat-seeker shots (dogfight)
     std::array<MissileShooter, World::kMaxAircraft> mrm_shooters{};    ///< AI radar-missile shots (dogfight)
-    EvasionPilot evader{};       ///< Flies the player's jet in an AI-flown evade (demo, tests)
+    EvasionPilot evader{};       ///< The defending jet: the player's in an AI-flown evade, the bandit in intercept
     EngagementStats stats{};
     EngagementOutcome outcome{EngagementOutcome::IN_PROGRESS};
     double end_time{-1.0};
@@ -269,15 +334,21 @@ public:
         end_time = -1.0;
         events_read_ = 0;
         ai_controlled.fill(false);
+        hunter_scope_ = RadarScope{};
+        hunter_scope_on_ = false;
 
         const double alt = s.altitude_m;
         const double v = s.speed_mps;
         const bool evade = s.mode == EngagementMode::EVADE;
+        const bool intercept = s.mode == EngagementMode::INTERCEPT;
         const EvadeProfile profile = EvadeProfile::of(s.evade_difficulty);
-        const AiSkill bandit_skill = evade ? profile.pilot : s.skill;
+        const InterceptProfile hunt = intercept_profile(s);
+        const AiSkill bandit_skill = evade ? profile.pilot : intercept ? hunt.pilot : s.skill;
         fdm::FlightState own{}, bandit{};
         if (evade) {
             evade_start(own, bandit, s, profile);
+        } else if (intercept) {
+            intercept_start(own, bandit, s, hunt);
         } else {
             switch (s.geometry) {
                 case StartGeometry::HEAD_ON_MERGE:
@@ -309,7 +380,7 @@ public:
         maws_memory_.fill(MawsMemory{});
 
         ai_controlled[OWN] = s.own_is_ai;
-        ai_controlled[BANDIT] = evade || s.geometry != StartGeometry::GUNNERY_RANGE;
+        ai_controlled[BANDIT] = evade || intercept || s.geometry != StartGeometry::GUNNERY_RANGE;
         for (int i = 0; i < world.count; ++i) {
             ai[static_cast<size_t>(i)] =
                 BfmPilot(i == BANDIT ? bandit_skill : s.skill, s.seed * 2654435761u + static_cast<uint32_t>(i) * 97u + 1u);
@@ -341,6 +412,44 @@ public:
             shooter.doctrine = radar ? profile.doctrine : LaunchDoctrine::NONE;
             shooter.shoot_shoot = profile.shoot_shoot;
             setup_data.time_limit_s = profile.survive_s;
+        } else if (intercept) {
+            // Your jet's full missile load against a bandit with a gun and,
+            // if he fights back, his heat seekers (used only once he has
+            // turned to fight), and the countermeasures his level gives him.
+            world.stores[OWN].load(own_loadout, true);
+            if (hunt.fights_back) {
+                world.stores[BANDIT].load(bandit_loadout, false);
+                const AiMissileDiscipline d = AiMissileDiscipline::of(hunt.pilot);
+                world.seekers[BANDIT].search_half_deg = d.off_boresight_deg;
+                srm_shooters[BANDIT].off_boresight_deg = d.off_boresight_deg;
+                srm_shooters[BANDIT].confirm_lock_s = d.confirm_lock_s;
+                srm_shooters[BANDIT].spacing_s = d.spacing_s;
+                srm_shooters[BANDIT].max_off_tail_deg = d.max_off_tail_deg;
+                srm_shooters[BANDIT].strong_off_tail_deg = d.strong_off_tail_deg;
+            }
+            world.chaff_load[BANDIT] = hunt.chaff ? World::DEFAULT_CHAFF : 0;
+            world.flare_load[BANDIT] = hunt.flares ? World::DEFAULT_FLARES : 0;
+            evader.floor_agl_m = hunt.notch_floor_agl_m;
+            evader.cruise_mach = hunt.run_mach;
+            setup_data.time_limit_s = hunt.home_s;
+            if (s.own_is_ai) {
+                const AiMissileDiscipline d = AiMissileDiscipline::of(s.skill);
+                world.seekers[OWN].search_half_deg = d.off_boresight_deg;
+                srm_shooters[OWN].off_boresight_deg = d.off_boresight_deg;
+                srm_shooters[OWN].confirm_lock_s = d.confirm_lock_s;
+                srm_shooters[OWN].spacing_s = d.spacing_s;
+                srm_shooters[OWN].max_off_tail_deg = d.max_off_tail_deg;
+                srm_shooters[OWN].strong_off_tail_deg = d.strong_off_tail_deg;
+                const bool rf = world.stores[OWN].mrm.count > 0 && world.radars[OWN].spec.fitted;
+                mrm_shooters[OWN].doctrine = rf ? d.mrm_doctrine : LaunchDoctrine::NONE;
+                // He works the radar the way the player has to: RWS search,
+                // designate what shows up, find him again after chaff.
+                hunter_scope_on_ = world.radars[OWN].spec.fitted;
+                if (hunter_scope_on_) {
+                    hunter_scope_.sync(world, OWN);
+                    hunter_scope_.set_master_mode(world, false);
+                }
+            }
         } else if (s.loadout != WeaponsLoadout::GUNS_ONLY) {
             // Dogfight: each jet's own heat seekers, and its radar missiles in the full load.
             const bool with_mrm = s.loadout == WeaponsLoadout::FULL_LOADOUT;
@@ -365,6 +474,9 @@ public:
         }
         chaff_at_start_ = world.chaff_load[OWN];
         unlocked_far_s_ = 0.0;
+        lock_held_s_ = 0.0;
+        bandit_fighting_ = false;
+        designate_wait_s_ = 0.0;
         eject_timer_.fill(0.0);
         range_pilot = RangeTargetPilot{};
         range_pilot.profile = s.range_profile;
@@ -400,6 +512,8 @@ public:
                                              evader.mode == EvasionPilot::Mode::LAST_DITCH;
                 const bool visual_fight = range < VISUAL_FIGHT_RANGE_M && !missile_defence;
                 controls[idx] = visual_fight ? bfm : defend;
+            } else if (ai_controlled[idx] && i == BANDIT && intercept_mode()) {
+                controls[idx] = intercept_bandit(dt, self, foe);
             } else if (ai_controlled[idx]) {
                 MissileThreat threat{};
                 if (!evade_mode()) {
@@ -421,21 +535,59 @@ public:
             const auto idx = static_cast<size_t>(i);
             if (ai_controlled[idx] && should_eject(i, dt)) controls[idx].eject = true;
         }
-        // Once the fight is decided the survivors hold fire.
+        // Once the fight is decided the survivors hold fire. In intercept, a
+        // bandit who has reached home is out of reach: no new shots, though
+        // the missiles already in the air still count.
         if (finished()) {
-            for (auto& c : controls) c.trigger = false;
+            for (auto& c : controls) c.trigger = c.pickle = false;
         } else if (evade_mode()) {
             (void)shooter.update(dt, world, BANDIT, OWN);
         } else {
+            if (bandit_home()) controls[OWN].trigger = controls[OWN].pickle = false;
+            if (hunter_scope_on_) operate_hunter_radar(dt);
             employ_missiles(dt);
         }
 
         world.step(dt, controls);
+        if (hunter_scope_on_) hunter_scope_.step(dt, world, OWN);
         tally(dt);
         judge();
     }
 
     [[nodiscard]] bool evade_mode() const noexcept { return setup_data.mode == EngagementMode::EVADE; }
+    [[nodiscard]] bool intercept_mode() const noexcept { return setup_data.mode == EngagementMode::INTERCEPT; }
+
+    /// @brief The intercept level as flown in @p s: a hunter without a radar
+    /// (the A-10C) finds his bandit with his eyes and heat seekers, so the
+    /// bandit starts inside their reach and no faster than the hunter.
+    [[nodiscard]] static InterceptProfile intercept_profile(const EngagementSetup& s) noexcept {
+        InterceptProfile p = InterceptProfile::of(s.intercept_difficulty);
+        if (!radar_spec(s.own_type).fitted) {
+            p.start_range_m = std::min(p.start_range_m, NO_RADAR_START_M);
+            p.speed_offset_mps = std::min(p.speed_offset_mps, -20.0);
+            // Chaff is no use against heat seekers: a bandit who would chaff
+            // a radar missile flares instead.
+            p.flares = p.flares || p.chaff;
+        }
+        return p;
+    }
+
+    /// @brief True while you hold the bandit: a radar lock or, in a jet
+    /// without a radar (the A-10C), heat-seeker tone on him.
+    [[nodiscard]] bool own_locked_on_bandit() const noexcept {
+        const FireControlRadar& r = world.radars[OWN];
+        if (r.spec.fitted) return r.locked() && r.target == BANDIT;
+        const IrSeeker& sk = world.seekers[OWN];
+        return sk.locked && sk.target == BANDIT;
+    }
+
+    /// @brief Intercept: the time is up and the bandit has reached home.
+    [[nodiscard]] bool bandit_home() const noexcept {
+        return intercept_mode() && world.time >= setup_data.time_limit_s;
+    }
+
+    /// The AI hunter's radar scope (intercept with own_is_ai; tests, --watch).
+    [[nodiscard]] const RadarScope& hunter_scope() const noexcept { return hunter_scope_; }
 
     /// Range inside which a pilot sees a missile whose motor is burning (its smoke trail) [m].
     static constexpr double VISUAL_MISSILE_SMOKE_M = 5000.0;
@@ -523,6 +675,16 @@ public:
     static constexpr double DOGFIGHT_CHASE_MACH = 1.4;
     static constexpr double EVADE_FAR_CHASE_Q_PA = 95000.0; ///< ~390 m/s at sea level, ~510 m/s at 5 km
     static constexpr double VISUAL_FIGHT_RANGE_M = 4000.0;
+    /// Intercept: a bandit this far away, with no lock on him and none of
+    /// your missiles in the air, has got away (after ESCAPE_HOLD_S).
+    static constexpr double INTERCEPT_ESCAPE_RANGE_M = 40000.0;
+    /// Intercept: the furthest a bandit starts from a hunter without a radar (3 nm).
+    static constexpr double NO_RADAR_START_M = 5556.0;
+    // Intercept start variety (see intercept_start).
+    static constexpr double START_RANGE_SPREAD = 0.15;      ///< +- this share of the level's range
+    static constexpr double START_HEIGHT_SPREAD_M = 300.0;  ///< +- on his height
+    static constexpr double START_SPEED_SPREAD_MPS = 15.0;  ///< +- on his speed
+    static constexpr double START_COURSE_SPREAD_DEG = 40.0; ///< +- on his course away from you
 
     /// Time an AI pilot takes to decide to eject from a doomed jet [s].
     static constexpr double EJECT_DECISION_S = 1.5;
@@ -544,6 +706,11 @@ private:
     int events_read_{0};
     int chaff_at_start_{0};
     double unlocked_far_s_{0.0};
+    double lock_held_s_{0.0};    ///< Intercept: how long the player's lock on the bandit has been held
+    bool bandit_fighting_{false};///< Intercept: the bandit has turned to fight (his missiles are free)
+    RadarScope hunter_scope_{};  ///< Intercept: an AI hunter's radar, worked by the player's rules
+    bool hunter_scope_on_{false};
+    double designate_wait_s_{0.0};
     std::array<double, World::kMaxAircraft> eject_timer_{};
 
     /// @brief Keep AI pilot @p i's memory of his own MAWS's threat: a passive
@@ -574,6 +741,10 @@ private:
         for (int i = 0; i < world.count; ++i) {
             const auto idx = static_cast<size_t>(i);
             if (!ai_controlled[idx]) continue;
+            // An intercept bandit shoots only once he has turned to fight,
+            // and nobody shoots at one who has reached home.
+            if (intercept_mode() && i == BANDIT && !bandit_fighting_) continue;
+            if (i == OWN && bandit_home()) continue;
             const int foe = i == OWN ? BANDIT : OWN;
             if (!srm_shooters[idx].update(dt, world, i, foe)) (void)mrm_shooters[idx].update(dt, world, i, foe);
         }
@@ -592,6 +763,106 @@ private:
         eject_timer_[idx] += dt;
         return eject_timer_[idx] >= EJECT_DECISION_S;
     }
+
+    /**
+     * @brief Intercept: the bandit's pilot. He runs for home and defends
+     * against you the way the AI defends the player's jet in evade mode
+     * (EvasionPilot): cold when painted, notch and chaff when locked, beam,
+     * chaff or flares and a last-ditch break against a missile. His level
+     * sets how much of it he does: a novice never looks at his RWR, the
+     * others react once your lock has held for their reaction time. An
+     * expert turns to fight with the gun once you are close enough to see.
+     */
+    [[nodiscard]] AircraftControls intercept_bandit(double dt, const Aircraft& self, const Aircraft& foe) noexcept {
+        const InterceptProfile p = intercept_profile(setup_data);
+        RwrStatus rwr{};
+        MissileThreat threat{};
+        if (p.reaction_s >= 0.0) {
+            rwr = world.rwr(BANDIT);
+            threat = detect_missile_threat(BANDIT);
+            remember_maws(BANDIT, threat, dt);
+            // A missile he can see (its smoke, or the missile itself close
+            // in) he defends as he would a MAWS call, timing the break by eye:
+            // otherwise a heat seeker that a passive MAWS lost at burnout went
+            // unanswered all the way in.
+            if (threat.inbound && !threat.maws && !threat.radar_guided) {
+                threat.maws = true;
+                threat.heat_seeker = true;
+            }
+            // Until the lock has held for his reaction time he has not taken
+            // it in: he only knows he is being painted.
+            lock_held_s_ = rwr.level >= RwrStatus::Level::LOCK ? lock_held_s_ + dt : 0.0;
+            if (rwr.level == RwrStatus::Level::LOCK && lock_held_s_ < p.reaction_s) rwr.level = RwrStatus::Level::SEARCH;
+        }
+        AircraftControls out = evader.update(dt, self, rwr, threat);
+        bandit_fighting_ = false;
+        if (p.fights_back) {
+            const AircraftControls bfm = ai[BANDIT].update(dt, self, foe, threat);
+            const bool missile_defence = evader.mode == EvasionPilot::Mode::NOTCH_MISSILE ||
+                                         evader.mode == EvasionPilot::Mode::LAST_DITCH;
+            const double range = (foe.position() - self.position()).norm();
+            if (range < VISUAL_FIGHT_RANGE_M && !missile_defence) {
+                bandit_fighting_ = true;
+                const bool chaff = out.dispense, flare = out.dispense_flare;
+                out = bfm;
+                out.dispense = out.dispense || chaff;
+                out.dispense_flare = out.dispense_flare || flare;
+            }
+        } else {
+            out.trigger = false;
+        }
+        out.pickle = false;
+        return out;
+    }
+
+    /**
+     * @brief Intercept, AI hunter: work the radar scope as the player has to.
+     * In RWS he designates a contact once it has been on the scope for
+     * HUNTER_DESIGNATE_S (seeing it and slewing the cursor onto it); inside
+     * visual range he selects ACM, which locks by itself, and goes back to
+     * CRM once the fight opens out again.
+     */
+    void operate_hunter_radar(double dt) noexcept {
+        RadarScope& sc = hunter_scope_;
+        sc.sync(world, OWN);
+        const double range = (world.aircraft[BANDIT].position() - world.aircraft[OWN].position()).norm();
+        if (sc.mode != RadarScope::Mode::STT) {
+            if (!sc.acm && range < VISUAL_FIGHT_RANGE_M) sc.set_master_mode(world, true);
+            else if (sc.acm && range > 2.0 * VISUAL_FIGHT_RANGE_M) sc.set_master_mode(world, false);
+        }
+        if (sc.mode == RadarScope::Mode::RWS && sc.cursor_hit()) {
+            designate_wait_s_ += dt;
+            if (designate_wait_s_ >= HUNTER_DESIGNATE_S) {
+                (void)sc.designate(world);
+                designate_wait_s_ = 0.0;
+            }
+        } else {
+            designate_wait_s_ = 0.0;
+        }
+    }
+
+    /// An AI hunter's time from a contact on the scope to designating it [s].
+    static constexpr double HUNTER_DESIGNATE_S = 1.0;
+
+    /// @brief Intercept start: you heading north, the bandit ahead of you
+    /// (off your nose, either side), heading away, lower and faster at the
+    /// harder levels. Range, height, speed and his course all vary a little,
+    /// so no two fights at a level open the same way.
+    static void intercept_start(fdm::FlightState& own, fdm::FlightState& bandit, const EngagementSetup& s,
+                                const InterceptProfile& p) noexcept {
+        DamageRng rng{s.seed * 0x85EBCA6Bu + 0xC2B2AE35u};
+        const double side = rng.uniform() < 0.5 ? -1.0 : 1.0;
+        const double off = p.off_nose_deg * rng.uniform() * (M_PI / 180.0);
+        const double range = p.start_range_m * (1.0 + START_RANGE_SPREAD * (2.0 * rng.uniform() - 1.0));
+        const double height = p.altitude_offset_m + (rng.uniform() - 0.5) * 2.0 * START_HEIGHT_SPREAD_M;
+        const double speed = p.speed_offset_mps + (rng.uniform() - 0.5) * 2.0 * START_SPEED_SPREAD_MPS;
+        own = make_state({0.0, 0.0, -s.altitude_m}, 0.0, s.speed_mps);
+        const math::Vector3 pos{range * std::cos(off), side * range * std::sin(off), -(s.altitude_m + height)};
+        // Running for home: away from you, give or take START_COURSE_SPREAD_DEG.
+        const double heading = side * off + (rng.uniform() - 0.5) * (2.0 * START_COURSE_SPREAD_DEG * M_PI / 180.0);
+        bandit = make_state(pos, heading, s.speed_mps + speed);
+    }
+
 
     /**
      * @brief Evade start: you heading north, the bandit behind you, nose on,
@@ -651,18 +922,36 @@ private:
         stats.rounds_fired = me.gun.rounds_fired;
         stats.chaff_used = chaff_at_start_ - world.chaff_load[OWN];
         if (!finished() && world.rwr(OWN).level >= RwrStatus::Level::LOCK) stats.time_locked_s += dt;
+        if (!finished() && own_locked_on_bandit()) {
+            stats.time_on_lock_s += dt;
+            if (stats.first_lock_s < 0.0) stats.first_lock_s = stats.duration_s;
+        }
         for (; events_read_ < world.event_count(); ++events_read_) {
+            // What happens after the result (a salvo's second missile running
+            // out after the kill) is not part of the score.
+            if (finished()) continue;
             const CombatEvent& e = world.event(events_read_);
             const bool at_me = e.victim == OWN;
+            const bool at_him = e.victim == BANDIT;
             switch (e.kind) {
                 case CombatEvent::Kind::HIT:
                     if (e.shooter == OWN) ++stats.hits_scored;
                     if (at_me) ++stats.hits_taken;
                     break;
-                case CombatEvent::Kind::MISSILE_LAUNCH:     stats.missiles_at_you += at_me; break;
-                case CombatEvent::Kind::MISSILE_DEFEATED:   stats.missiles_defeated += at_me; break;
+                case CombatEvent::Kind::MISSILE_LAUNCH:
+                    stats.missiles_at_you += at_me;
+                    stats.missiles_fired += e.shooter == OWN;
+                    break;
+                case CombatEvent::Kind::MISSILE_DEFEATED:
+                    stats.missiles_defeated += at_me;
+                    stats.missiles_missed += at_him && e.shooter == OWN;
+                    break;
                 case CombatEvent::Kind::MISSILE_DETONATION: stats.missile_detonations += at_me; break;
-                case CombatEvent::Kind::LOCK_BROKEN_CHAFF:  stats.locks_broken_by_chaff += at_me; break;
+                case CombatEvent::Kind::LOCK_BROKEN_CHAFF:
+                    stats.locks_broken_by_chaff += at_me;
+                    stats.locks_he_broke += at_him && e.shooter == OWN;
+                    break;
+                case CombatEvent::Kind::LOCK_BROKEN_FLARE: stats.locks_he_broke += at_him && e.shooter == OWN; break;
                 default: break;
             }
         }
@@ -676,6 +965,7 @@ private:
         else if (bandit_out) outcome = EngagementOutcome::WIN;
         else if (own_out) outcome = EngagementOutcome::LOSS;
         else if (evade_mode()) judge_evade();
+        else if (intercept_mode()) judge_intercept();
         else if (world.time >= setup_data.time_limit_s) outcome = EngagementOutcome::TIMEOUT;
         if (finished()) end_time = world.time;
     }
@@ -693,6 +983,23 @@ private:
         unlocked_far_s_ = lost ? unlocked_far_s_ + DT : 0.0;
         if (world.time >= setup_data.time_limit_s || winchester) outcome = EngagementOutcome::SURVIVED;
         else if (unlocked_far_s_ >= ESCAPE_HOLD_S) outcome = EngagementOutcome::ESCAPED;
+    }
+
+    /// @brief Intercept ends when he reaches home (the time limit; your
+    /// missiles already in the air still get their chance), when you are out
+    /// of weapons with nothing in the air (Winchester), or when he has opened
+    /// beyond INTERCEPT_ESCAPE_RANGE_M with no lock on him for long enough.
+    void judge_intercept() noexcept {
+        constexpr double DT = Aircraft::DT;
+        const auto o = static_cast<size_t>(OWN);
+        const bool nothing_out = world.missiles_in_flight(OWN, BANDIT) == 0;
+        const bool winchester = world.stores[o].missiles() == 0 && world.aircraft[o].gun.ammo == 0 && nothing_out;
+        const double range = (world.aircraft[BANDIT].position() - world.aircraft[o].position()).norm();
+        const bool gone = !own_locked_on_bandit() && nothing_out && range > INTERCEPT_ESCAPE_RANGE_M;
+        unlocked_far_s_ = gone ? unlocked_far_s_ + DT : 0.0;
+        if ((bandit_home() && nothing_out) || winchester || unlocked_far_s_ >= ESCAPE_HOLD_S) {
+            outcome = EngagementOutcome::GOT_AWAY;
+        }
     }
 };
 

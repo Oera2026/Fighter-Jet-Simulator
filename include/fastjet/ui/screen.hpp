@@ -30,6 +30,8 @@ enum class ScreenId : uint8_t {
     DOGFIGHT_LOADOUT,
     DOGFIGHT_SKILL,
     DOGFIGHT_AIRCRAFT,
+    INTERCEPT_DIFFICULTY,
+    INTERCEPT_AIRCRAFT,
     COUNT
 };
 
@@ -40,6 +42,7 @@ enum class MenuAction : uint8_t {
     OPEN_MISSION_SELECT, ///< Hand over to the tactical aircraft/sortie menu
     START_DOGFIGHT,      ///< Begin a 1v1 guns engagement against an AI bandit
     START_EVADE,         ///< Begin evade mode with MenuSystem::evade_choice(): survive a bandit hunting you
+    START_INTERCEPT,     ///< Begin intercept mode with MenuSystem::intercept_choice(): lock up and kill a bandit who runs
     QUIT,
 };
 

@@ -103,6 +103,8 @@ public:
         flare_timer_.fill(0.0);
         prev_flare_.fill(false);
         prev_pickle_.fill(false);
+        search_painter_.fill(-1);
+        search_heard_until_.fill(0.0);
         for (auto& s : seats) s.reset();
         event_count_ = 0;
         seed_ = seed;
@@ -178,7 +180,7 @@ public:
     static constexpr int DEFAULT_CHAFF = 60;
 
     /// @brief What the latest pickle press did (for a "NO LOCK" cue).
-    enum class LaunchCue : uint8_t { NONE, LAUNCH, NO_LOCK, EMPTY };
+    enum class LaunchCue : uint8_t { NONE, LAUNCH, NO_LOCK, EMPTY, GUN };
     std::array<LaunchCue, kMaxAircraft> launch_cue{};
     std::array<int, kMaxAircraft> pickle_presses{}; ///< Counts presses, so a display can tell a new one
 
@@ -249,6 +251,19 @@ public:
         return n;
     }
 
+    /// How long an RWR keeps showing a search radar after its beam last swept
+    /// over the jet: longer than a full RWS frame (about 7.5 s for A6, 4 bars).
+    static constexpr double RWR_SEARCH_HOLD_S = 8.0;
+
+    /// @brief A search scan's beam is on @p target: its RWR hears @p emitter
+    /// (World::rwr) for RWR_SEARCH_HOLD_S. Called by RadarScope, whose RWS
+    /// scan otherwise leaves the fire-control radar off.
+    void note_search_paint(int emitter, int target) noexcept {
+        if (target < 0 || target >= count || emitter == target) return;
+        search_painter_[static_cast<size_t>(target)] = emitter;
+        search_heard_until_[static_cast<size_t>(target)] = time + RWR_SEARCH_HOLD_S;
+    }
+
     /// @brief What @p i's radar warning receiver shows.
     [[nodiscard]] RwrStatus rwr(int i) const noexcept {
         RwrStatus s;
@@ -265,6 +280,18 @@ public:
             s.emitter_valid = true;
             s.emitter_bearing = RwrStatus::relative_bearing(own.state, e.position());
             s.emitter_symbol = r.spec.rwr_symbol;
+        }
+        // A search radar's beam swept over him lately (a pilot's RWS scan).
+        const auto ii = static_cast<size_t>(i);
+        const int p = search_painter_[ii];
+        if (p >= 0 && p < count && time < search_heard_until_[ii] &&
+            aircraft[static_cast<size_t>(p)].alive()) {
+            raise(RwrStatus::Level::SEARCH);
+            if (!s.emitter_valid) {
+                s.emitter_valid = true;
+                s.emitter_bearing = RwrStatus::relative_bearing(own.state, aircraft[static_cast<size_t>(p)].position());
+                s.emitter_symbol = radars[static_cast<size_t>(p)].spec.rwr_symbol;
+            }
         }
         double nearest = 1e18;
         for (const auto& m : missiles) {
@@ -361,6 +388,8 @@ private:
     std::array<double, kMaxAircraft> flare_timer_{};
     std::array<bool, kMaxAircraft> prev_flare_{};
     std::array<bool, kMaxAircraft> prev_pickle_{};
+    std::array<int, kMaxAircraft> search_painter_{};        ///< Who last swept a search beam over each jet
+    std::array<double, kMaxAircraft> search_heard_until_{}; ///< ...and until when his RWR shows it
 
     /// @brief Countermeasures, radars and missiles. Kept out of line so that
     /// step() compiles the aircraft pipeline exactly as the single-jet
@@ -405,8 +434,11 @@ private:
             if (!pressed || !aircraft[idx].alive()) continue;
             const WeaponSel sel = stores[idx].selected;
             const MissileStore* st = stores[idx].selected_store();
-            if (st == nullptr) continue; // Gun selected: the pickle does nothing
             ++pickle_presses[idx];
+            if (st == nullptr) { // Gun selected: the pickle fires nothing
+                launch_cue[idx] = LaunchCue::GUN;
+                continue;
+            }
             if (st->count <= 0) {
                 launch_cue[idx] = LaunchCue::EMPTY;
                 continue;

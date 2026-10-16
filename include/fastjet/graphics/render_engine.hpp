@@ -14,6 +14,7 @@
 #include "fastjet/graphics/exhaust_plume.hpp"
 #include "fastjet/graphics/escape_renderer.hpp"
 #include "fastjet/graphics/jet_airframes.hpp"
+#include "fastjet/graphics/jet_assets.hpp"
 #include "fastjet/graphics/jet_cockpits.hpp"
 #include "fastjet/graphics/frame_context.hpp"
 #include "fastjet/graphics/hdr_pipeline.hpp"
@@ -59,9 +60,15 @@ private:
     CockpitGauges gauges_;
     SkyGroundRenderer environment_;
     ModelGLB f16_model_;
-    /// Procedural airframes of the other jets (jet_airframes.hpp), built
-    /// the first time each type is seen.
+    /// The other jets as seen from outside: their assets (jet_assets.hpp),
+    /// or their procedural airframes (jet_airframes.hpp) where they have
+    /// none, built the first time each type is seen.
     std::array<std::unique_ptr<ModelGLB>, 6> airframes_{};
+    std::array<bool, 6> airframe_built_{};
+    std::array<bool, 6> airframe_asset_{};  ///< airframes_[i] is drawn from its asset
+    /// The procedural airframes seen from the seat: they fit the procedural
+    /// cockpit shells (canopy, sills, coaming) the other jets are flown from.
+    std::array<std::unique_ptr<ModelGLB>, 6> hulls_{};
     AircraftMenu aircraft_menu_;
     UiCanvas ui_canvas_;
     ColorFilterPass color_filter_;
@@ -201,6 +208,7 @@ private:
             glClear(GL_DEPTH_BUFFER_BIT);
 
             ModelGLB& model = airframe(slot.type);
+            model.set_joints(JointPose{}); // doors shut, nozzle aft
             // Fit the airframe's bounding sphere to the slot.
             const BodyBounds b = model.part_bounds(F16PartType::AIRFRAME, ModelAlignment::WORLD);
             float r = 8.0f;
@@ -408,7 +416,8 @@ private:
         // procedural jets' own cockpit shell stands in for their interior).
         if (ownship_visible_) {
             const bool f16 = cockpit_type_ == aircraft::AircraftType::F16_FIGHTING_FALCON;
-            airframe(cockpit_type_, stovl, ownship_bay_).render_shadow(shadow_map_, state, gear_down, align, f16 || chase);
+            ModelGLB& m = chase ? airframe(cockpit_type_, stovl, ownship_bay_) : hull(cockpit_type_, stovl, ownship_bay_);
+            m.render_shadow(shadow_map_, state, gear_down, align, f16 || chase);
         }
         if (!chase && !asset_cockpit_) {
             // The cockpit shades itself too: glare shield onto the panel,
@@ -473,10 +482,11 @@ private:
     void render_lift_jets(const Mat4& view_proj_rot, const fdm::FlightState& state, const math::Vector3& eye,
                           const AvionicsTelemetry& t, float afterburner, float glow) {
         static constexpr aircraft::StovlConfig kCfg = aircraft::AircraftConfig::get(aircraft::AircraftType::F35B_LIGHTNING_II).stovl;
+        constexpr auto kF35b = aircraft::AircraftType::F35B_LIGHTNING_II;
         const propulsion::StovlStatus& st = t.stovl;
-        const StovlPose pose = f35b_stovl_pose(st);
+        const StovlPose pose = airframe_asset_[static_cast<size_t>(kF35b)] ? f35b_asset_pose(st) : f35b_stovl_pose(st);
         const float time = static_cast<float>(time_s_);
-        const float r = airframe_info(aircraft::AircraftType::F35B_LIGHTNING_II).nozzles[0].radius;
+        const float r = exterior_info(kF35b).nozzles[0].radius;
         const float k = r / ExhaustPlume::kNozzleRadius;
         exhaust_.render(view_proj_rot,
                         jet_matrix(state, eye, pose.nozzle_pos, pose.nozzle_dir, ExhaustPlume::kNozzleRadius * k,
@@ -502,22 +512,73 @@ private:
     /// nothing moves on the others).
     ModelGLB& airframe(aircraft::AircraftType type, const propulsion::StovlStatus& stovl, const WeaponBayDoors& bay) {
         ModelGLB& m = airframe(type);
-        if (type == aircraft::AircraftType::F35B_LIGHTNING_II) m.set_joints(f35b_stovl_pose(stovl, bay).joints);
+        if (type == aircraft::AircraftType::F35B_LIGHTNING_II) {
+            m.set_joints(airframe_asset_[static_cast<size_t>(type)] ? f35b_asset_pose(stovl, bay).joints
+                                                                    : f35b_stovl_pose(stovl, bay).joints);
+        }
         return m;
     }
 
-    /// @brief The airframe model for @p type: the F-16C's asset, or the
-    /// type's procedural model (built on first use).
+    /// @brief The airframe model for @p type seen from outside: the F-16C's
+    /// asset, the type's own asset, or failing that its procedural model
+    /// (built on first use).
     ModelGLB& airframe(aircraft::AircraftType type) {
         if (type == aircraft::AircraftType::F16_FIGHTING_FALCON) return f16_model_;
-        auto& slot = airframes_[static_cast<size_t>(type) % airframes_.size()];
+        const size_t i = static_cast<size_t>(type) % airframes_.size();
+        auto& slot = airframes_[i];
+        if (!slot) slot = std::make_unique<ModelGLB>();
+        if (!airframe_built_[i]) {
+            airframe_built_[i] = true;
+            if (!slot->init()) return *slot;
+            const AirframeAsset asset = airframe_asset(type);
+            if (asset.path && slot->load(asset.path, asset.placement, asset.cutaway)) {
+                airframe_asset_[i] = true;
+                if (type == aircraft::AircraftType::F35B_LIGHTNING_II) slot->add_body_parts(f35b_asset_parts());
+            } else {
+                ModelPlacement placement;
+                const std::vector<ProceduralPart> parts = build_airframe(type, placement);
+                slot->load_procedural(parts, placement);
+            }
+        }
+        return *slot;
+    }
+
+    /// @brief The airframe around the pilot in the cockpit view: the
+    /// F-16C's asset, or the type's procedural model, posed like airframe().
+    ModelGLB& hull(aircraft::AircraftType type, const propulsion::StovlStatus& stovl, const WeaponBayDoors& bay) {
+        if (type == aircraft::AircraftType::F16_FIGHTING_FALCON) return f16_model_;
+        auto& slot = hulls_[static_cast<size_t>(type) % hulls_.size()];
         if (!slot) {
             slot = std::make_unique<ModelGLB>();
             ModelPlacement placement;
             const std::vector<ProceduralPart> parts = build_airframe(type, placement);
             if (slot->init()) slot->load_procedural(parts, placement);
         }
+        if (type == aircraft::AircraftType::F35B_LIGHTNING_II) slot->set_joints(f35b_stovl_pose(stovl, bay).joints);
         return *slot;
+    }
+
+    /// @brief Exhausts and the rest of @p type's airframe description, for
+    /// the model drawn outside: an asset's nozzles stand where it has them.
+    [[nodiscard]] AirframeInfo exterior_info(aircraft::AircraftType type) const {
+        AirframeInfo info = airframe_info(type);
+        if (airframe_asset_[static_cast<size_t>(type) % airframe_asset_.size()]) {
+            const AirframeAsset asset = airframe_asset(type);
+            info.nozzles = asset.nozzles;
+            info.nozzle_count = asset.nozzle_count;
+        }
+        return info;
+    }
+
+    /// @brief Puts one prefetched asset on the GPU, if one is ready: a frame
+    /// takes at most one upload, so they spread out instead of stalling.
+    void stream_airframes() {
+        for (size_t i = 0; i < airframes_.size(); ++i) {
+            if (airframes_[i] && !airframe_built_[i] && airframes_[i]->prefetch_ready()) {
+                airframe(static_cast<aircraft::AircraftType>(i));
+                return;
+            }
+        }
     }
 
 public:
@@ -601,6 +662,25 @@ public:
 
     [[nodiscard]] aircraft::AircraftType cockpit_type() const noexcept { return cockpit_type_; }
 
+    /// @brief Starts reading and decoding every jet's airframe asset on the
+    /// worker threads; each goes up to the GPU in a later frame, or when its
+    /// jet is first drawn. Call after init().
+    void prefetch_airframes() {
+        for (size_t i = 0; i < airframes_.size(); ++i) {
+            const AirframeAsset asset = airframe_asset(static_cast<aircraft::AircraftType>(i));
+            if (!asset.path || airframes_[i]) continue;
+            airframes_[i] = std::make_unique<ModelGLB>();
+            airframes_[i]->prefetch(asset.path);
+        }
+    }
+
+    /// @brief True if @p type is drawn from its glTF asset outside the
+    /// cockpit (the F-16C always is; the others once their asset has loaded).
+    [[nodiscard]] bool exterior_from_asset(aircraft::AircraftType type) const noexcept {
+        if (type == aircraft::AircraftType::F16_FIGHTING_FALCON) return f16_model_.is_loaded();
+        return airframe_asset_[static_cast<size_t>(type) % airframe_asset_.size()];
+    }
+
     void set_viewport(int width, int height) noexcept {
         viewport_width_  = width;
         viewport_height_ = height;
@@ -630,6 +710,9 @@ public:
         environment_.destroy();
         f16_model_.destroy();
         for (auto& a : airframes_) a.reset();
+        for (auto& h : hulls_) h.reset();
+        airframe_built_.fill(false);
+        airframe_asset_.fill(false);
         aircraft_menu_.destroy();
         ui_canvas_.destroy();
         color_filter_.destroy();
@@ -664,6 +747,7 @@ public:
         // A new jet brings its own cockpit (before the displays are drawn:
         // the instrument atlas may change size with it).
         if (telemetry.aircraft_type != cockpit_type_) apply_cockpit(telemetry.aircraft_type);
+        stream_airframes();
 
         // -------------------------------------------------------------------
         // 0. Update dynamic systems and cameras
@@ -796,7 +880,7 @@ public:
                     float afterburner = 0.0f;
                     float glow = 0.0f;
                     exhaust_levels(telemetry, afterburner, glow);
-                    const AirframeInfo info = airframe_info(cockpit_type_);
+                    const AirframeInfo info = exterior_info(cockpit_type_);
                     if (!info.afterburner) {
                         afterburner = 0.0f; // turbofans without reheat: only a faint hot core
                         glow *= 0.35f;
@@ -902,7 +986,7 @@ public:
             if (cockpit_type_ == aircraft::AircraftType::F16_FIGHTING_FALCON) {
                 f16_model_.render_cockpit(proj_cockpit, view_cockpit, state, ctx, eye_b, asset_cockpit_);
             } else {
-                airframe(cockpit_type_, telemetry.stovl, ownship_bay_)
+                hull(cockpit_type_, telemetry.stovl, ownship_bay_)
                     .render_cockpit(proj_cockpit, view_cockpit, state, ctx, eye_b, false);
             }
 

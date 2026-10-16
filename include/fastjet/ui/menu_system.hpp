@@ -44,6 +44,10 @@ public:
             std::make_unique<EvadeSetupScreen>(EvadeSetupScreen::Step::DIFFICULTY, evade_choice_);
         screens_[index(ScreenId::EVADE_AIRCRAFT)] =
             std::make_unique<EvadeSetupScreen>(EvadeSetupScreen::Step::AIRCRAFT, evade_choice_);
+        screens_[index(ScreenId::INTERCEPT_DIFFICULTY)] = std::make_unique<EvadeSetupScreen>(
+            EvadeSetupScreen::Step::DIFFICULTY, intercept_choice_, EvadeSetupScreen::Game::INTERCEPT);
+        screens_[index(ScreenId::INTERCEPT_AIRCRAFT)] = std::make_unique<EvadeSetupScreen>(
+            EvadeSetupScreen::Step::AIRCRAFT, intercept_choice_, EvadeSetupScreen::Game::INTERCEPT);
         screens_[index(ScreenId::DOGFIGHT_GEOMETRY)] =
             std::make_unique<DogfightSetupScreen>(DogfightSetupScreen::Step::GEOMETRY, dogfight_choice_);
         screens_[index(ScreenId::DOGFIGHT_LOADOUT)] =
@@ -68,6 +72,8 @@ public:
     void set_current_aircraft(aircraft::AircraftType type) noexcept { current_aircraft_ = type; }
     /// @brief Difficulty index (sim::EvadeDifficulty order) the evade set-up opens on.
     void set_evade_difficulty(int difficulty) noexcept { evade_choice_.difficulty = difficulty; }
+    /// @brief Difficulty index (sim::InterceptDifficulty order) the intercept set-up opens on.
+    void set_intercept_difficulty(int difficulty) noexcept { intercept_choice_.difficulty = difficulty; }
     [[nodiscard]] const DogfightChoice& dogfight_choice() const noexcept { return dogfight_choice_; }
     [[nodiscard]] DogfightChoice& dogfight_choice() noexcept { return dogfight_choice_; }
     /// @brief Quality preset the GL context was created with (restart detection).
@@ -247,6 +253,8 @@ public:
     [[nodiscard]] const std::optional<std::string>& toast_text() const noexcept { return toast_text_; }
     /// @brief Threat level and jet picked on the evade set-up screens (read on START_EVADE).
     [[nodiscard]] const EvadeChoice& evade_choice() const noexcept { return evade_choice_; }
+    /// @brief Bandit level and jet picked on the intercept set-up screens (read on START_INTERCEPT).
+    [[nodiscard]] const EvadeChoice& intercept_choice() const noexcept { return intercept_choice_; }
 
 private:
     // -- State -----------------------------------------------------------------
@@ -304,6 +312,7 @@ private:
     std::string status_;
     aircraft::AircraftType current_aircraft_ = aircraft::AircraftType::F16_FIGHTING_FALCON;
     EvadeChoice evade_choice_{};
+    EvadeChoice intercept_choice_{};
     DogfightChoice dogfight_choice_{};
     QualityPreset launch_quality_ = QualityPreset::ULTRA;
 

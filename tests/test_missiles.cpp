@@ -370,9 +370,10 @@ void test_stores_and_weapon_select() {
         c[0].pickle = false;
         w->step(DT, c);
     };
-    // Gun selected: the pickle does nothing.
+    // Gun selected: the pickle fires nothing, but the press is answered (GUN SEL cue).
     pickle();
-    assert(w->missiles_in_flight() == 0 && w->pickle_presses[0] == 0);
+    assert(w->missiles_in_flight() == 0 && w->pickle_presses[0] == 1);
+    assert(w->launch_cue[0] == sim::World::LaunchCue::GUN);
 
     // SRM: the seeker uncages and locks the target's tail; the pickle fires a heat seeker.
     assert(st.cycle() == sim::WeaponSel::SRM);

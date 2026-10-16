@@ -80,6 +80,8 @@ public:
     static constexpr double ELEV_SLEW_RAD_S = 8.0 * DEG;
     /// Search detection range against a fighter, as a multiple of the lock-on range.
     static constexpr double DETECTION_RANGE_FACTOR = 1.25;
+    /// A target's RWR hears the RWS scan out to this multiple of the detection range.
+    static constexpr double RWR_HEARS_SEARCH_FACTOR = 1.5;
     static constexpr int HISTORY_FRAMES = 3;
     static constexpr int kMaxHits = 32;
     static constexpr double ACQUIRE_S = 0.1;      ///< Designation to STT with the jet in the beam
@@ -418,7 +420,7 @@ private:
         return std::clamp((rd - range) / (0.25 * rd), 0.0, 1.0);
     }
 
-    void paint(const World& w, const Aircraft& self) noexcept {
+    void paint(World& w, const Aircraft& self) noexcept {
         const math::Vector3 beam = beam_ned(self, false);
         const math::Vector3 nose = self.state.q_att.rotate_body_to_ned(math::Vector3(1.0, 0.0, 0.0));
         const SensorLimits lim = search_limits(detection_range_m());
@@ -427,6 +429,9 @@ private:
             const Aircraft& t = w.aircraft[static_cast<size_t>(j)];
             const math::Vector3 los = t.position() - self.position();
             const bool inside = !t.crashed && AirCombatGeometry::angle_between(beam, los) < BEAM_HALF_RAD;
+            // His RWR hears the beam sweep over him, further out than the
+            // radar can see him.
+            if (inside && los.norm() < RWR_HEARS_SEARCH_FACTOR * detection_range_m()) w.note_search_paint(own_, j);
             const bool entered = inside && !in_beam_[static_cast<size_t>(j)];
             in_beam_[static_cast<size_t>(j)] = inside;
             if (!entered) continue;

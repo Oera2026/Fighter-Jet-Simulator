@@ -10,9 +10,10 @@
 
 namespace fastjet::ui {
 
-/// @brief What the evade set-up screens have chosen; read by the host on START_EVADE.
+/// @brief What the evade (or intercept) set-up screens have chosen; read by
+/// the host on START_EVADE (START_INTERCEPT).
 struct EvadeChoice {
-    int difficulty = 1; ///< 0 EASY .. 3 EXPERT, the order of sim::EvadeDifficulty
+    int difficulty = 1; ///< 0 EASY .. 3 EXPERT, the order of sim::EvadeDifficulty / sim::InterceptDifficulty
     aircraft::AircraftType jet = aircraft::AircraftType::F16_FIGHTING_FALCON;
 };
 
@@ -40,23 +41,41 @@ inline constexpr std::array<EvadeDifficultyInfo, 4> kEvadeDifficulties = {{
      "6 nm behind, 3,000 ft above, 115 kt faster", "Two missiles per shot: one defence will not beat both."},
 }};
 
+/// @brief Intercept levels as the menu describes them (the same fields: the
+/// time is how long he takes to reach home, `weapons` his defences). The
+/// numbers mirror sim::InterceptProfile; test_intercept_mode checks they agree.
+inline constexpr std::array<EvadeDifficultyInfo, 4> kInterceptDifficulties = {{
+    {"EASY", 180, 3.0, "Novice pilot, never looks at his RWR", "None: no chaff, no flares",
+     "3 nm ahead of you, level, a little slower", "Lock him up and shoot: he flies straight on."},
+    {"MEDIUM", 180, 8.0, "Veteran pilot, hears your radar, reacts to a lock in 2 s", "Notches your radar and drops chaff",
+     "8 nm ahead, 1,000 ft below", "Keep him off your beam: a notching bandit breaks the lock."},
+    {"HARD", 210, 12.0, "Ace pilot, reacts to a lock in 1 s", "Chaff and flares, notches low",
+     "12 nm ahead, 3,000 ft below, faster; runs at Mach 1.1", "Close in before you shoot: long shots get defeated."},
+    {"EXPERT", 210, 12.0, "Ace pilot, reacts to a lock in 0.5 s", "Chaff and flares; turns and fights with heat seekers",
+     "12 nm ahead, 3,000 ft below; runs at Mach 1.2", "Inside 2 nm he turns on you: shoot first or be ready to fight."},
+}};
+
 inline constexpr std::array<aircraft::AircraftType, 6> kEvadeJets = {
     aircraft::AircraftType::F16_FIGHTING_FALCON, aircraft::AircraftType::F15EX_EAGLE_II,
     aircraft::AircraftType::EUROFIGHTER_TYPHOON, aircraft::AircraftType::F22_RAPTOR,
     aircraft::AircraftType::A10_THUNDERBOLT, aircraft::AircraftType::F35B_LIGHTNING_II};
 
-/// @brief Evade set-up, in two steps: the threat level, then your jet. Each
-/// list works like a radio group: the focused entry is the choice, ENTER on
-/// it (or the footer's primary button) moves on, BACK returns a step.
+/// @brief Evade (or intercept) set-up, in two steps: the threat level, then
+/// your jet. Each list works like a radio group: the focused entry is the
+/// choice, ENTER on it (or the footer's primary button) moves on, BACK
+/// returns a step.
 class EvadeSetupScreen final : public Screen {
 public:
     enum class Step : uint8_t { DIFFICULTY, AIRCRAFT };
+    /// Evade: survive a bandit hunting you. Intercept: hunt one who runs.
+    enum class Game : uint8_t { EVADE, INTERCEPT };
 
     static constexpr WidgetId kOptionBase = 1; ///< Options are kOptionBase + index
     static constexpr WidgetId kBack = 100;
     static constexpr WidgetId kGo = 101;
 
-    EvadeSetupScreen(Step step, EvadeChoice& choice) noexcept : step_(step), choice_(choice) {}
+    EvadeSetupScreen(Step step, EvadeChoice& choice, Game game = Game::EVADE) noexcept
+        : step_(step), game_(game), choice_(choice) {}
 
     void on_enter(MenuServices& svc) override {
         // The jet list opens on the airframe you are flying.
@@ -95,9 +114,9 @@ public:
             o.kind = WidgetKind::BUTTON;
             o.variant = ButtonVariant::MENU;
             if (step_ == Step::DIFFICULTY) {
-                const EvadeDifficultyInfo& d = kEvadeDifficulties[static_cast<size_t>(i)];
+                const EvadeDifficultyInfo& d = levels()[static_cast<size_t>(i)];
                 o.label = d.name;
-                o.value_text = "SURVIVE " + clock(d.survive_s);
+                o.value_text = (intercept() ? "KILL IN " : "SURVIVE ") + clock(d.survive_s);
             } else {
                 o.label = upper(aircraft::to_short_string(kEvadeJets[static_cast<size_t>(i)]));
                 o.value_text = upper(aircraft::engine_designation(kEvadeJets[static_cast<size_t>(i)]));
@@ -124,7 +143,7 @@ public:
         go.id = kGo;
         go.kind = WidgetKind::BUTTON;
         go.variant = ButtonVariant::PRIMARY;
-        go.label = step_ == Step::DIFFICULTY ? "NEXT" : "START EVADE";
+        go.label = step_ == Step::DIFFICULTY ? "NEXT" : intercept() ? "START INTERCEPT" : "START EVADE";
         go.rect = {footer_.right() - pad - go_w, footer_.cy() - bh * 0.5f, go_w, bh};
         go.nav = {1, 0, 1};
         go.selected = true; // DOWN off the list lands here, not on BACK
@@ -141,12 +160,13 @@ public:
         } else if (id != kGo) {
             return;
         }
-        if (step_ == Step::DIFFICULTY) svc.navigate(ScreenId::EVADE_AIRCRAFT, true);
-        else svc.emit(MenuAction::START_EVADE);
+        if (step_ == Step::DIFFICULTY) svc.navigate(intercept() ? ScreenId::INTERCEPT_AIRCRAFT : ScreenId::EVADE_AIRCRAFT, true);
+        else svc.emit(intercept() ? MenuAction::START_INTERCEPT : MenuAction::START_EVADE);
     }
 
     void on_back(MenuServices& svc) override {
-        svc.navigate(step_ == Step::DIFFICULTY ? ScreenId::MAIN : ScreenId::EVADE_DIFFICULTY, false);
+        const ScreenId first = intercept() ? ScreenId::INTERCEPT_DIFFICULTY : ScreenId::EVADE_DIFFICULTY;
+        svc.navigate(step_ == Step::DIFFICULTY ? ScreenId::MAIN : first, false);
     }
 
     void paint_background(const LayoutContext& ctx, MenuServices&, DrawList& dl) override {
@@ -157,12 +177,16 @@ public:
 
         const float pad = ctx.px(t.space.xxl);
         const float title_cy = panel_.y + ctx.px(t.metrics.header_h) * 0.42f;
-        dl.text_v_centered("EVADE", panel_.x + pad, title_cy, ctx.px(t.type.title), p.text_primary, ctx.px(1.0f));
-        const char* step = step_ == Step::DIFFICULTY ? "STEP 1 OF 2  /  THREAT LEVEL" : "STEP 2 OF 2  /  YOUR AIRCRAFT";
+        dl.text_v_centered(intercept() ? "INTERCEPT" : "EVADE", panel_.x + pad, title_cy, ctx.px(t.type.title), p.text_primary,
+                           ctx.px(1.0f));
+        const char* step = step_ == Step::AIRCRAFT ? "STEP 2 OF 2  /  YOUR AIRCRAFT"
+                           : intercept()           ? "STEP 1 OF 2  /  BANDIT"
+                                                   : "STEP 1 OF 2  /  THREAT LEVEL";
         dl.text_v_centered(step, panel_.x + pad, title_cy + ctx.px(t.space.xxl), ctx.px(t.type.label), p.text_label,
                            ctx.px(t.type.tracking_wide));
         if (step_ == Step::AIRCRAFT) {
-            const std::string threat = std::string("THREAT  ") + kEvadeDifficulties[static_cast<size_t>(choice_.difficulty)].name;
+            const std::string threat = std::string(intercept() ? "BANDIT  " : "THREAT  ") +
+                                       levels()[static_cast<size_t>(choice_.difficulty)].name;
             dl.text_right(threat, panel_.right() - pad, title_cy, ctx.px(t.type.label), p.highlight, ctx.px(t.type.tracking_wide));
         }
         // Step progress: two bars, the current one lit.
@@ -205,7 +229,17 @@ public:
             y += ctx.px(t.space.xl);
         };
 
-        if (step_ == Step::DIFFICULTY) {
+        if (step_ == Step::DIFFICULTY && intercept()) {
+            const EvadeDifficultyInfo& d = levels()[static_cast<size_t>(choice_.difficulty)];
+            heading(d.name);
+            field("BANDIT", d.pilot);
+            field("DEFENCES", d.weapons);
+            field("START", d.start);
+            field("TIME", clock(d.survive_s) + " until he reaches home");
+            note(d.advice);
+            note("L locks him on the FCR page (K: CRM / ACM radar).");
+            note("Q selects a missile, Enter fires, F fires the gun.");
+        } else if (step_ == Step::DIFFICULTY) {
             const EvadeDifficultyInfo& d = kEvadeDifficulties[static_cast<size_t>(choice_.difficulty)];
             heading(d.name);
             field("BANDIT", d.pilot);
@@ -221,13 +255,16 @@ public:
             field("PERFORMANCE", std::string(aircraft::signature_spec(j)));
             note(jet_note(j));
             note("The bandit flies the same type.");
-            if (j == aircraft::AircraftType::A10_THUNDERBOLT) note("The A-10 has no radar: its bandit carries guns only.");
+            if (j == aircraft::AircraftType::A10_THUNDERBOLT) {
+                note(intercept() ? "No radar: he starts within 3 nm, slower, and flares instead of chaff."
+                                 : "The A-10 has no radar: its bandit carries guns only.");
+            }
         }
     }
 
     /// @brief The choice as the list shows it (tests / tooling).
     [[nodiscard]] int chosen() const noexcept {
-        if (step_ == Step::DIFFICULTY) return std::clamp(choice_.difficulty, 0, static_cast<int>(kEvadeDifficulties.size()) - 1);
+        if (step_ == Step::DIFFICULTY) return std::clamp(choice_.difficulty, 0, static_cast<int>(levels().size()) - 1);
         for (size_t i = 0; i < kEvadeJets.size(); ++i) {
             if (kEvadeJets[i] == choice_.jet) return static_cast<int>(i);
         }
@@ -236,12 +273,18 @@ public:
 
 private:
     Step step_;
+    Game game_;
     EvadeChoice& choice_;
+
+    [[nodiscard]] bool intercept() const noexcept { return game_ == Game::INTERCEPT; }
+    [[nodiscard]] const std::array<EvadeDifficultyInfo, 4>& levels() const noexcept {
+        return intercept() ? kInterceptDifficulties : kEvadeDifficulties;
+    }
     Rect panel_{}, footer_{}, detail_{};
     std::vector<Rect> option_rects_;
 
     [[nodiscard]] int option_count() const noexcept {
-        return static_cast<int>(step_ == Step::DIFFICULTY ? kEvadeDifficulties.size() : kEvadeJets.size());
+        return static_cast<int>(step_ == Step::DIFFICULTY ? levels().size() : kEvadeJets.size());
     }
 
     void choose(int i) noexcept {

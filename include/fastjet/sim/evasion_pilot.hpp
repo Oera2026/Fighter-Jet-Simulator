@@ -41,6 +41,7 @@ public:
     double chaff_interval_s{1.0};
     double break_time_to_go_s{1.6};
     double threat_memory_s{8.0};  ///< Keeps defending this long after the RWR goes quiet
+    double cruise_mach{0.85};     ///< Speed held running cold (an intercept bandit runs faster)
 
     // Diagnostics
     enum class Mode : uint8_t { CRUISE, NOTCH_RADAR, NOTCH_MISSILE, LAST_DITCH };
@@ -211,7 +212,9 @@ public:
 
         // Hold high subsonic: a beaming jet needs turn performance in the
         // endgame, and turn rate peaks near corner speed, far below Mach 1.4.
-        const double v_target = 0.85 * environment::Atmosphere1976::compute(self.state.altitude()).speed_of_sound;
+        // Running cold he holds cruise_mach.
+        const double mach = mode == Mode::CRUISE ? cruise_mach : 0.85;
+        const double v_target = mach * environment::Atmosphere1976::compute(self.state.altitude()).speed_of_sound;
         out.throttle = V < v_target ? 1.0 : 0.7;
         // Against a heat seeker, out of reheat: the plume is what it sees.
         if (heat_seeker) out.throttle = std::min(out.throttle, 0.8);

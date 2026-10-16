@@ -19,6 +19,7 @@ public:
         QUIT,
         DOGFIGHT,
         EVADE,
+        INTERCEPT,
     };
 
     void layout(const LayoutContext& ctx, MenuServices& svc, std::vector<Widget>& out) override {
@@ -26,11 +27,12 @@ public:
         const Metrics& m = ctx.theme.metrics;
         const bool flying = svc.in_flight();
         struct Entry { Item id; const char* label; ButtonVariant variant; };
-        const std::array<Entry, 7> entries = {{
+        const std::array<Entry, 8> entries = {{
             {START, flying ? "RESUME FLIGHT" : "START FLIGHT", ButtonVariant::MENU},
             {MISSION, "AIRCRAFT & MISSION", ButtonVariant::MENU},
             {DOGFIGHT, "DOGFIGHT", ButtonVariant::MENU},
             {EVADE, "EVADE", ButtonVariant::MENU},
+            {INTERCEPT, "INTERCEPT", ButtonVariant::MENU},
             {SETTINGS, "SETTINGS", ButtonVariant::MENU},
             {CREDITS, "CREDITS", ButtonVariant::MENU},
             {QUIT, "QUIT", ButtonVariant::MENU},
@@ -58,6 +60,7 @@ public:
             case MISSION: svc.emit(MenuAction::OPEN_MISSION_SELECT); break;
             case DOGFIGHT: svc.navigate(ScreenId::DOGFIGHT_GEOMETRY, true); break;
             case EVADE: svc.navigate(ScreenId::EVADE_DIFFICULTY, true); break;
+            case INTERCEPT: svc.navigate(ScreenId::INTERCEPT_DIFFICULTY, true); break;
             case SETTINGS: svc.navigate(ScreenId::SETTINGS, true); break;
             case CREDITS: svc.navigate(ScreenId::CREDITS, true); break;
             case QUIT: confirm_quit(svc); break;
@@ -161,6 +164,7 @@ private:
             case MISSION: return "Choose an airframe, review its envelope and set up the sortie.";
             case DOGFIGHT: return "1v1 guns BFM against an AI bandit. F10 cycles the set-up, F11 the skill.";
             case EVADE: return "A bandit with radar missiles hunts you from your six. Choose the threat and your jet, then survive.";
+            case INTERCEPT: return "The other way round: a bandit runs for home. Lock him up with your radar and shoot him down.";
             case SETTINGS: return "Graphics, audio, controls and accessibility.";
             case CREDITS: return "Data sources and open-source libraries.";
             case QUIT: return flying ? "End this flight and close the simulator." : "Close the simulator.";

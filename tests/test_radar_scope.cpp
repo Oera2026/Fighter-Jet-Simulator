@@ -159,7 +159,9 @@ void test_stt_is_a_lock_the_target_hears() {
     scope.sync(*w, 0);
     assert(!scope.designate(*w)); // nothing on the scope yet
     run(*w, scope, FRAME_S + 0.2);
-    assert(w->rwr(1).level == sim::RwrStatus::Level::CLEAR);
+    // The RWS scan sweeping over him is a search on his RWR, not a lock.
+    assert(w->rwr(1).level == sim::RwrStatus::Level::SEARCH);
+    assert(w->rwr(1).emitter_valid && std::abs(w->rwr(1).emitter_bearing) < 5.0 * DEG);
     assert(scope.designate(*w));
     run(*w, scope, 0.15);
     assert(scope.mode == RadarScope::Mode::STT && w->radars[0].locked());
@@ -173,7 +175,8 @@ void test_stt_is_a_lock_the_target_hears() {
     scope.undesignate(*w);
     assert(scope.mode == RadarScope::Mode::RWS && !w->radars[0].locked());
     run(*w, scope, 0.05);
-    assert(w->rwr(1).level == sim::RwrStatus::Level::CLEAR);
+    // Lock dropped: back to the search he heard before.
+    assert(w->rwr(1).level == sim::RwrStatus::Level::SEARCH);
     std::cout << "  -> PASSED\n";
 }
 
@@ -196,7 +199,8 @@ void test_broken_lock_needs_the_pilot() {
     // Back in front of the nose: no lock without a new designation.
     w->aircraft[1].state.pos_ned = w->aircraft[0].position() + math::Vector3(10000.0, 0.0, 0.0);
     run(*w, scope, 1.0);
-    assert(!w->radars[0].locked() && w->rwr(1).level == sim::RwrStatus::Level::CLEAR);
+    // He hears the search scan at most, never a lock.
+    assert(!w->radars[0].locked() && w->rwr(1).level <= sim::RwrStatus::Level::SEARCH);
 
     // A stale brick: the jet has gone behind since it was painted.
     run(*w, scope, FRAME_S + 0.2);

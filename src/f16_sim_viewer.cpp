@@ -117,12 +117,13 @@ int main(int argc, char* argv[]) {
     std::cout << "  [ / ]:                  Radar range scale down / up\n";
     std::cout << "  = / -:                  Radar antenna elevation up / down\n";
     std::cout << "  P:                      Left MFD page: FCR / FLCS\n";
-    std::cout << "  F9 / F10:               New fight / cycle set-up (merge, perch, range, evade)\n";
-    std::cout << "  F11:                    Cycle bandit skill (dogfight) or difficulty (evade)\n";
+    std::cout << "  F9 / F10:               New fight / cycle set-up (merge, perch, range, evade, intercept)\n";
+    std::cout << "  F11:                    Cycle bandit skill (dogfight) or difficulty (evade, intercept)\n";
     std::cout << "  (Flight keys can be rebound in Settings > Controls.)\n";
     std::cout << "  --dogfight [merge|offensive|defensive|range] --skill [novice|veteran|ace] --bandit TYPE\n";
     std::cout << "  --loadout [guns|ir|full]: dogfight weapons (Q selects GUN / heat seeker / radar missile)\n";
     std::cout << "  --evade [easy|medium|hard|expert]: survive a bandit with radar missiles in your six\n";
+    std::cout << "  --intercept [easy|medium|hard|expert]: lock up and shoot down a bandit running for home\n";
     std::cout << "  --canyon:               Start airborne at the canyon mouth (east of the field), lined up to fly it\n";
     std::cout << "  --hover:                F-35B converted, hovering 50 ft over the runway at vertical-landing weight\n";
     std::cout << "  --stovl-approach:       F-35B converted, 120 kt and 1,000 ft, 3 nm short of the runway\n";
@@ -152,8 +153,10 @@ int main(int argc, char* argv[]) {
     bool start_dogfight = false;     // --dogfight: straight into a 1v1
     sim::EngagementSetup dogfight_setup{};
     sim::WeaponSel start_weapon = sim::WeaponSel::GUN; // --weapon: store selected when a fight starts
+    bool start_weapon_set = false;                      // --weapon given (intercept otherwise starts on a missile)
     bool bandit_type_set = false;
     ui::ScreenId boot_screen = ui::ScreenId::MAIN;
+    bool boot_airframes = false;     // --ui-screen airframes: tooling, boot into the jet-select page
     std::optional<ui::SettingsSection> boot_tab;
 
     for (int i = 1; i < argc; ++i) {
@@ -170,6 +173,8 @@ int main(int argc, char* argv[]) {
             else if (v == "credits") boot_screen = ui::ScreenId::CREDITS;
             else if (v == "evade") boot_screen = ui::ScreenId::EVADE_DIFFICULTY;
             else if (v == "evade-jet") boot_screen = ui::ScreenId::EVADE_AIRCRAFT;
+            else if (v == "intercept") boot_screen = ui::ScreenId::INTERCEPT_DIFFICULTY;
+            else if (v == "airframes") boot_airframes = true;
         }
         if (arg == "--ui-tab" && i + 1 < argc) {
             const std::string v = argv[++i];
@@ -219,6 +224,18 @@ int main(int argc, char* argv[]) {
                                                                   : sim::EvadeDifficulty::MEDIUM;
             }
         }
+        if (arg == "--intercept") {
+            start_dogfight = true;
+            no_menu = true;
+            dogfight_setup.mode = sim::EngagementMode::INTERCEPT;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                const std::string d = argv[++i];
+                dogfight_setup.intercept_difficulty = d == "easy"     ? sim::InterceptDifficulty::EASY
+                                                    : d == "hard"     ? sim::InterceptDifficulty::HARD
+                                                    : d == "expert"   ? sim::InterceptDifficulty::EXPERT
+                                                                      : sim::InterceptDifficulty::MEDIUM;
+            }
+        }
         if (arg == "--watch") dogfight_setup.own_is_ai = true; // AI flies your jet too (demo)
         if (arg == "--loadout" && i + 1 < argc) {
             const std::string l = argv[++i];
@@ -229,6 +246,7 @@ int main(int argc, char* argv[]) {
         if (arg == "--weapon" && i + 1 < argc) { // Tooling: start the fight with this store selected
             const std::string k = argv[++i];
             start_weapon = k == "srm" ? sim::WeaponSel::SRM : k == "mrm" ? sim::WeaponSel::MRM : sim::WeaponSel::GUN;
+            start_weapon_set = true;
         }
         if (arg == "--skill" && i + 1 < argc) {
             const std::string k = argv[++i];
@@ -332,6 +350,8 @@ int main(int argc, char* argv[]) {
         SDL_Quit();
         return 1;
     }
+    // The other jets' airframe assets decode in the background meanwhile.
+    renderer.prefetch_airframes();
 
     // 2. Physics lives in sim::World (see the flight state set-up below).
 
@@ -533,6 +553,13 @@ int main(int argc, char* argv[]) {
         dogfight_setup.seed = static_cast<uint32_t>(SDL_GetTicks()) | 1u;
         dogfight->setup(dogfight_setup);
         dogfight->world.stores[0].select(start_weapon);
+        if (dogfight->intercept_mode() && !start_weapon_set) {
+            // A bandit miles ahead: start on the radar missile (heat seeker
+            // in a jet without radar or radar missiles), not the gun.
+            sim::WeaponStores& stores = dogfight->world.stores[0];
+            const bool radar = dogfight->world.radars[0].spec.fitted;
+            if (!(radar && stores.select(sim::WeaponSel::MRM))) (void)stores.select(sim::WeaponSel::SRM);
+        }
         dogfight_active = true;
         own = &dogfight->world.aircraft[0];
         stovl_selected = false;
@@ -546,10 +573,10 @@ int main(int argc, char* argv[]) {
         renderer.camera_rig().reset();
         // Dogfight switch: a visual fight starts with the radar in ACM, which
         // finds and locks the bandit by itself; RWS search cannot hold a jet
-        // a mile away in a turning fight. Evade starts in CRM, the bandit
-        // miles back.
+        // a mile away in a turning fight. Evade and intercept start in CRM,
+        // the bandit miles away.
         radar_scope.sync(dogfight->world, 0);
-        radar_scope.set_master_mode(dogfight->world, !dogfight->evade_mode());
+        radar_scope.set_master_mode(dogfight->world, !dogfight->evade_mode() && !dogfight->intercept_mode());
         sweep_scope.reset();
         sweep_world_time = dogfight->world.time;
         if (dogfight->evade_mode()) {
@@ -561,6 +588,15 @@ int main(int argc, char* argv[]) {
                       << static_cast<int>(profile.start_range_m / 1852.0 + 0.5)
                       << " nm in your six. Survive " << static_cast<int>(profile.survive_s)
                       << " s. C dispenses chaff.\n";
+        } else if (dogfight->intercept_mode()) {
+            main_menu.set_intercept_difficulty(static_cast<int>(dogfight_setup.intercept_difficulty));
+            const auto profile = sim::Engagement::intercept_profile(dogfight_setup);
+            const bool radar = dogfight->world.radars[0].spec.fitted;
+            std::cout << "[INTERCEPT] " << sim::to_string(dogfight_setup.intercept_difficulty) << ": "
+                      << aircraft::to_string(dogfight_setup.bandit_type) << " (" << profile.summary << ") running for home, "
+                      << static_cast<int>(dogfight->setup_data.time_limit_s) << " s to kill him. "
+                      << (radar ? "Radar in CRM: L locks him on the FCR page, Q selects a missile, Enter fires.\n"
+                                : "No radar: put him in the HUD for heat-seeker tone, Enter fires, F fires the gun.\n");
         } else {
             std::cout << "[DOGFIGHT] " << sim::to_string(dogfight_setup.geometry) << " vs "
                       << sim::to_string(dogfight_setup.skill) << " " << aircraft::to_string(dogfight_setup.bandit_type)
@@ -668,6 +704,11 @@ int main(int argc, char* argv[]) {
         main_menu.open(boot_screen, /*in_flight=*/false);
         main_menu.update(0.0f, static_cast<float>(pixel_w), static_cast<float>(pixel_h));
         if (boot_tab) main_menu.show_settings_tab(*boot_tab);
+        if (boot_airframes) {
+            main_menu.close();
+            renderer.menu().open_as_dispatch(selected_aircraft);
+            mission_from_main_menu = true;
+        }
     }
     SDL_Gamepad* gamepad = nullptr;
     auto upper = [](std::string text) {
@@ -1010,10 +1051,13 @@ int main(int argc, char* argv[]) {
                     switch_aircraft(static_cast<aircraft::AircraftType>(next_idx));
                 }
                 // Combat: new fight, cycle the set-up (the four dogfight set-ups,
-                // then evade), cycle the bandit's skill or the evade difficulty.
+                // then evade, then intercept), cycle the bandit's skill or the
+                // evade / intercept difficulty.
                 if (ev.key.key == SDLK_F9 && !ev.key.repeat) start_dogfight_now();
                 if (ev.key.key == SDLK_F10 && !ev.key.repeat) {
                     if (dogfight_setup.mode == sim::EngagementMode::EVADE) {
+                        dogfight_setup.mode = sim::EngagementMode::INTERCEPT;
+                    } else if (dogfight_setup.mode == sim::EngagementMode::INTERCEPT) {
                         dogfight_setup.mode = sim::EngagementMode::DOGFIGHT;
                         dogfight_setup.geometry = sim::StartGeometry::HEAD_ON_MERGE;
                     } else if (dogfight_setup.geometry == sim::StartGeometry::GUNNERY_RANGE) {
@@ -1028,6 +1072,9 @@ int main(int argc, char* argv[]) {
                     if (dogfight_setup.mode == sim::EngagementMode::EVADE) {
                         dogfight_setup.evade_difficulty = static_cast<sim::EvadeDifficulty>(
                             (static_cast<int>(dogfight_setup.evade_difficulty) + 1) % 4);
+                    } else if (dogfight_setup.mode == sim::EngagementMode::INTERCEPT) {
+                        dogfight_setup.intercept_difficulty = static_cast<sim::InterceptDifficulty>(
+                            (static_cast<int>(dogfight_setup.intercept_difficulty) + 1) % 4);
                     } else {
                         dogfight_setup.skill =
                             static_cast<sim::AiSkill>((static_cast<int>(dogfight_setup.skill) + 1) % 3);
@@ -1100,6 +1147,16 @@ int main(int argc, char* argv[]) {
                     if (pick.jet != selected_aircraft) switch_aircraft(pick.jet);
                     dogfight_setup.mode = sim::EngagementMode::EVADE;
                     dogfight_setup.evade_difficulty = static_cast<sim::EvadeDifficulty>(pick.difficulty);
+                    start_dogfight_now();
+                    break;
+                }
+                case ui::MenuAction::START_INTERCEPT: {
+                    main_menu.close();
+                    flight_started = true;
+                    const ui::EvadeChoice& pick = main_menu.intercept_choice();
+                    if (pick.jet != selected_aircraft) switch_aircraft(pick.jet);
+                    dogfight_setup.mode = sim::EngagementMode::INTERCEPT;
+                    dogfight_setup.intercept_difficulty = static_cast<sim::InterceptDifficulty>(pick.difficulty);
                     start_dogfight_now();
                     break;
                 }
@@ -1467,10 +1524,25 @@ int main(int argc, char* argv[]) {
                         renderer.trigger_explosion(w.aircraft[static_cast<size_t>(e.victim)].position());
                     }
                 }
+                if (dogfight->intercept_mode() && e.victim == sim::Engagement::BANDIT && e.shooter == sim::Engagement::OWN) {
+                    switch (e.kind) {
+                        case sim::CombatEvent::Kind::MISSILE_DEFEATED:
+                            if (!dogfight->finished()) std::cout << "[INTERCEPT] Your missile missed.\n";
+                            break;
+                        case sim::CombatEvent::Kind::LOCK_BROKEN_CHAFF:
+                            std::cout << "[INTERCEPT] His chaff broke your lock.\n";
+                            break;
+                        case sim::CombatEvent::Kind::LOCK_BROKEN_FLARE:
+                            std::cout << "[INTERCEPT] His flares decoyed your heat seeker.\n";
+                            break;
+                        default: break;
+                    }
+                }
                 if (e.victim != sim::Engagement::OWN) continue;
                 switch (e.kind) {
                     case sim::CombatEvent::Kind::MISSILE_LAUNCH:
-                        std::cout << "[" << (dogfight->evade_mode() ? "EVADE" : "DOGFIGHT") << "] Missile launch! Bandit fired "
+                        std::cout << "[" << (dogfight->evade_mode() ? "EVADE" : dogfight->intercept_mode() ? "INTERCEPT" : "DOGFIGHT")
+                                  << "] Missile launch! Bandit fired "
                                   << (launched ? launched : "a missile") << ".\n";
                         break;
                     case sim::CombatEvent::Kind::MISSILE_DEFEATED:
@@ -1571,7 +1643,14 @@ int main(int argc, char* argv[]) {
                 if (w.pickle_presses[OWN] != pickle_presses_seen) {
                     pickle_presses_seen = w.pickle_presses[OWN];
                     const auto cue = w.launch_cue[OWN];
-                    if (cue == sim::World::LaunchCue::NO_LOCK || cue == sim::World::LaunchCue::EMPTY) {
+                    if (cue == sim::World::LaunchCue::GUN) {
+                        // The pickle fires missiles; the gun is on the trigger.
+                        const bool any = stores.missiles() > 0;
+                        weapon_cue = any ? "GUN SEL" : "NO MSL";
+                        weapon_cue_timer = 1.5;
+                        std::cout << "[WEAPON] " << (any ? "Gun selected: Q selects a missile, F fires the gun"
+                                                         : "No missiles: F fires the gun") << "\n";
+                    } else if (cue == sim::World::LaunchCue::NO_LOCK || cue == sim::World::LaunchCue::EMPTY) {
                         weapon_cue = cue == sim::World::LaunchCue::NO_LOCK ? "NO LOCK" : "NO MSL";
                         weapon_cue_timer = 1.5;
                         std::cout << "[WEAPON] " << weapon_cue
@@ -1606,6 +1685,18 @@ int main(int argc, char* argv[]) {
                 std::snprintf(c.status, sizeof(c.status), "EVADE %s  %.*s  BINGO %d:%02d",
                               sim::to_string(dogfight_setup.evade_difficulty), static_cast<int>(bandit_name.size()),
                               bandit_name.data(), left / 60, left % 60);
+            } else if (dogfight->intercept_mode()) {
+                // The time left until he reaches home, and whether you hold him locked.
+                const int left = static_cast<int>(
+                    std::max(0.0, dogfight->setup_data.time_limit_s - dogfight->stats.duration_s));
+                // Tenths of a mile inside 10 nm. A jet without radar holds him by heat-seeker tone.
+                const double range_nm = (bandit.position() - own->position()).norm() / 1852.0;
+                const bool radar = w.radars[sim::Engagement::OWN].spec.fitted;
+                const bool held = dogfight->own_locked_on_bandit();
+                std::snprintf(c.status, sizeof(c.status), "INTERCEPT %s  %.*s  %.*f NM  %s  HOME %d:%02d",
+                              sim::to_string(dogfight_setup.intercept_difficulty), static_cast<int>(bandit_name.size()),
+                              bandit_name.data(), range_nm < 9.95 ? 1 : 0, range_nm,
+                              radar ? (held ? "LOCKED" : "NO LOCK") : (held ? "TONE" : "NO TONE"), left / 60, left % 60);
             } else {
                 std::snprintf(c.status, sizeof(c.status), "%s %.*s  %s", sim::to_string(dogfight_setup.skill),
                               static_cast<int>(bandit_name.size()), bandit_name.data(),
@@ -1648,6 +1739,14 @@ int main(int argc, char* argv[]) {
                                   "MISSILES %d  DEFEATED %d  CHAFF %d  LOCKS BROKEN %d  LOCKED %d SEC",
                                   st.missiles_at_you, st.missiles_defeated, st.chaff_used, st.locks_broken_by_chaff,
                                   static_cast<int>(st.time_locked_s));
+                } else if (dogfight->intercept_mode()) {
+                    // Without a radar, "locked" is heat-seeker tone.
+                    const bool radar = w.radars[sim::Engagement::OWN].spec.fitted;
+                    char first[16] = "NONE";
+                    if (st.first_lock_s >= 0.0) std::snprintf(first, sizeof(first), "%dS", static_cast<int>(st.first_lock_s));
+                    std::snprintf(c.debrief2, sizeof(c.debrief2), "FIRED %d  MISSED %d  LOCKS BROKEN %d  %s %dS  FIRST %s",
+                                  st.missiles_fired, st.missiles_missed, st.locks_he_broke, radar ? "LOCKED" : "TONE",
+                                  static_cast<int>(st.time_on_lock_s), first);
                 }
             }
         }
@@ -1902,7 +2001,7 @@ int main(int argc, char* argv[]) {
         if (main_menu.is_visible()) {
             main_menu.set_current_aircraft(selected_aircraft);
             main_menu.set_status_text(upper(std::string(aircraft::to_string(selected_aircraft))) +
-                                      (dogfight_active ? (dogfight->evade_mode() ? "  /  EVADE PAUSED" : "  /  DOGFIGHT PAUSED")
+                                      (dogfight_active ? (dogfight->evade_mode() ? "  /  EVADE PAUSED" : dogfight->intercept_mode() ? "  /  INTERCEPT PAUSED" : "  /  DOGFIGHT PAUSED")
                                        : flight_started ? "  /  FLIGHT PAUSED"
                                        : stovl_start() ? (start_hover ? "  /  HOVER OVER RUNWAY 09" : "  /  STOVL APPROACH")
                                                        : "  /  RUNWAY 09 LINE-UP"));

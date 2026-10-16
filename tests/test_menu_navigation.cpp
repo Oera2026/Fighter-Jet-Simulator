@@ -134,6 +134,47 @@ void test_evade_setup_flow() {
     std::cout << "PASS\n";
 }
 
+void test_intercept_setup_flow() {
+    std::cout << "[Test] Intercept: pick the bandit, then the jet, then launch... " << std::flush;
+    SettingsManager s;
+    s.load();
+    MenuSystem m(s, AppInfo{});
+    m.set_current_aircraft(fastjet::aircraft::AircraftType::EUROFIGHTER_TYPHOON);
+    m.open(ScreenId::MAIN, false);
+    frames(m);
+    focus_down_to(m, MainMenuScreen::INTERCEPT);
+    press(m, NavCommand::ACCEPT);
+    frames(m);
+    assert(m.current_screen() == ScreenId::INTERCEPT_DIFFICULTY && !m.poll_action());
+    assert(m.focused_id() == EvadeSetupScreen::kOptionBase + 1); // Opens on MEDIUM
+    press(m, NavCommand::DOWN);
+    assert(m.intercept_choice().difficulty == 2);
+    assert(m.evade_choice().difficulty == 1); // Evade's choice is its own
+
+    press(m, NavCommand::ACCEPT);
+    frames(m);
+    assert(m.current_screen() == ScreenId::INTERCEPT_AIRCRAFT);
+    assert(m.intercept_choice().jet == fastjet::aircraft::AircraftType::EUROFIGHTER_TYPHOON);
+    press(m, NavCommand::BACK);
+    frames(m);
+    assert(m.current_screen() == ScreenId::INTERCEPT_DIFFICULTY);
+    press(m, NavCommand::ACCEPT);
+    frames(m);
+    press(m, NavCommand::UP); // F-15EX
+    assert(!m.poll_action());
+    press(m, NavCommand::ACCEPT);
+    assert(m.poll_action() == MenuAction::START_INTERCEPT);
+    assert(m.intercept_choice().difficulty == 2 &&
+           m.intercept_choice().jet == fastjet::aircraft::AircraftType::F15EX_EAGLE_II);
+
+    m.open(ScreenId::INTERCEPT_DIFFICULTY, false);
+    frames(m);
+    press(m, NavCommand::BACK);
+    frames(m);
+    assert(m.current_screen() == ScreenId::MAIN && !m.poll_action());
+    std::cout << "PASS\n";
+}
+
 void test_quit_confirmation() {
     std::cout << "[Test] Main menu: quit asks first, defaults to Cancel... " << std::flush;
     SettingsManager s;
@@ -371,6 +412,7 @@ int main() {
     test_main_menu_keyboard_flow();
     test_quit_confirmation();
     test_evade_setup_flow();
+    test_intercept_setup_flow();
     test_settings_edit_apply_revert();
     test_pointer_toggle_and_slider_drag();
     test_dropdown();

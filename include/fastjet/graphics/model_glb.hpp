@@ -11,8 +11,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <chrono>
 #include <cmath>
 #include <future>
+#include <optional>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -68,6 +71,8 @@ struct GLBSubmesh {
     std::array<float, 3> emissive{0.0f, 0.0f, 0.0f};
     bool is_transparent = false;
     int joint = -1;             ///< Articulated part: index of its joint transform (-1: rigid)
+    int shown_by = -1;          ///< Drawn only while this joint has moved (-1: always)
+    int hidden_by = -1;         ///< Hidden while this joint has moved (-1: never)
 
     /// Bounds in body axes, model units (before scale and placement).
     std::array<float, 3> bounds_min{0.0f, 0.0f, 0.0f};
@@ -106,6 +111,21 @@ struct ProceduralPart {
     /// transform `joint` of the model, set each frame (ModelGLB::set_joints).
     /// -1 for the rigid airframe.
     int joint = -1;
+    /// Drawn only while this joint has moved (-1: always): a door laid over
+    /// an asset's closed skin shows only once it opens.
+    int shown_by = -1;
+};
+
+/// @brief A round region of an asset's skin, in body axes (world alignment)
+/// [m]: within `radius` of the X-parallel axis through (y, z), aft of
+/// `x_max`. Its triangles load as a part of their own, hidden while joint
+/// `hidden_by` has moved: a fixed nozzle that a swivelling one replaces.
+struct AssetCutaway {
+    float x_max = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float radius = 0.0f;
+    int hidden_by = -1;
 };
 
 /// @brief Per-frame transforms of an airframe's moving parts, in the
@@ -140,11 +160,13 @@ private:
     /// Moving parts' transforms this draw, and the uniforms they are
     /// composed with (the model and normal matrices of the whole airframe).
     JointPose joints_{};
+    std::array<bool, JointPose::kMax> moved_{};  ///< Joint i is away from its rest pose
     Mat4 base_model_ = Mat4::identity();
     Mat4 base_rot_ = Mat4::identity();
     bool depth_pass_ = false;          ///< Drawing with the depth-only shader (uLightMVP)
     int posed_ = -1;                   ///< Joint the bound model matrix carries (-1: rigid)
-    ModelPlacement placement_{};  ///< F-16C asset unless load_procedural() says otherwise
+    ModelPlacement placement_{};  ///< F-16C asset unless a load says otherwise
+    std::optional<AssetCutaway> cutaway_;  ///< Skin region split off at upload
     std::future<std::unique_ptr<Prepared>> prefetch_;  ///< Background prepare()
     std::string prefetch_path_;
 
@@ -167,17 +189,24 @@ private:
     /// Vertex stream: position(3), normal(3), uv(2), tangent(4).
     static constexpr int kFloatsPerVertex = 12;
 
-    F16PartType classify_node(const std::string& name) {
-        if (name.find("canopy") != std::string::npos) return F16PartType::CANOPY;
-        if (name.find("cockpit") != std::string::npos) return F16PartType::COCKPIT;
-        if (name.find("hud") != std::string::npos) return F16PartType::HUD;
-        if (name.find("landingOff") != std::string::npos) return F16PartType::GEAR_UP;
-        if (name.find("landingOnLight") != std::string::npos) return F16PartType::LIGHTS;
-        if (name.find("landingOn") != std::string::npos) return F16PartType::GEAR_DOWN;
-        if (name.find("rails") != std::string::npos) return F16PartType::RAILS;
+public:
+    /// @brief The part a node belongs to, from its name and its parent's.
+    /// Any case: the series' assets spell them "F-16-landingOn_6",
+    /// "LandingOn_6", "LandingLight_7", "WeaponRails_8"...
+    [[nodiscard]] static F16PartType classify_node(std::string name) {
+        for (char& ch : name) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        auto has = [&](const char* s) { return name.find(s) != std::string::npos; };
+        if (has("canopy")) return F16PartType::CANOPY;
+        if (has("cockpit")) return F16PartType::COCKPIT;
+        if (has("hud")) return F16PartType::HUD;
+        if (has("landingoff")) return F16PartType::GEAR_UP;
+        if (has("landingonlight") || has("landinglight")) return F16PartType::LIGHTS;
+        if (has("landingon")) return F16PartType::GEAR_DOWN;
+        if (has("rails")) return F16PartType::RAILS;
         return F16PartType::AIRFRAME;
     }
 
+private:
     /// @brief Model axes to body axes.
     ///
     /// The asset is authored X forward, Y up, Z along the span; the body frame
@@ -423,6 +452,22 @@ public:
         prefetch_ = core::ThreadPool::shared().submit([filepath] { return prepare(filepath); });
     }
 
+    /// @brief True once a prefetch() has finished preparing, so a load()
+    /// of its path only has the GPU upload left to do.
+    [[nodiscard]] bool prefetch_ready() const {
+        return prefetch_.valid() && prefetch_.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    }
+
+    /// @brief Loads an airframe asset other than the F-16C's: @p placement
+    /// puts it on the CG, and @p cutaway (if any) splits a region of its
+    /// skin off as a part of its own.
+    bool load(const std::string& filepath, const ModelPlacement& placement,
+              const std::optional<AssetCutaway>& cutaway = std::nullopt) {
+        placement_ = placement;
+        cutaway_ = cutaway;
+        return load(filepath);
+    }
+
     /// @brief Load binary glTF model from disk and initialize OpenGL resources
     bool load(const std::string& filepath) {
         std::unique_ptr<Prepared> prepared;
@@ -440,6 +485,22 @@ public:
     /// puts those axes in the body frame for each alignment.
     bool load_procedural(const std::vector<ProceduralPart>& parts, const ModelPlacement& placement) {
         placement_ = placement;
+        append_parts(parts, 1.0f, 0.0f, 0.0f);
+        loaded_ = true;
+        return true;
+    }
+
+    /// @brief Adds procedural parts, authored in body axes (world alignment,
+    /// metres), to a loaded asset: the moving parts its own mesh lacks.
+    void add_body_parts(const std::vector<ProceduralPart>& parts) {
+        const ModelPlacement& p = placement_;
+        append_parts(parts, 1.0f / p.scale, p.world_x, p.world_z);
+    }
+
+private:
+    /// @brief Procedural parts into submeshes, each position taken from body
+    /// axes into this model's own: (p - (offset_x, 0, offset_z)) * k.
+    void append_parts(const std::vector<ProceduralPart>& parts, float k, float offset_x, float offset_z) {
         for (const ProceduralPart& part : parts) {
             const size_t n = part.vertices.size() / 6;
             if (n < 3) continue;
@@ -450,11 +511,12 @@ public:
             std::vector<uint32_t> indices(n);
             for (size_t v = 0; v < n; ++v) {
                 const float* src = &part.vertices[v * 6];
-                for (size_t k = 0; k < 3; ++k) {
-                    bmin[k] = (std::min)(bmin[k], src[k]);
-                    bmax[k] = (std::max)(bmax[k], src[k]);
+                const float pos[3] = {(src[0] - offset_x) * k, src[1] * k, (src[2] - offset_z) * k};
+                for (size_t c = 0; c < 3; ++c) {
+                    bmin[c] = (std::min)(bmin[c], pos[c]);
+                    bmax[c] = (std::max)(bmax[c], pos[c]);
                 }
-                const float vert[kFloatsPerVertex] = {src[0], src[1], src[2], src[3], src[4], src[5],
+                const float vert[kFloatsPerVertex] = {pos[0], pos[1], pos[2], src[3], src[4], src[5],
                                                       0.0f,   0.0f,   0.0f,   0.0f,   0.0f,   1.0f};
                 vertex_data.insert(vertex_data.end(), vert, vert + kFloatsPerVertex);
                 indices[v] = static_cast<uint32_t>(v);
@@ -470,13 +532,25 @@ public:
             sm.emissive = part.emissive;
             sm.is_transparent = part.transparent;
             sm.joint = part.joint < JointPose::kMax ? part.joint : -1;
+            sm.shown_by = part.shown_by < JointPose::kMax ? part.shown_by : -1;
             submeshes_.push_back(sm);
         }
-        loaded_ = true;
-        return true;
     }
 
-private:
+    /// @brief True if the triangle (body-axis vertices, model units) lies
+    /// wholly inside the cutaway region.
+    [[nodiscard]] bool in_cutaway(const float* a, const float* b, const float* c) const noexcept {
+        if (!cutaway_) return false;
+        const AssetCutaway& r = *cutaway_;
+        const ModelPlacement& p = placement_;
+        for (const float* v : {a, b, c}) {
+            const float x = v[0] * p.scale + p.world_x;
+            const float y = v[1] * p.scale - r.y;
+            const float z = v[2] * p.scale + p.world_z - r.z;
+            if (x > r.x_max || y * y + z * z > r.radius * r.radius) return false;
+        }
+        return true;
+    }
     /// @brief Vertex array, vertex and index buffers for one submesh
     /// (kFloatsPerVertex floats per vertex).
     static GLBSubmesh make_submesh(const std::vector<float>& vertex_data, const std::vector<uint32_t>& indices) {
@@ -666,6 +740,20 @@ private:
                     for (uint32_t vi = 0; vi < num_verts; ++vi) indices[vi] = vi;
                 }
 
+                // The cutaway's triangles become a part of their own.
+                std::vector<uint32_t> cut;
+                if (cutaway_ && ptype == F16PartType::AIRFRAME) {
+                    std::vector<uint32_t> kept;
+                    for (size_t t = 0; t + 2 < indices.size(); t += 3) {
+                        const float* a = &vertex_data[indices[t] * kFloatsPerVertex];
+                        const float* b = &vertex_data[indices[t + 1] * kFloatsPerVertex];
+                        const float* c = &vertex_data[indices[t + 2] * kFloatsPerVertex];
+                        auto& to = in_cutaway(a, b, c) ? cut : kept;
+                        to.insert(to.end(), {indices[t], indices[t + 1], indices[t + 2]});
+                    }
+                    indices = std::move(kept);
+                }
+
                 GLBSubmesh sm = make_submesh(vertex_data, indices);
                 sm.name = part_name;
                 sm.part_type = ptype;
@@ -690,6 +778,23 @@ private:
                 // asset's HUD plate is the combiner glass, not a green panel.
                 if (ptype == F16PartType::CANOPY || ptype == F16PartType::HUD) sm.is_transparent = true;
 
+                if (!cut.empty()) {
+                    GLBSubmesh part = make_submesh(vertex_data, cut);
+                    part.name = part_name + " cutaway";
+                    part.part_type = ptype;
+                    part.bounds_min = bmin;
+                    part.bounds_max = bmax;
+                    part.base_texture = sm.base_texture;
+                    part.mr_texture = sm.mr_texture;
+                    part.normal_texture = sm.normal_texture;
+                    part.base_color_factor = sm.base_color_factor;
+                    part.metallic_factor = sm.metallic_factor;
+                    part.roughness_factor = sm.roughness_factor;
+                    part.emissive = sm.emissive;
+                    part.is_transparent = sm.is_transparent;
+                    part.hidden_by = cutaway_->hidden_by < JointPose::kMax ? cutaway_->hidden_by : -1;
+                    submeshes_.push_back(part);
+                }
                 submeshes_.push_back(sm);
             }
         }
@@ -733,8 +838,28 @@ public:
     /// @brief Poses the moving parts for the next draws (doors, nozzle). The
     /// model is shared by every jet of its type: set before each one.
     void set_joints(const JointPose& pose) noexcept {
-        joints_ = pose;
-        for (int i = pose.count; i < JointPose::kMax; ++i) joints_.m[static_cast<size_t>(i)] = Mat4::identity();
+        // Joints move parts in body axes (world alignment). An asset's own
+        // axes are those scaled and shifted, so each joint is carried into
+        // them; on a procedural model (placed at scale 1, no offset) both
+        // matrices are the identity.
+        const ModelPlacement& p = placement_;
+        const Mat4 to_body = placed_matrix(ModelAlignment::WORLD);
+        const Mat4 to_model = Mat4::scale(1.0f / p.scale, 1.0f / p.scale, 1.0f / p.scale) *
+                              Mat4::translate(-p.world_x, 0.0f, -p.world_z);
+        joints_.count = pose.count;
+        for (int i = 0; i < JointPose::kMax; ++i) {
+            const auto k = static_cast<size_t>(i);
+            if (i >= pose.count) {
+                joints_.m[k] = Mat4::identity();
+                moved_[k] = false;
+                continue;
+            }
+            joints_.m[k] = to_model * pose.m[k] * to_body;
+            float off = 0.0f;
+            const Mat4 id = Mat4::identity();
+            for (size_t e = 0; e < 16; ++e) off = (std::max)(off, std::fabs(pose.m[k].m[e] - id.m[e]));
+            moved_[k] = off > 1e-5f;
+        }
     }
     [[nodiscard]] size_t submesh_count() const noexcept { return submeshes_.size(); }
 
@@ -1029,7 +1154,9 @@ public:
     }
 
 private:
-    static bool visible(const GLBSubmesh& sm, bool gear_down) noexcept {
+    [[nodiscard]] bool visible(const GLBSubmesh& sm, bool gear_down) const noexcept {
+        if (sm.shown_by >= 0 && !moved_[static_cast<size_t>(sm.shown_by)]) return false;
+        if (sm.hidden_by >= 0 && moved_[static_cast<size_t>(sm.hidden_by)]) return false;
         switch (sm.part_type) {
             case F16PartType::GEAR_DOWN: return gear_down;
             case F16PartType::GEAR_UP: return !gear_down;
